@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>body{margin:0;background:#0f1012;font-family:"IBM Plex Sans",system-ui,sans-serif}a{color:#5a93d4}a:hover{color:#7fb0e4}.dv-turn{padding:40px 44px 32px;border-bottom:1px solid rgba(255,255,255,.08);scroll-margin-top:16px}.dv-thd{display:flex;align-items:baseline;gap:10px;margin:0 0 20px}.dv-tid{font:600 10px "IBM Plex Mono",monospace;padding:3px 7px;background:#e8e9ea;color:#111;border-radius:4px;text-decoration:none}.dv-tname{font:600 13px/1.2 "IBM Plex Sans",sans-serif;color:#e8e9ea}.dv-opts{display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start}.dv-opt{flex:none;display:flex;flex-direction:column;gap:9px;scroll-margin-top:16px}.dv-oid{font:600 10.5px "IBM Plex Mono",monospace;padding:3px 7px;background:rgba(255,255,255,.14);color:#e8e9ea;border-radius:5px;text-decoration:none}.dv-olabel{display:flex;align-items:baseline;gap:8px;font:400 11px/1.3 "IBM Plex Sans",sans-serif;color:rgba(255,255,255,.55)}.dv-card{max-width:100%;background:#141518;border:1px solid rgba(255,255,255,.09);border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.5);overflow:hidden}.dv-opt:target .dv-oid{background:#5a93d4;color:#fff}.dv-next{margin:22px 0 0;font:12px/1.5 "IBM Plex Sans",sans-serif;color:rgba(255,255,255,.5)}</style>
+</helmet>
+
+<section class="dv-turn" id="t2">
+<div class="dv-thd"><a class="dv-tid" href="#t2">2</a><span class="dv-tname">Every other window &amp; popup, in <a class="dv-oid" href="#1b">1b</a>'s floating-HUD language</span></div>
+<div style="font:400 12px/1.6 'IBM Plex Sans',sans-serif;color:rgba(255,255,255,.55);max-width:860px;margin:-8px 0 22px">Shared vocabulary from <a href="#1b">1b</a>: translucent blurred panels on the image (dimmed when modal), same borders/radii, mono for data, Sans only for dialog titles/buttons. Sessions auto-resume per spec, so there's no resume dialog — it's a toast (<a href="#2g">2g</a>).</div>
+<div class="dv-opts">
+
+<!-- ══ 2a STARTUP ══ -->
+<div class="dv-opt" id="2a"><div class="dv-olabel"><a class="dv-oid" href="#2a">2a</a>Startup — open a source folder, recents with progress</div>
+<div class="dv-card" style="width:1240px;height:780px;background:radial-gradient(ellipse at 50% 38%,#141519 0%,#0b0c0e 70%);display:flex;align-items:center;justify-content:center">
+  <div style="width:520px;display:flex;flex-direction:column;gap:26px">
+    <div style="display:flex;flex-direction:column;gap:6px;align-items:center">
+      <span style="font:600 22px 'IBM Plex Mono',monospace;color:#e8e9ea;letter-spacing:.02em">fastcull</span>
+      <span style="font:400 11.5px 'IBM Plex Mono',monospace;color:#63666c">keyboard-driven photo culling</span>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:center;gap:10px;border:1.5px dashed #34373d;border-radius:8px;padding:30px 20px;background:rgba(255,255,255,.02)">
+      <span style="font:600 13px 'IBM Plex Sans',sans-serif;color:#0e0f11;background:#5a93d4;border-radius:6px;padding:9px 18px">Open source folder…</span>
+      <span style="font:400 11px 'IBM Plex Mono',monospace;color:#54575d">or drop a folder here · or: fastcull ~/shoots/…</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <span style="font:600 9.5px 'IBM Plex Mono',monospace;color:#63666c;letter-spacing:.14em">RECENT</span>
+      <div style="display:flex;flex-direction:column;border:1px solid rgba(255,255,255,.08);border-radius:6px;overflow:hidden">
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,255,255,.045);font:400 12px 'IBM Plex Mono',monospace">
+          <span style="flex:1;color:#d6d7d9">~/shoots/2026-07-04_lisbon</span><span style="color:#8b8e94">2000 shots</span><span style="color:#57a86d">seen 60%</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,255,255,.02);border-top:1px solid rgba(255,255,255,.05);font:400 12px 'IBM Plex Mono',monospace">
+          <span style="flex:1;color:#a8abb0">~/shoots/2026-06-21_wedding-ana</span><span style="color:#63666c">3412 shots</span><span style="color:#63666c">applied ✓</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,255,255,.02);border-top:1px solid rgba(255,255,255,.05);font:400 12px 'IBM Plex Mono',monospace">
+          <span style="flex:1;color:#a8abb0">~/shoots/2026-06-02_alfama-walk</span><span style="color:#63666c">618 shots</span><span style="color:#63666c">applied ✓</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+
+<!-- ══ 2b APPLY DIALOG ══ -->
+<div class="dv-opt" id="2b"><div class="dv-olabel"><a class="dv-oid" href="#2b">2b</a>Apply dialog — floating overlay in <a class="dv-oid" href="#1b">1b</a>'s language</div>
+<div class="dv-card" style="width:1000px;height:640px;position:relative;background:repeating-linear-gradient(45deg,#17191c 0 18px,#1b1e21 18px 36px)">
+  <div style="position:absolute;inset:0;background:rgba(5,6,7,.6)"></div>
+  <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:560px;background:rgba(13,14,17,.82);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.6);padding:22px 24px;display:flex;flex-direction:column;gap:18px">
+    <div style="display:flex;align-items:baseline;gap:10px">
+      <span style="font:600 15px 'IBM Plex Sans',sans-serif;color:#e8e9ea">Apply — move 2,000 shots</span>
+      <span style="font:400 11px 'IBM Plex Mono',monospace;color:#63666c">nothing is deleted</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:7px">
+      <span style="font:600 9.5px 'IBM Plex Mono',monospace;color:#63666c;letter-spacing:.14em">DESTINATION</span>
+      <div style="display:flex;align-items:center;gap:8px;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.14);border-radius:6px;padding:9px 12px">
+        <span style="flex:1;font:400 12px 'IBM Plex Mono',monospace;color:#d6d7d9">~/shoots/2026-07-04_lisbon/sorted</span>
+        <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#8b8e94">Browse…</span>
+      </div>
+      <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#57a86d">✓ subfolder of source — in-place organize</span>
+    </div>
+    <div style="display:flex;flex-direction:column;border:1px solid rgba(255,255,255,.08);border-radius:6px;overflow:hidden">
+      <sc-for list="{{ buckets }}" as="k" hint-placeholder-count="5">
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:rgba(255,255,255,.03);border-bottom:1px solid rgba(255,255,255,.05);font:400 12px 'IBM Plex Mono',monospace">
+          <span style="width:8px;height:8px;border-radius:50%;background:{{ k.dot }}"></span>
+          <span style="color:#c9cacc;width:110px">{{ k.dir }}</span>
+          <span style="color:#63666c;flex:1">{{ k.note }}</span>
+          <span style="color:#e8e9ea">{{ k.n }}</span>
+        </div>
+      </sc-for>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:5px;font:400 11px 'IBM Plex Mono',monospace;color:#8b8e94">
+      <span>· 3 name collisions → auto-suffixed <span style="color:#63666c">(IMG_0311 → IMG_0311-1)</span></span>
+      <span>· 17 unrecognized files stay behind <span style="color:#63666c">(.mp4, .wav)</span></span>
+      <span>· 9 existing .xmp sidecars carried untouched — tag-write skipped</span>
+      <span style="color:#57a86d">· free space ok — 84 GB needed / 412 GB available</span>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:2px">
+      <span style="font:500 12px 'IBM Plex Sans',sans-serif;color:#9fa3a9;border:1px solid rgba(255,255,255,.18);border-radius:6px;padding:8px 16px">Cancel</span>
+      <span style="font:600 12px 'IBM Plex Sans',sans-serif;color:#0e0f11;background:#57a86d;border-radius:6px;padding:8px 16px">Move 2,000 shots</span>
+    </div>
+  </div>
+</div></div>
+
+<!-- ══ 2c APPLY PROGRESS ══ -->
+<div class="dv-opt" id="2c"><div class="dv-olabel"><a class="dv-oid" href="#2c">2c</a>Apply in flight — journaled progress, safe cancel</div>
+<div class="dv-card" style="width:1000px;height:640px;position:relative;background:repeating-linear-gradient(45deg,#17191c 0 18px,#1b1e21 18px 36px)">
+  <div style="position:absolute;inset:0;background:rgba(5,6,7,.6)"></div>
+  <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:520px;background:rgba(13,14,17,.82);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.6);padding:22px 24px;display:flex;flex-direction:column;gap:16px">
+    <div style="display:flex;align-items:baseline;justify-content:space-between">
+      <span style="font:600 15px 'IBM Plex Sans',sans-serif;color:#e8e9ea">Moving shots…</span>
+      <span style="font:500 12px 'IBM Plex Mono',monospace;color:#9fa3a9">763 / 2,000</span>
+    </div>
+    <div style="height:6px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden"><div style="width:38%;height:100%;background:#57a86d"></div></div>
+    <div style="display:flex;flex-direction:column;gap:4px;font:400 11.5px 'IBM Plex Mono',monospace">
+      <span style="color:#c9cacc">IMG_1207.JPG + .CR3 → <span style="color:#57a86d">02_keep/</span></span>
+      <span style="color:#54575d">cross-fs copy · verified · rename NOREPLACE</span>
+    </div>
+    <div style="display:flex;gap:14px;font:400 11px 'IBM Plex Mono',monospace;color:#8b8e94">
+      <span style="color:#d05f5f">X 81</span><span>· 490</span><span style="color:#57a86d">K 158</span><span style="color:#5a93d4">P 30</span><span style="color:#d2a545">B 4</span>
+      <span style="margin-left:auto;color:#63666c">xmp written 187</span>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;border-top:1px solid rgba(255,255,255,.07);padding-top:14px">
+      <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#54575d">journal: sorted/.fastcull-apply.json</span>
+      <span style="font:500 12px 'IBM Plex Sans',sans-serif;color:#9fa3a9;border:1px solid rgba(255,255,255,.18);border-radius:6px;padding:7px 14px">Stop safely</span>
+    </div>
+  </div>
+</div></div>
+
+<!-- ══ 2d CRASH RECOVERY ══ -->
+<div class="dv-opt" id="2d"><div class="dv-olabel"><a class="dv-oid" href="#2d">2d</a>Launch after a crash mid-apply — resume or report</div>
+<div class="dv-card" style="width:1000px;height:640px;position:relative;background:radial-gradient(ellipse at 50% 38%,#141519 0%,#0b0c0e 70%)">
+  <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:520px;background:rgba(13,14,17,.82);backdrop-filter:blur(12px);border:1px solid rgba(210,165,69,.35);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.6);padding:22px 24px;display:flex;flex-direction:column;gap:16px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="width:26px;height:26px;border-radius:50%;background:rgba(210,165,69,.18);border:1px solid rgba(210,165,69,.5);display:flex;align-items:center;justify-content:center;font:600 13px 'IBM Plex Mono',monospace;color:#d2a545">!</span>
+      <span style="font:600 15px 'IBM Plex Sans',sans-serif;color:#e8e9ea">Interrupted apply found</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:5px;font:400 11.5px 'IBM Plex Mono',monospace;color:#a8abb0">
+      <span>journal: ~/shoots/2026-07-04_lisbon/sorted/.fastcull-apply.json</span>
+      <span><span style="color:#57a86d">1,237 of 2,000</span> moves completed · last write 2026-07-06 18:42</span>
+      <span style="color:#63666c">every completed move is recorded — nothing was deleted</span>
+    </div>
+    <div style="height:5px;background:rgba(255,255,255,.1);border-radius:3px;overflow:hidden"><div style="width:62%;height:100%;background:#d2a545"></div></div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <span style="font:500 12px 'IBM Plex Sans',sans-serif;color:#9fa3a9;border:1px solid rgba(255,255,255,.18);border-radius:6px;padding:8px 16px">Show report</span>
+      <span style="font:600 12px 'IBM Plex Sans',sans-serif;color:#0e0f11;background:#d2a545;border-radius:6px;padding:8px 16px">Resume apply</span>
+    </div>
+  </div>
+</div></div>
+
+<!-- ══ 2e KEYMAP OVERLAY ══ -->
+<div class="dv-opt" id="2e"><div class="dv-olabel"><a class="dv-oid" href="#2e">2e</a>Keymap cheat-sheet — the <a class="dv-oid" href="#1b">1b</a> "?" button expanded</div>
+<div class="dv-card" style="width:1000px;height:640px;position:relative;background:repeating-linear-gradient(45deg,#17191c 0 18px,#1b1e21 18px 36px)">
+  <div style="position:absolute;inset:0;background:rgba(5,6,7,.62)"></div>
+  <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:640px;background:rgba(13,14,17,.82);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.6);padding:22px 26px;display:flex;flex-direction:column;gap:18px">
+    <div style="display:flex;align-items:baseline;justify-content:space-between">
+      <span style="font:600 15px 'IBM Plex Sans',sans-serif;color:#e8e9ea">Keys</span>
+      <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#54575d">? or esc to close</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px 34px">
+      <sc-for list="{{ keygroups }}" as="g" hint-placeholder-count="4">
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <span style="font:600 9.5px 'IBM Plex Mono',monospace;color:#63666c;letter-spacing:.14em">{{ g.title }}</span>
+          <sc-for list="{{ g.rows }}" as="r" hint-placeholder-count="4">
+            <div style="display:flex;align-items:center;gap:10px;font:400 11.5px 'IBM Plex Mono',monospace">
+              <span style="min-width:52px;text-align:center;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.14);border-radius:4px;padding:2.5px 7px;color:#e8e9ea;font-weight:500">{{ r.k }}</span>
+              <span style="color:#a8abb0">{{ r.d }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+</div></div>
+
+<!-- ══ 2f TAG ENTRY ══ -->
+<div class="dv-opt" id="2f"><div class="dv-olabel"><a class="dv-oid" href="#2f">2f</a>Tag entry — translucent, image stays visible</div>
+<div class="dv-card" style="width:900px;height:560px;position:relative;background:repeating-linear-gradient(45deg,#17191c 0 18px,#1b1e21 18px 36px)">
+  <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center"><span style="font:400 12px 'IBM Plex Mono',monospace;color:#5b5e64">photo stays visible — no dim</span></div>
+  <div style="position:absolute;top:14px;right:14px;display:flex;align-items:center;gap:8px">
+    <span style="font:600 12px 'IBM Plex Mono',monospace;color:#0e0f11;background:#5a93d4;border-radius:6px;padding:8px 14px;letter-spacing:.08em">PICK</span>
+  </div>
+  <div style="position:absolute;left:50%;bottom:24px;transform:translateX(-50%);width:380px;background:rgba(13,14,17,.82);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 16px 50px rgba(0,0,0,.6);padding:14px;display:flex;flex-direction:column;gap:10px">
+    <div style="display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.16);border-radius:6px;padding:8px 10px">
+      <span style="font:400 11px 'IBM Plex Mono',monospace;color:#c9cacc;background:rgba(255,255,255,.12);border-radius:3px;padding:2px 7px">street ×</span>
+      <span style="font:400 12px 'IBM Plex Mono',monospace;color:#e8e9ea">mar<span style="display:inline-block;width:1px;height:13px;background:#e8e9ea;vertical-align:-2px;margin-left:1px"></span></span>
+    </div>
+    <div style="display:flex;flex-direction:column;font:400 12px 'IBM Plex Mono',monospace;border:1px solid rgba(255,255,255,.08);border-radius:6px;overflow:hidden">
+      <div style="padding:7px 12px;background:rgba(90,147,212,.22);color:#e8e9ea;display:flex;justify-content:space-between"><span><b style="color:#7fb0e4;font-weight:600">mar</b>ia</span><span style="color:#8b8e94">142</span></div>
+      <div style="padding:7px 12px;background:rgba(255,255,255,.03);color:#a8abb0;display:flex;justify-content:space-between"><span><b style="color:#7fb0e4;font-weight:600">mar</b>ina beach</span><span style="color:#63666c">38</span></div>
+      <div style="padding:7px 12px;background:rgba(255,255,255,.03);color:#a8abb0;display:flex;justify-content:space-between"><span><b style="color:#7fb0e4;font-weight:600">mar</b>ket</span><span style="color:#63666c">21</span></div>
+    </div>
+    <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#54575d;text-align:center">enter add · comma next tag · esc done</span>
+  </div>
+</div></div>
+
+<!-- ══ 2g TOASTS ══ -->
+<div class="dv-opt" id="2g"><div class="dv-olabel"><a class="dv-oid" href="#2g">2g</a>Transient toasts — filter, undo, session restore, apply done</div>
+<div class="dv-card" style="width:560px;background:#101114;padding:26px;display:flex;flex-direction:column;gap:14px;align-items:center">
+  <div style="display:flex;align-items:center;gap:10px;background:rgba(13,14,17,.9);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:9px 16px;box-shadow:0 4px 16px rgba(0,0,0,.5);font:400 12px 'IBM Plex Mono',monospace">
+    <span style="width:7px;height:7px;border-radius:50%;background:#5a93d4"></span><span style="color:#e8e9ea">filter ≥ Pick</span><span style="color:#63666c">100 shots in set</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;background:rgba(13,14,17,.9);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:9px 16px;box-shadow:0 4px 16px rgba(0,0,0,.5);font:400 12px 'IBM Plex Mono',monospace">
+    <span style="color:#9fa3a9">undo</span><span style="color:#e8e9ea">IMG_2046 → keep</span><span style="width:7px;height:7px;border-radius:50%;background:#57a86d"></span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;background:rgba(13,14,17,.9);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:9px 16px;box-shadow:0 4px 16px rgba(0,0,0,.5);font:400 12px 'IBM Plex Mono',monospace">
+    <span style="color:#57a86d">✓</span><span style="color:#e8e9ea">session restored</span><span style="color:#63666c">1204 seen · 715 decided</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;background:rgba(13,14,17,.9);border:1px solid rgba(87,168,109,.4);border-radius:8px;padding:9px 16px;box-shadow:0 4px 16px rgba(0,0,0,.5);font:400 12px 'IBM Plex Mono',monospace">
+    <span style="color:#57a86d">✓</span><span style="color:#e8e9ea">apply complete — 2,000 shots moved</span><span style="color:#63666c">session archived in sorted/</span>
+  </div>
+  <div style="display:flex;align-items:center;gap:10px;background:rgba(13,14,17,.9);border:1px solid rgba(208,95,95,.4);border-radius:8px;padding:9px 16px;box-shadow:0 4px 16px rgba(0,0,0,.5);font:400 12px 'IBM Plex Mono',monospace">
+    <span style="color:#d05f5f">×</span><span style="color:#e8e9ea">.fastcull.json was corrupt</span><span style="color:#63666c">renamed .bad · fresh session</span>
+  </div>
+</div></div>
+
+</div>
+<p class="dv-next">Try next: "make <a class="dv-oid" href="#1b">1b</a> + these dialogs an interactive prototype" · "darken <a class="dv-oid" href="#2b">2b</a>'s backdrop more" · "add an error-state variant of <a class="dv-oid" href="#2c">2c</a>"</p>
+</section>
+
+<section class="dv-turn" id="t1">
+<div class="dv-thd"><a class="dv-tid" href="#t1">1</a><span class="dv-tname">FastCull — main culling view</span></div>
+<div style="font:400 12px/1.6 'IBM Plex Sans',sans-serif;color:rgba(255,255,255,.55);max-width:860px;margin:-8px 0 22px">Assumptions: pro-dark, image-first, middle density. Near-black neutrals, IBM Plex Sans + Mono, tier palette grey/green/blue/gold/red at matched chroma, filmstrip tier <b style="color:#c9cacc">dot badges</b>, unvisited tiles dimmed. Sample state: shot 1,205 of 2,000 (IMG_2047, RAW pair, tier Pick, tags street/maria). Image maximized with floating translucent HUD.</div>
+<div class="dv-opts">
+
+<!-- ══════════ 1b OVERLAY ══════════ -->
+<div class="dv-opt" id="1b"><div class="dv-olabel"><a class="dv-oid" href="#1b">1b</a>Floating HUD — image maximized, chrome as translucent overlays</div>
+<div class="dv-card" style="width:1240px;height:780px;position:relative;background:repeating-linear-gradient(45deg,#17191c 0 18px,#1b1e21 18px 36px)">
+  <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center"><span style="font:400 12px 'IBM Plex Mono',monospace;color:#5b5e64">photo — full-bleed fit</span></div>
+  <div style="position:absolute;top:14px;left:14px;display:flex;align-items:center;gap:10px;background:rgba(10,11,13,.72);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:7px 12px">
+    <span style="font:500 12px 'IBM Plex Mono',monospace;color:#e8e9ea">IMG_2047.JPG</span>
+    <span style="font:600 9px 'IBM Plex Mono',monospace;color:#9fa3a9;border:1px solid #45484e;border-radius:3px;padding:1.5px 4px">RAW</span>
+    <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#7d8087">1205/2000</span>
+  </div>
+  <div style="position:absolute;top:14px;right:14px;display:flex;align-items:center;gap:8px">
+    <div style="display:flex;align-items:center;gap:6px;background:rgba(10,11,13,.72);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:7px 12px">
+      <sc-for list="{{ counts }}" as="c" hint-placeholder-count="5">
+        <span style="display:flex;align-items:center;gap:4px;font:400 10.5px 'IBM Plex Mono',monospace;color:#a8abb0"><span style="width:6px;height:6px;border-radius:50%;background:{{ c.dot }}"></span>{{ c.n }}</span>
+      </sc-for>
+    </div>
+    <span style="font:600 12px 'IBM Plex Mono',monospace;color:#0e0f11;background:#5a93d4;border-radius:6px;padding:8px 14px;letter-spacing:.08em;box-shadow:0 2px 8px rgba(0,0,0,.4)">PICK</span>
+  </div>
+  <div style="position:absolute;left:14px;bottom:104px;display:flex;flex-direction:column;gap:8px;background:rgba(10,11,13,.72);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);border-radius:6px;padding:10px 12px;width:220px">
+    <div style="height:44px;display:flex;align-items:flex-end;gap:1px">
+      <sc-for list="{{ bars }}" as="b" hint-placeholder-count="8">
+        <div style="flex:1;background:rgba(255,255,255,.32);height:{{ b.h }}"></div>
+      </sc-for>
+    </div>
+    <span style="font:400 10.5px 'IBM Plex Mono',monospace;color:#8b8e94">1/250s · ƒ2.8 · ISO 400 · 85mm</span>
+    <div style="display:flex;gap:5px">
+      <span style="font:400 10px 'IBM Plex Mono',monospace;color:#c9cacc;background:rgba(255,255,255,.1);border-radius:3px;padding:2px 6px">street</span>
+      <span style="font:400 10px 'IBM Plex Mono',monospace;color:#c9cacc;background:rgba(255,255,255,.1);border-radius:3px;padding:2px 6px">maria</span>
+    </div>
+  </div>
+  <div style="position:absolute;right:14px;bottom:104px;width:30px;height:30px;border-radius:50%;background:rgba(10,11,13,.72);border:1px solid rgba(255,255,255,.12);display:flex;align-items:center;justify-content:center;font:500 12px 'IBM Plex Mono',monospace;color:#8b8e94">?</div>
+  <div style="position:absolute;left:14px;right:14px;bottom:14px;display:flex;gap:5px;align-items:center;background:rgba(10,11,13,.72);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:7px;overflow:hidden">
+    <div style="flex:1;min-width:0;overflow:hidden;display:flex;gap:5px">
+    <sc-for list="{{ strip }}" as="t" hint-placeholder-count="12">
+      <div style="position:relative;flex:none;width:84px;height:56px;border-radius:3px;background:{{ t.bg }};opacity:{{ t.op }};box-shadow:{{ t.bs }}">
+        <sc-if value="{{ t.dot }}" hint-placeholder-val="{{ false }}"><span style="position:absolute;top:4px;right:4px;width:7px;height:7px;border-radius:50%;background:{{ t.dot }};box-shadow:0 0 0 2px rgba(0,0,0,.55)"></span></sc-if>
+      </div>
+    </sc-for>
+    </div>
+    <div style="flex:none;display:flex;flex-direction:column;gap:4px;align-items:flex-end;padding:0 6px">
+      <span style="font:400 10px 'IBM Plex Mono',monospace;color:#7d8087">seen 1204/2000</span>
+      <div style="width:80px;height:3px;background:rgba(255,255,255,.12);border-radius:2px;overflow:hidden"><div style="width:60%;height:100%;background:#57a86d"></div></div>
+    </div>
+  </div>
+</div></div>
+
+</div>
+<p class="dv-next">Try next: "make 1b interactive with real keyboard culling" · "add a resize/orientation variant" · "tune the tier colors"</p>
+</section>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;showKeymap&quot;: {&quot;editor&quot;: &quot;boolean&quot;, &quot;default&quot;: true, &quot;tsType&quot;: &quot;boolean&quot;, &quot;section&quot;: &quot;HUD&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const C = { k:'#57a86d', p:'#5a93d4', b:'#d2a545', x:'#d05f5f', r:'#63666c' };
+    const tones = ['#232629','#1e2124','#282b2f','#202328','#25282c','#1c1f22','#2a2d32','#212427'];
+    const tiers = [C.k, C.k, null, C.x, C.p, 'CUR', C.b, null, C.k, C.x, null, C.p, C.k, null];
+    const strip = tiers.map((t, i) => {
+      const cur = t === 'CUR';
+      const dot = cur ? C.p : t;
+      const unvisited = !cur && !t && i > 6;
+      return {
+        bg: `repeating-linear-gradient(45deg, ${tones[i % 8]} 0 10px, ${tones[(i + 3) % 8]} 10px 20px)`,
+        dot: dot || false,
+        op: unvisited ? '.4' : '1',
+        bs: cur ? '0 0 0 2px #e8e9ea' : 'none'
+      };
+    });
+    const heights = [14,22,34,48,62,70,76,68,55,62,72,80,68,52,40,31,25,21,27,35,42,33,23,15,11,9,13,19,15,10];
+    return {
+      showKeymap: this.props.showKeymap ?? true,
+      strip,
+      bars: heights.map(h => ({ h: h + '%' })),
+      counts: [
+        { dot: C.b, label: 'best', n: '12' },
+        { dot: C.p, label: 'pick', n: '88' },
+        { dot: C.k, label: 'keep', n: '412' },
+        { dot: C.r, label: 'rest', n: '1285' },
+        { dot: C.x, label: 'reject', n: '203' }
+      ],
+      keygroups: [
+        { title: 'TIER', rows: [
+          { k: '1', d: 'keep' }, { k: '2', d: 'pick' }, { k: '3', d: 'best' },
+          { k: 'X', d: 'reject' }, { k: '0 / `', d: 'clear → rest' }, { k: 'U', d: 'undo last change' }
+        ]},
+        { title: 'NAVIGATE', rows: [
+          { k: '← →', d: 'prev / next' }, { k: 'space', d: 'next' }, { k: 'bksp', d: 'prev' },
+          { k: 'tab', d: 'next unvisited' }, { k: 'F', d: 'cycle tier filter' }
+        ]},
+        { title: 'VIEW & TAGS', rows: [
+          { k: 'Z', d: '1:1 zoom (sticky pan)' }, { k: 'T', d: 'tag entry' }, { k: '?', d: 'this sheet' }
+        ]},
+        { title: 'SESSION', rows: [
+          { k: 'A', d: 'apply — move to destination' }, { k: 'ctrl S', d: 'force-save session' }
+        ]}
+      ],
+      buckets: [
+        { dot: C.x, dir: '00_rejected', note: 'kept, not deleted', n: '203' },
+        { dot: C.r, dir: '01_rest', note: 'undecided + cleared', n: '1285' },
+        { dot: C.k, dir: '02_keep', note: 'rating 3 · xmp', n: '412' },
+        { dot: C.p, dir: '03_picks', note: 'rating 4 · xmp', n: '88' },
+        { dot: C.b, dir: '04_bests', note: 'rating 5 · xmp', n: '12' }
+      ]
+    };
+  }
+}
+</script>
+</body>
+</html>
