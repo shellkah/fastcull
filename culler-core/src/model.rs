@@ -86,6 +86,41 @@ impl Decision {
     }
 }
 
+/// A capture instant, string-comparable straight from EXIF. Pure model type
+/// (no exif dependency — `scan` fills it in a later phase).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CaptureTime {
+    /// "YYYY:MM:DD HH:MM:SS" exactly as EXIF stores it (lexically sortable).
+    pub datetime: Option<String>,
+    /// SubSecTimeOriginal parsed to a number.
+    pub subsec: Option<u32>,
+}
+
+/// One shot = all files sharing a filename stem. Produced by `scan`.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Shot {
+    pub stem: String, // the shot key, e.g. "IMG_1234" (case preserved as on disk)
+    pub jpeg: std::path::PathBuf, // display file, required in v1
+    pub raw: Option<std::path::PathBuf>,
+    pub sidecar: Option<std::path::PathBuf>, // pre-existing xmp (either convention)
+    pub capture: CaptureTime,
+}
+
+impl Shot {
+    /// All on-disk files belonging to this shot, in move order: jpeg, raw?, sidecar?.
+    pub fn files(&self) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::with_capacity(3);
+        out.push(self.jpeg.clone());
+        if let Some(raw) = &self.raw {
+            out.push(raw.clone());
+        }
+        if let Some(sidecar) = &self.sidecar {
+            out.push(sidecar.clone());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +212,49 @@ mod tests {
         };
         assert_eq!(reject.bucket(), BUCKET_REJECTED);
         assert_eq!(reject.xmp_rating(), Some(-1));
+    }
+
+    #[test]
+    fn shot_files_lists_jpeg_only_when_no_siblings() {
+        let shot = Shot {
+            stem: "IMG_1234".to_string(),
+            jpeg: std::path::PathBuf::from("/src/IMG_1234.JPG"),
+            raw: None,
+            sidecar: None,
+            capture: CaptureTime::default(),
+        };
+        assert_eq!(
+            shot.files(),
+            vec![std::path::PathBuf::from("/src/IMG_1234.JPG")]
+        );
+    }
+
+    #[test]
+    fn shot_files_orders_jpeg_then_raw_then_sidecar() {
+        let shot = Shot {
+            stem: "IMG_1234".to_string(),
+            jpeg: std::path::PathBuf::from("/src/IMG_1234.JPG"),
+            raw: Some(std::path::PathBuf::from("/src/IMG_1234.CR3")),
+            sidecar: Some(std::path::PathBuf::from("/src/IMG_1234.xmp")),
+            capture: CaptureTime {
+                datetime: Some("2026:07:08 10:11:12".to_string()),
+                subsec: Some(42),
+            },
+        };
+        assert_eq!(
+            shot.files(),
+            vec![
+                std::path::PathBuf::from("/src/IMG_1234.JPG"),
+                std::path::PathBuf::from("/src/IMG_1234.CR3"),
+                std::path::PathBuf::from("/src/IMG_1234.xmp"),
+            ]
+        );
+    }
+
+    #[test]
+    fn capture_time_default_is_empty() {
+        let c = CaptureTime::default();
+        assert_eq!(c.datetime, None);
+        assert_eq!(c.subsec, None);
     }
 }
