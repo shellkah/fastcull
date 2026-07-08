@@ -21,11 +21,17 @@ impl std::fmt::Display for PersistError {
 impl std::error::Error for PersistError {}
 
 /// Serialize `session` to `path` atomically: write `<path>.tmp` in the same
-/// directory, then `rename` it over `path` (rename is atomic on the same FS).
+/// directory, fsync it, then `rename` it over `path` (rename is atomic on the
+/// same FS).
 pub fn save(session: &Session, path: &Path) -> Result<(), PersistError> {
     let json = serde_json::to_vec_pretty(session).map_err(PersistError::Corrupt)?;
     let tmp = tmp_path(path);
-    std::fs::write(&tmp, &json).map_err(PersistError::Io)?;
+    let mut file = std::fs::File::create(&tmp).map_err(PersistError::Io)?;
+    std::io::Write::write_all(&mut file, &json).map_err(PersistError::Io)?;
+    // Without this, a crash can commit the rename before the data blocks
+    // reach disk, publishing a truncated sidecar.
+    file.sync_all().map_err(PersistError::Io)?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(PersistError::Io)?;
     Ok(())
 }
@@ -150,6 +156,32 @@ mod tests {
         assert_eq!(loaded.decisions, session.decisions);
         assert_eq!(loaded.current, 0);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_replaces_existing_sidecar_on_resave() {
+        let dir = unique_temp_dir("resave");
+        let path = dir.join(SESSION_FILE);
+
+        let first = Session {
+            source_dir: dir.clone(),
+            current: 0,
+            ..Session::default()
+        };
+        save(&first, &path).unwrap();
+
+        let second = Session {
+            source_dir: dir.clone(),
+            current: 7,
+            ..Session::default()
+        };
+        save(&second, &path).unwrap();
+
+        // The autosave path: the newer session fully replaces the older one,
+        // and no temp file is left behind.
+        assert_eq!(load(&path).unwrap().current, 7);
+        assert!(!dir.join(".fastcull.json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
