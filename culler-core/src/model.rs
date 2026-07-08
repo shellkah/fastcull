@@ -244,6 +244,60 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Per-bucket counts over ALL shots. A shot with no decision (or a cleared
+    /// tier) counts as `rest` — the destination it would land in on Apply.
+    pub fn counts(&self) -> TierCounts {
+        let mut c = TierCounts::default();
+        for shot in &self.shots {
+            let tier = self.decisions.get(&shot.stem).and_then(|d| d.tier);
+            match tier {
+                Some(Tier::Reject) => c.rejected += 1,
+                Some(Tier::Keep) => c.keep += 1,
+                Some(Tier::Pick) => c.picks += 1,
+                Some(Tier::Best) => c.bests += 1,
+                None => c.rest += 1,
+            }
+        }
+        c
+    }
+
+    /// How many shots have been seen in the loupe (real completion progress).
+    pub fn visited_count(&self) -> usize {
+        self.shots
+            .iter()
+            .filter(|shot| {
+                self.decisions
+                    .get(&shot.stem)
+                    .map(|d| d.visited)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    /// First unvisited shot at index `>= from` (inclusive), or `None`.
+    pub fn next_unvisited(&self, from: usize) -> Option<usize> {
+        (from..self.shots.len()).find(|&i| {
+            !self
+                .decisions
+                .get(&self.shots[i].stem)
+                .map(|d| d.visited)
+                .unwrap_or(false)
+        })
+    }
+
+    /// All tags used across the session, sorted and de-duplicated (autocomplete).
+    pub fn all_tags(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for decision in self.decisions.values() {
+            for tag in &decision.tags {
+                set.insert(tag.clone());
+            }
+        }
+        set.into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +632,79 @@ mod tests {
         session.mark_visited(99);
         assert!(session.undo.is_empty());
         assert!(session.decisions.is_empty());
+    }
+
+    #[test]
+    fn counts_buckets_every_shot_undecided_as_rest() {
+        let mut session = fixture_session(&["A", "B", "C", "D", "E"]);
+        session.set_tier(0, Some(Tier::Keep));
+        session.set_tier(1, Some(Tier::Pick));
+        session.set_tier(2, Some(Tier::Best));
+        session.set_tier(3, Some(Tier::Reject));
+        // index 4 ("E") left undecided → rest
+        assert_eq!(
+            session.counts(),
+            TierCounts {
+                rejected: 1,
+                rest: 1,
+                keep: 1,
+                picks: 1,
+                bests: 1
+            }
+        );
+    }
+
+    #[test]
+    fn counts_treats_cleared_tier_as_rest() {
+        let mut session = fixture_session(&["A", "B"]);
+        session.set_tier(0, Some(Tier::Keep));
+        session.set_tier(0, None); // explicitly cleared back to Rest
+        assert_eq!(
+            session.counts(),
+            TierCounts {
+                rejected: 0,
+                rest: 2,
+                keep: 0,
+                picks: 0,
+                bests: 0
+            }
+        );
+    }
+
+    #[test]
+    fn visited_count_counts_only_visited() {
+        let mut session = fixture_session(&["A", "B", "C"]);
+        session.mark_visited(0);
+        session.mark_visited(2);
+        assert_eq!(session.visited_count(), 2);
+    }
+
+    #[test]
+    fn next_unvisited_finds_first_from_index_inclusive() {
+        let mut session = fixture_session(&["A", "B", "C"]);
+        session.mark_visited(0);
+        assert_eq!(session.next_unvisited(0), Some(1));
+        assert_eq!(session.next_unvisited(1), Some(1)); // inclusive of `from`
+        session.mark_visited(1);
+        session.mark_visited(2);
+        assert_eq!(session.next_unvisited(0), None);
+    }
+
+    #[test]
+    fn next_unvisited_past_end_is_none() {
+        let session = fixture_session(&["A", "B"]);
+        assert_eq!(session.next_unvisited(0), Some(0));
+        assert_eq!(session.next_unvisited(5), None);
+    }
+
+    #[test]
+    fn all_tags_are_sorted_and_unique() {
+        let mut session = fixture_session(&["A", "B"]);
+        session.set_tags(0, vec!["sky".to_string(), "tree".to_string()]);
+        session.set_tags(1, vec!["tree".to_string(), "beach".to_string()]);
+        assert_eq!(
+            session.all_tags(),
+            vec!["beach".to_string(), "sky".to_string(), "tree".to_string()]
+        );
     }
 }
