@@ -1,6 +1,6 @@
 //! Session persistence: atomic JSON sidecar read/write for `.fastcull.json`.
 
-use crate::model::Session;
+use crate::model::{Session, SESSION_BAD_FILE, SESSION_FILE};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -37,6 +37,29 @@ pub fn load(path: &Path) -> Result<Session, PersistError> {
     serde_json::from_slice(&bytes).map_err(PersistError::Corrupt)
 }
 
+/// Load the session sidecar from `source_dir/SESSION_FILE`.
+/// - Missing file → `Ok(None)` (start a fresh session).
+/// - Valid file → `Ok(Some(session))`.
+/// - Corrupt file → rename it to the `SESSION_BAD_FILE` sibling (preserving the
+///   evidence, never overwriting) and return `Ok(None)`.
+/// - Other I/O errors → `Err(PersistError::Io)`.
+pub fn load_or_fresh(source_dir: &Path) -> Result<Option<Session>, PersistError> {
+    let path = source_dir.join(SESSION_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(PersistError::Io(e)),
+    };
+    match serde_json::from_slice::<Session>(&bytes) {
+        Ok(session) => Ok(Some(session)),
+        Err(_) => {
+            let bad = source_dir.join(SESSION_BAD_FILE);
+            std::fs::rename(&path, &bad).map_err(PersistError::Io)?;
+            Ok(None)
+        }
+    }
+}
+
 /// `<path>.tmp` in the same directory, so the subsequent rename stays same-FS.
 fn tmp_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_owned();
@@ -47,7 +70,7 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CaptureTime, Decision, Session, Shot, Tier, SESSION_FILE};
+    use crate::model::{CaptureTime, Decision, Session, Shot, Tier, SESSION_BAD_FILE, SESSION_FILE};
     use std::path::PathBuf;
 
     /// A fresh, unique temp directory for a single test.
@@ -134,6 +157,48 @@ mod tests {
             }
             other => panic!("expected Io(NotFound), got {other:?}"),
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_fresh_missing_returns_none() {
+        let dir = unique_temp_dir("lofmissing");
+        assert!(load_or_fresh(&dir).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_fresh_valid_returns_session() {
+        let dir = unique_temp_dir("lofvalid");
+        let path = dir.join(SESSION_FILE);
+        let session = Session {
+            source_dir: dir.clone(),
+            ..Session::default()
+        };
+        save(&session, &path).unwrap();
+
+        let loaded = load_or_fresh(&dir).unwrap().expect("session present");
+        assert_eq!(loaded.source_dir, dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_fresh_corrupt_renames_to_bad_and_returns_none() {
+        let dir = unique_temp_dir("lofcorrupt");
+        let path = dir.join(SESSION_FILE);
+        std::fs::write(&path, b"{ this is not valid json ").unwrap();
+
+        let result = load_or_fresh(&dir).unwrap();
+        assert!(result.is_none());
+        // The original is renamed aside, not overwritten or deleted.
+        assert!(!path.exists());
+        let bad = dir.join(SESSION_BAD_FILE);
+        assert!(bad.exists());
+        // Evidence is preserved verbatim.
+        assert_eq!(
+            std::fs::read(&bad).unwrap(),
+            b"{ this is not valid json ".to_vec()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
