@@ -121,6 +121,49 @@ impl Shot {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UndoEntry {
+    pub stem: String,
+    pub previous: Decision,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Session {
+    pub source_dir: std::path::PathBuf,
+    pub shots: Vec<Shot>,
+    /// Keyed by `Shot.stem` so resume re-attaches decisions after a rescan.
+    pub decisions: std::collections::HashMap<String, Decision>,
+    pub current: usize, // index into `shots`
+    #[serde(skip)]
+    pub undo: Vec<UndoEntry>, // bounded (UNDO_LIMIT), most-recent last
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TierCounts {
+    pub rejected: usize,
+    pub rest: usize,
+    pub keep: usize,
+    pub picks: usize,
+    pub bests: usize,
+}
+
+impl Session {
+    /// The decision for `shots[index]` (keyed by its stem), or a reference to a
+    /// stored default `Decision` when the shot has no recorded decision or the
+    /// index is out of range. Never panics.
+    pub fn decision(&self, index: usize) -> &Decision {
+        static DEFAULT: Decision = Decision {
+            tier: None,
+            tags: Vec::new(),
+            visited: false,
+        };
+        self.shots
+            .get(index)
+            .and_then(|shot| self.decisions.get(&shot.stem))
+            .unwrap_or(&DEFAULT)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +299,102 @@ mod tests {
         let c = CaptureTime::default();
         assert_eq!(c.datetime, None);
         assert_eq!(c.subsec, None);
+    }
+
+    #[test]
+    fn session_serde_round_trips_and_skips_undo() {
+        let mut session = Session {
+            source_dir: std::path::PathBuf::from("/src"),
+            shots: vec![Shot {
+                stem: "IMG_0001".to_string(),
+                jpeg: std::path::PathBuf::from("/src/IMG_0001.JPG"),
+                raw: None,
+                sidecar: None,
+                capture: CaptureTime::default(),
+            }],
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            undo: vec![UndoEntry {
+                stem: "IMG_0001".to_string(),
+                previous: Decision::default(),
+            }],
+        };
+        session.decisions.insert(
+            "IMG_0001".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec!["sky".to_string()],
+                visited: true,
+            },
+        );
+
+        let json = serde_json::to_string(&session).unwrap();
+        // #[serde(skip)] means the undo stack is never serialized.
+        assert!(!json.contains("undo"));
+
+        let restored: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.source_dir, session.source_dir);
+        assert_eq!(restored.shots, session.shots);
+        assert_eq!(restored.decisions, session.decisions);
+        assert_eq!(restored.current, 0);
+        assert!(restored.undo.is_empty()); // skipped on ser, defaults on de
+    }
+
+    #[test]
+    fn session_decision_returns_stored_default_when_absent() {
+        let session = Session {
+            source_dir: std::path::PathBuf::from("/src"),
+            shots: vec![Shot {
+                stem: "IMG_0001".to_string(),
+                jpeg: std::path::PathBuf::from("/src/IMG_0001.JPG"),
+                raw: None,
+                sidecar: None,
+                capture: CaptureTime::default(),
+            }],
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            undo: Vec::new(),
+        };
+        let d = session.decision(0);
+        assert!(d.is_undecided());
+        assert_eq!(d, &Decision::default());
+        // Out-of-range index is also a default view, never a panic.
+        assert_eq!(session.decision(99), &Decision::default());
+    }
+
+    #[test]
+    fn session_decision_returns_stored_value_when_present() {
+        let mut session = Session::default();
+        session.shots.push(Shot {
+            stem: "IMG_0001".to_string(),
+            jpeg: std::path::PathBuf::from("/src/IMG_0001.JPG"),
+            raw: None,
+            sidecar: None,
+            capture: CaptureTime::default(),
+        });
+        session.decisions.insert(
+            "IMG_0001".to_string(),
+            Decision {
+                tier: Some(Tier::Best),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        assert_eq!(session.decision(0).tier, Some(Tier::Best));
+        assert!(session.decision(0).visited);
+    }
+
+    #[test]
+    fn tier_counts_default_is_all_zero() {
+        assert_eq!(
+            TierCounts::default(),
+            TierCounts {
+                rejected: 0,
+                rest: 0,
+                keep: 0,
+                picks: 0,
+                bests: 0
+            }
+        );
     }
 }
