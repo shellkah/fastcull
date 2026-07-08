@@ -5,6 +5,7 @@
 //! Nothing in this crate depends on Slint or any GUI type.
 
 pub mod model;
+pub mod persist;
 
 #[cfg(test)]
 mod tests {
