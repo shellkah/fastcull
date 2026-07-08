@@ -62,6 +62,30 @@ impl Tier {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Decision {
+    pub tier: Option<Tier>, // None = undecided/Rest → 01_rest on Apply
+    pub tags: Vec<String>,
+    pub visited: bool, // set the first time the shot is shown in the loupe
+}
+
+impl Decision {
+    /// Destination bucket: the tier's bucket, or `BUCKET_REST` when undecided.
+    pub fn bucket(&self) -> &'static str {
+        self.tier.map(Tier::bucket).unwrap_or(BUCKET_REST)
+    }
+
+    /// XMP rating for this decision, or `None` when undecided.
+    pub fn xmp_rating(&self) -> Option<i32> {
+        self.tier.map(Tier::xmp_rating)
+    }
+
+    /// True when no tier has been assigned (undecided / residual Rest).
+    pub fn is_undecided(&self) -> bool {
+        self.tier.is_none()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +147,35 @@ mod tests {
         assert_eq!(Tier::Keep.xmp_rating(), 3);
         assert_eq!(Tier::Pick.xmp_rating(), 4);
         assert_eq!(Tier::Best.xmp_rating(), 5);
+    }
+
+    #[test]
+    fn decision_default_is_undecided_rest() {
+        let d = Decision::default();
+        assert!(d.is_undecided());
+        assert_eq!(d.bucket(), BUCKET_REST);
+        assert_eq!(d.xmp_rating(), None);
+        assert!(d.tags.is_empty());
+        assert!(!d.visited);
+    }
+
+    #[test]
+    fn decision_bucket_and_rating_follow_tier() {
+        let pick = Decision {
+            tier: Some(Tier::Pick),
+            tags: vec![],
+            visited: true,
+        };
+        assert!(!pick.is_undecided());
+        assert_eq!(pick.bucket(), BUCKET_PICKS);
+        assert_eq!(pick.xmp_rating(), Some(4));
+
+        let reject = Decision {
+            tier: Some(Tier::Reject),
+            tags: vec![],
+            visited: true,
+        };
+        assert_eq!(reject.bucket(), BUCKET_REJECTED);
+        assert_eq!(reject.xmp_rating(), Some(-1));
     }
 }
