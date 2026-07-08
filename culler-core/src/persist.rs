@@ -40,8 +40,9 @@ pub fn load(path: &Path) -> Result<Session, PersistError> {
 /// Load the session sidecar from `source_dir/SESSION_FILE`.
 /// - Missing file → `Ok(None)` (start a fresh session).
 /// - Valid file → `Ok(Some(session))`.
-/// - Corrupt file → rename it to the `SESSION_BAD_FILE` sibling (preserving the
-///   evidence, never overwriting) and return `Ok(None)`.
+/// - Corrupt file → rename it to the first free `SESSION_BAD_FILE` sibling
+///   (`.bad`, then `.bad.1`, `.bad.2`, …) so every corruption's evidence is
+///   preserved, and return `Ok(None)`.
 /// - Other I/O errors → `Err(PersistError::Io)`.
 pub fn load_or_fresh(source_dir: &Path) -> Result<Option<Session>, PersistError> {
     let path = source_dir.join(SESSION_FILE);
@@ -53,10 +54,28 @@ pub fn load_or_fresh(source_dir: &Path) -> Result<Option<Session>, PersistError>
     match serde_json::from_slice::<Session>(&bytes) {
         Ok(session) => Ok(Some(session)),
         Err(_) => {
-            let bad = source_dir.join(SESSION_BAD_FILE);
+            let bad = quarantine_path(source_dir);
             std::fs::rename(&path, &bad).map_err(PersistError::Io)?;
             Ok(None)
         }
+    }
+}
+
+/// First quarantine name with no existing file: `SESSION_BAD_FILE`, then
+/// numbered `.1`, `.2`, … siblings, so a rename there never destroys evidence
+/// from an earlier corruption.
+fn quarantine_path(source_dir: &Path) -> PathBuf {
+    let bad = source_dir.join(SESSION_BAD_FILE);
+    if !bad.exists() {
+        return bad;
+    }
+    let mut n: u32 = 1;
+    loop {
+        let candidate = source_dir.join(format!("{}.{}", SESSION_BAD_FILE, n));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
@@ -198,6 +217,38 @@ mod tests {
         assert_eq!(
             std::fs::read(&bad).unwrap(),
             b"{ this is not valid json ".to_vec()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_fresh_repeated_corruption_preserves_all_evidence() {
+        let dir = unique_temp_dir("lofrepeat");
+        let path = dir.join(SESSION_FILE);
+
+        // First corruption is quarantined to the plain .bad sibling.
+        std::fs::write(&path, b"corrupt evidence A").unwrap();
+        assert!(load_or_fresh(&dir).unwrap().is_none());
+
+        // A later corruption must NOT clobber the earlier quarantine file.
+        std::fs::write(&path, b"corrupt evidence B").unwrap();
+        assert!(load_or_fresh(&dir).unwrap().is_none());
+
+        // And the numbering keeps advancing past existing suffixes.
+        std::fs::write(&path, b"corrupt evidence C").unwrap();
+        assert!(load_or_fresh(&dir).unwrap().is_none());
+
+        assert_eq!(
+            std::fs::read(dir.join(SESSION_BAD_FILE)).unwrap(),
+            b"corrupt evidence A".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format!("{}.1", SESSION_BAD_FILE))).unwrap(),
+            b"corrupt evidence B".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format!("{}.2", SESSION_BAD_FILE))).unwrap(),
+            b"corrupt evidence C".to_vec()
         );
         std::fs::remove_dir_all(&dir).ok();
     }
