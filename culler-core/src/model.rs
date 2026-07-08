@@ -164,6 +164,86 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Assign (or clear, with `None`) the tier for `shots[index]`. Records the
+    /// previous decision on the undo stack. Does NOT auto-advance — the input
+    /// layer owns navigation. No-op if `index` is out of range.
+    pub fn set_tier(&mut self, index: usize, tier: Option<Tier>) {
+        let stem = match self.shots.get(index) {
+            Some(shot) => shot.stem.clone(),
+            None => return,
+        };
+        let previous = self.decisions.get(&stem).cloned().unwrap_or_default();
+        self.record_undo(stem.clone(), previous);
+        self.decisions.entry(stem).or_default().tier = tier;
+    }
+
+    /// Add a single tag to `shots[index]`, ignoring duplicates. Records undo.
+    /// No-op if `index` is out of range.
+    pub fn add_tag(&mut self, index: usize, tag: String) {
+        let stem = match self.shots.get(index) {
+            Some(shot) => shot.stem.clone(),
+            None => return,
+        };
+        let previous = self.decisions.get(&stem).cloned().unwrap_or_default();
+        self.record_undo(stem.clone(), previous);
+        let entry = self.decisions.entry(stem).or_default();
+        if !entry.tags.contains(&tag) {
+            entry.tags.push(tag);
+        }
+    }
+
+    /// Replace all tags on `shots[index]` with `tags`, dropping duplicates and
+    /// keeping first-occurrence order. Records undo. No-op if out of range.
+    pub fn set_tags(&mut self, index: usize, tags: Vec<String>) {
+        let stem = match self.shots.get(index) {
+            Some(shot) => shot.stem.clone(),
+            None => return,
+        };
+        let previous = self.decisions.get(&stem).cloned().unwrap_or_default();
+        self.record_undo(stem.clone(), previous);
+        let mut deduped: Vec<String> = Vec::with_capacity(tags.len());
+        for t in tags {
+            if !deduped.contains(&t) {
+                deduped.push(t);
+            }
+        }
+        self.decisions.entry(stem).or_default().tags = deduped;
+    }
+
+    /// Mark `shots[index]` as seen. Idempotent; records NO undo entry.
+    /// No-op if `index` is out of range.
+    pub fn mark_visited(&mut self, index: usize) {
+        let stem = match self.shots.get(index) {
+            Some(shot) => shot.stem.clone(),
+            None => return,
+        };
+        self.decisions.entry(stem).or_default().visited = true;
+    }
+
+    /// Revert the most recent tier/tag change. Returns `false` if the stack is
+    /// empty. Restoring a previously-absent decision stores its default value,
+    /// which is equivalent to absence for every read path (counts, tags, etc.).
+    pub fn undo(&mut self) -> bool {
+        match self.undo.pop() {
+            Some(entry) => {
+                self.decisions.insert(entry.stem, entry.previous);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Push a previous decision onto the bounded undo stack, dropping the oldest
+    /// entry once `UNDO_LIMIT` is exceeded.
+    fn record_undo(&mut self, stem: String, previous: Decision) {
+        self.undo.push(UndoEntry { stem, previous });
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +476,107 @@ mod tests {
                 bests: 0
             }
         );
+    }
+
+    /// Build a session of undecided shots with the given stems.
+    fn fixture_session(stems: &[&str]) -> Session {
+        let mut session = Session::default();
+        for stem in stems {
+            session.shots.push(Shot {
+                stem: (*stem).to_string(),
+                jpeg: std::path::PathBuf::from(format!("/src/{stem}.JPG")),
+                raw: None,
+                sidecar: None,
+                capture: CaptureTime::default(),
+            });
+        }
+        session
+    }
+
+    #[test]
+    fn set_tier_records_undo_and_undo_restores_stepwise() {
+        let mut session = fixture_session(&["A"]);
+
+        session.set_tier(0, Some(Tier::Keep));
+        assert_eq!(session.decision(0).tier, Some(Tier::Keep));
+        assert_eq!(session.undo.len(), 1);
+
+        session.set_tier(0, Some(Tier::Best));
+        assert_eq!(session.decision(0).tier, Some(Tier::Best));
+        assert_eq!(session.undo.len(), 2);
+
+        assert!(session.undo());
+        assert_eq!(session.decision(0).tier, Some(Tier::Keep));
+        assert!(session.undo());
+        assert_eq!(session.decision(0).tier, None); // back to undecided
+        assert!(!session.undo()); // stack empty
+    }
+
+    #[test]
+    fn set_tier_preserves_existing_tags_and_visited() {
+        let mut session = fixture_session(&["A"]);
+        session.mark_visited(0);
+        session.add_tag(0, "sky".to_string());
+        session.set_tier(0, Some(Tier::Pick));
+        assert_eq!(session.decision(0).tier, Some(Tier::Pick));
+        assert_eq!(session.decision(0).tags, vec!["sky".to_string()]);
+        assert!(session.decision(0).visited);
+    }
+
+    #[test]
+    fn add_tag_dedupes_and_records_undo() {
+        let mut session = fixture_session(&["A"]);
+        session.add_tag(0, "sky".to_string());
+        session.add_tag(0, "sky".to_string()); // duplicate ignored
+        session.add_tag(0, "tree".to_string());
+        assert_eq!(
+            session.decision(0).tags,
+            vec!["sky".to_string(), "tree".to_string()]
+        );
+
+        assert!(session.undo()); // reverts the "tree" add
+        assert_eq!(session.decision(0).tags, vec!["sky".to_string()]);
+    }
+
+    #[test]
+    fn set_tags_replaces_and_dedupes_preserving_order() {
+        let mut session = fixture_session(&["A"]);
+        session.set_tags(
+            0,
+            vec!["a".to_string(), "b".to_string(), "a".to_string()],
+        );
+        assert_eq!(
+            session.decision(0).tags,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn mark_visited_is_idempotent_and_records_no_undo() {
+        let mut session = fixture_session(&["A"]);
+        session.mark_visited(0);
+        session.mark_visited(0);
+        assert!(session.decision(0).visited);
+        assert!(session.undo.is_empty());
+    }
+
+    #[test]
+    fn undo_stack_is_bounded_at_limit() {
+        let mut session = fixture_session(&["A"]);
+        for _ in 0..(UNDO_LIMIT + 50) {
+            session.add_tag(0, "x".to_string());
+        }
+        assert_eq!(session.undo.len(), UNDO_LIMIT);
+    }
+
+    #[test]
+    fn transitions_on_out_of_range_index_are_no_ops() {
+        let mut session = fixture_session(&["A"]);
+        session.set_tier(99, Some(Tier::Keep));
+        session.add_tag(99, "x".to_string());
+        session.set_tags(99, vec!["y".to_string()]);
+        session.mark_visited(99);
+        assert!(session.undo.is_empty());
+        assert!(session.decisions.is_empty());
     }
 }
