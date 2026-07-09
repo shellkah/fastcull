@@ -6,7 +6,7 @@
 
 **Architecture:** `xmp` builds a `dc:subject` + `xmp:Rating` XMP document with quick-xml and writes it atomically (temp + rename) — the only disk touch in this phase. `plan` is **pure: it performs no filesystem I/O whatsoever** — it consumes an in-memory `Session` plus caller-gathered facts (`existing` names, `sizes`) and returns an `ApplyPlan` (per-shot moves, collision suffixes, sidecar-write intents, per-bucket counts, total bytes). That `ApplyPlan` powers the preview and is later executed by Phase 4's apply engine; nothing here moves a user file.
 
-**Tech Stack:** Rust 2021, quick-xml.
+**Tech Stack:** Rust 2024, quick-xml 0.41, rustix 1 (`fs` feature — the no-clobber sidecar publish; Phase 4 reuses the dep).
 
 ## Global Constraints
 
@@ -15,7 +15,7 @@ Copied from [README.md](README.md); every task inherits these.
 - **`plan` is pure and performs no I/O.** All culling decisions live in memory + the autosaved session sidecar; nothing touches disk until Apply. `plan` gathers no facts itself — `existing` (destination file names) and `sizes` (stem → bytes) are handed in by the binary.
 - **`culler-core` has zero GUI dependencies.** No `slint` types in the library.
 - **v1 performs no deletions of user data.** Rejects are *moved* to `00_rejected`. `plan` never emits an unlink; there is no delete step.
-- **Atomic writes everywhere:** `write_sidecar` writes to a temp file then renames. (Session saves and journal writes follow the same discipline in other phases.)
+- **Atomic writes everywhere, and NO destination write may clobber (spec §8 rev 3):** `write_sidecar` writes to a temp file, fsyncs, then publishes with `renameat2(RENAME_NOREPLACE)` — an existing file at the target is `ErrorKind::AlreadyExists`, never silently overwritten. (Session saves and journal writes follow the same temp+fsync+rename discipline in other phases; a plain clobbering `rename` was this plan's one unguarded destination write in rev 2.)
 - **Pre-existing sidecars are carried untouched, and the skipped tag-write is reported.** When a shot already has a sidecar, `plan` puts that sidecar in `moves` unmodified, writes **no** new one, and records the stem in `ApplyPlan.skipped_sidecar_writes`. Merging tags into an existing XMP is Phase 2 — overwriting someone's edit history is data loss through the front door.
 - **Decisions are keyed by filename stem.** `plan` resolves each shot's decision via the session's stem-keyed map.
 - **Platform:** Linux only.
@@ -70,9 +70,10 @@ Run: `cargo test -p culler-core build_xmp_emits_dc_subject_bag`
 Expected: FAIL — compile error `cannot find function \`build_xmp\` in this scope` (module/function not yet defined).
 
 - [ ] **Step 3: Minimal implementation**
-First add the dependency and wire the module:
+First add the dependencies and wire the module (quick-xml 0.41 API verified by probe build 2026-07-09; rustix is used by Task 3's no-clobber publish and reused by Phase 4):
 ```bash
-cargo add quick-xml@0.36 -p culler-core
+cargo add quick-xml@0.41 -p culler-core
+cargo add rustix@1 --features fs -p culler-core
 ```
 Add to `culler-core/src/lib.rs`:
 ```rust
@@ -282,8 +283,8 @@ git commit -m "feat(xmp): emit xmp:Rating and round-trip tags+rating"
 - Modify `culler-core/src/xmp.rs` (add `write_sidecar`; add atomic-write test)
 
 **Interfaces:**
-- Consumes: `build_xmp(tags, rating)` from Task 2.
-- Produces: `pub fn write_sidecar(path: &std::path::Path, tags: &[String], rating: Option<i32>) -> std::io::Result<()>`.
+- Consumes: `build_xmp(tags, rating)` from Task 2; `rustix::fs::{renameat_with, RenameFlags, CWD}`.
+- Produces: `pub fn write_sidecar(path: &std::path::Path, tags: &[String], rating: Option<i32>) -> std::io::Result<()>` — atomic (temp + fsync + rename) **and no-clobber** (`RENAME_NOREPLACE`; an existing target is `ErrorKind::AlreadyExists`). Phase 4's apply relies on the no-clobber error to make resume-time sidecar re-runs skip-idempotent.
 
 - [ ] **Step 1: Write the failing test** (add inside `mod tests`)
 ```rust
@@ -316,6 +317,15 @@ fn write_sidecar_writes_atomically_and_parses_back() {
     entries.sort();
     assert_eq!(entries, vec!["IMG_1234.xmp".to_string()], "leftover files: {entries:?}");
 
+    // NO-CLOBBER (spec §8 rev 3): a second write onto the same path must fail
+    // AlreadyExists, leave the original byte-for-byte intact, and clean its temp.
+    let before = std::fs::read(&path).unwrap();
+    let err = write_sidecar(&path, &["other".to_string()], Some(1)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(&path).unwrap(), before, "existing sidecar untouched");
+    let count = std::fs::read_dir(&dir).unwrap().count();
+    assert_eq!(count, 1, "refused publish leaves no temp litter");
+
     std::fs::remove_dir_all(&dir).ok();
 }
 ```
@@ -326,9 +336,13 @@ Expected: FAIL — compile error `cannot find function \`write_sidecar\` in this
 
 - [ ] **Step 3: Minimal implementation** — append to `culler-core/src/xmp.rs`:
 ```rust
-/// Write `build_xmp(tags, rating)` to `path` atomically: content goes to a
-/// sibling temp file, is fsynced, then renamed onto `path`. Caller chooses the
-/// path (`<stem>.xmp`, Adobe style).
+/// Write `build_xmp(tags, rating)` to `path` atomically AND no-clobber: content
+/// goes to a sibling temp file, is fsynced, then published with
+/// `renameat2(RENAME_NOREPLACE)`. An existing file at `path` yields
+/// `ErrorKind::AlreadyExists` and is never overwritten — the same guarantee
+/// every file move has (spec §8 rev 3); a plain `rename` here was the one
+/// destination write that could silently clobber. Caller chooses the path
+/// (`<stem>.xmp`, Adobe style).
 pub fn write_sidecar(path: &Path, tags: &[String], rating: Option<i32>) -> io::Result<()> {
     let content = build_xmp(tags, rating);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -346,7 +360,11 @@ pub fn write_sidecar(path: &Path, tags: &[String], rating: Option<i32>) -> io::R
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    if let Err(e) = renameat_with(CWD, &tmp, CWD, path, RenameFlags::NOREPLACE) {
+        let _ = std::fs::remove_file(&tmp); // refused publish leaves no litter
+        return Err(io::Error::from(e));
+    }
     Ok(())
 }
 ```
@@ -546,9 +564,11 @@ fn rest_after_stem(file_name: &str, stem: &str) -> String {
     file_name.get(stem.len()..).unwrap_or_default().to_string()
 }
 
-/// PURE — no filesystem I/O. `existing` = destination file names already on disk
-/// (gathered by the binary via readdir). `sizes` = stem → total bytes. `buckets`
-/// = resolved bucket names, order [rejected, rest, keep, picks, bests].
+/// PURE — no filesystem I/O. `existing` = BUCKET-RELATIVE destination paths
+/// ("02_keep/IMG_1234.JPG") already on disk (gathered by the binary via one
+/// readdir per bucket). Collisions are PER TARGET DIRECTORY — the same name in
+/// a different bucket must not force a suffix (rev 3). `sizes` = stem → total
+/// bytes. `buckets` = resolved bucket names, order [rejected, rest, keep, picks, bests].
 pub fn plan(
     session: &Session,
     dest: &Path,
@@ -624,17 +644,23 @@ git commit -m "feat(plan): bucket assignment and per-shot move list"
 #[test]
 fn plan_auto_suffixes_existing_and_intra_plan() {
     let buckets = default_buckets();
+    // Realistic intra-plan collision: IMG_0002 gets suffixed to IMG_0002-1 by
+    // `existing`, which then collides with the REAL stem IMG_0002-1. (Two shots
+    // sharing one stem is impossible — scan groups by stem and decisions are
+    // stem-keyed — so the old duplicate-stem fixture modeled an unreachable state.)
     let shots = vec![
         shot("IMG_0001", "JPG", Some("CR3"), None), // both files collide with `existing`
-        shot("IMG_0002", "JPG", None, None),        // first of an intra-plan duplicate
-        shot("IMG_0002", "JPG", None, None),        // duplicate => must be suffixed
+        shot("IMG_0002", "JPG", None, None),        // suffixed to -1 by `existing`…
+        shot("IMG_0002-1", "JPG", None, None),      // …colliding with that claimed name
     ];
     // all undecided => all land in 01_rest
     let session = Session { shots, decisions: HashMap::new(), ..Default::default() };
 
+    // `existing` holds BUCKET-RELATIVE paths (rev 3).
     let mut existing = BTreeSet::new();
-    existing.insert("IMG_0001.JPG".to_string());
-    existing.insert("IMG_0001.CR3".to_string());
+    existing.insert("01_rest/IMG_0001.JPG".to_string());
+    existing.insert("01_rest/IMG_0001.CR3".to_string());
+    existing.insert("01_rest/IMG_0002.JPG".to_string());
 
     let p = plan(&session, Path::new("/dest"), &buckets, &existing, &HashMap::new());
 
@@ -654,13 +680,28 @@ fn plan_auto_suffixes_existing_and_intra_plan() {
         ],
     );
 
-    // first duplicate is untouched
-    assert_eq!(p.ops[1].suffix, None);
-    assert_eq!(p.ops[1].moves[0].to, PathBuf::from("/dest/01_rest/IMG_0002.JPG"));
+    // IMG_0002 is taken in 01_rest => suffixed to IMG_0002-1
+    assert_eq!(p.ops[1].suffix, Some(1));
+    assert_eq!(p.ops[1].moves[0].to, PathBuf::from("/dest/01_rest/IMG_0002-1.JPG"));
 
-    // second duplicate collides with the first op's claimed name => -1
+    // the real stem IMG_0002-1 collides with the name op[1] claimed => IMG_0002-1-1
     assert_eq!(p.ops[2].suffix, Some(1));
-    assert_eq!(p.ops[2].moves[0].to, PathBuf::from("/dest/01_rest/IMG_0002-1.JPG"));
+    assert_eq!(p.ops[2].moves[0].to, PathBuf::from("/dest/01_rest/IMG_0002-1-1.JPG"));
+}
+
+#[test]
+fn plan_ignores_same_name_in_a_different_bucket() {
+    let buckets = default_buckets();
+    let shots = vec![shot("IMG_0009", "JPG", None, None)]; // undecided -> 01_rest
+    let session = Session { shots, decisions: HashMap::new(), ..Default::default() };
+
+    let mut existing = BTreeSet::new();
+    existing.insert("02_keep/IMG_0009.JPG".to_string()); // same NAME, different bucket
+
+    let p = plan(&session, Path::new("/dest"), &buckets, &existing, &HashMap::new());
+    // rev 3: collisions are per target directory — no spurious rename.
+    assert_eq!(p.ops[0].suffix, None);
+    assert_eq!(p.ops[0].moves[0].to, PathBuf::from("/dest/01_rest/IMG_0009.JPG"));
 }
 ```
 
@@ -678,9 +719,11 @@ fn suffixed_stem(stem: &str, suffix: Option<u32>) -> String {
     }
 }
 
-/// PURE — no filesystem I/O. `existing` = destination file names already on disk
-/// (gathered by the binary via readdir). `sizes` = stem → total bytes. `buckets`
-/// = resolved bucket names, order [rejected, rest, keep, picks, bests].
+/// PURE — no filesystem I/O. `existing` = BUCKET-RELATIVE destination paths
+/// ("02_keep/IMG_1234.JPG") already on disk (gathered by the binary via one
+/// readdir per bucket). Collisions are PER TARGET DIRECTORY — the same name in
+/// a different bucket must not force a suffix (rev 3). `sizes` = stem → total
+/// bytes. `buckets` = resolved bucket names, order [rejected, rest, keep, picks, bests].
 pub fn plan(
     session: &Session,
     dest: &Path,
@@ -707,13 +750,15 @@ pub fn plan(
             })
             .collect();
 
-        // Resolve a whole-stem suffix so no target name collides with the
-        // destination (`existing`) or with a name already claimed by this plan.
+        // Resolve a whole-stem suffix so no BUCKET-RELATIVE target path
+        // ("01_rest/IMG_1234.JPG") collides with the destination (`existing`)
+        // or with a path already claimed by this plan. Per-directory keys mean
+        // the same name in a DIFFERENT bucket never forces a suffix (rev 3).
         let mut suffix: Option<u32> = None;
         let names = loop {
             let new_stem = suffixed_stem(&shot.stem, suffix);
             let candidate: Vec<String> =
-                rests.iter().map(|rest| format!("{new_stem}{rest}")).collect();
+                rests.iter().map(|rest| format!("{bucket}/{new_stem}{rest}")).collect();
             if candidate
                 .iter()
                 .all(|n| !existing.contains(n) && !claimed.contains(n))
@@ -759,7 +804,7 @@ pub fn plan(
 
 - [ ] **Step 4: Run to verify pass**
 Run: `cargo test -p culler-core plan_`
-Expected: PASS (`plan_assigns_buckets_and_builds_moves` + `plan_auto_suffixes_existing_and_intra_plan`).
+Expected: PASS (`plan_assigns_buckets_and_builds_moves`, `plan_auto_suffixes_existing_and_intra_plan`, `plan_ignores_same_name_in_a_different_bucket`).
 
 - [ ] **Step 5: Commit**
 ```bash
@@ -843,9 +888,11 @@ Expected: FAIL — `assert_eq!(p.ops[0].write_sidecar, Some(..))` gets `None` (T
 
 - [ ] **Step 3: Minimal implementation** — replace `plan` in `culler-core/src/plan.rs` with (the `bucket_index`, `rest_after_stem`, and `suffixed_stem` helpers are unchanged):
 ```rust
-/// PURE — no filesystem I/O. `existing` = destination file names already on disk
-/// (gathered by the binary via readdir). `sizes` = stem → total bytes. `buckets`
-/// = resolved bucket names, order [rejected, rest, keep, picks, bests].
+/// PURE — no filesystem I/O. `existing` = BUCKET-RELATIVE destination paths
+/// ("02_keep/IMG_1234.JPG") already on disk (gathered by the binary via one
+/// readdir per bucket). Collisions are PER TARGET DIRECTORY — the same name in
+/// a different bucket must not force a suffix (rev 3). `sizes` = stem → total
+/// bytes. `buckets` = resolved bucket names, order [rejected, rest, keep, picks, bests].
 pub fn plan(
     session: &Session,
     dest: &Path,
@@ -883,9 +930,9 @@ pub fn plan(
         let names = loop {
             let new_stem = suffixed_stem(&shot.stem, suffix);
             let mut candidate: Vec<String> =
-                rests.iter().map(|rest| format!("{new_stem}{rest}")).collect();
+                rests.iter().map(|rest| format!("{bucket}/{new_stem}{rest}")).collect();
             if write_new_sidecar {
-                candidate.push(format!("{new_stem}.xmp"));
+                candidate.push(format!("{bucket}/{new_stem}.xmp"));
             }
             if candidate
                 .iter()
@@ -1011,9 +1058,11 @@ Expected: FAIL — `assert_eq!(p.per_bucket_counts, ..)` gets all-zero counts an
 
 - [ ] **Step 3: Minimal implementation** — replace `plan` in `culler-core/src/plan.rs` with the final version (helpers unchanged):
 ```rust
-/// PURE — no filesystem I/O. `existing` = destination file names already on disk
-/// (gathered by the binary via readdir). `sizes` = stem → total bytes. `buckets`
-/// = resolved bucket names, order [rejected, rest, keep, picks, bests].
+/// PURE — no filesystem I/O. `existing` = BUCKET-RELATIVE destination paths
+/// ("02_keep/IMG_1234.JPG") already on disk (gathered by the binary via one
+/// readdir per bucket). Collisions are PER TARGET DIRECTORY — the same name in
+/// a different bucket must not force a suffix (rev 3). `sizes` = stem → total
+/// bytes. `buckets` = resolved bucket names, order [rejected, rest, keep, picks, bests].
 ///
 /// `stale` is left empty: `plan` does no I/O, so the binary pre-verifies file
 /// existence, drops missing shots before calling `plan`, and fills `stale` for
@@ -1053,9 +1102,9 @@ pub fn plan(
         let names = loop {
             let new_stem = suffixed_stem(&shot.stem, suffix);
             let mut candidate: Vec<String> =
-                rests.iter().map(|rest| format!("{new_stem}{rest}")).collect();
+                rests.iter().map(|rest| format!("{bucket}/{new_stem}{rest}")).collect();
             if write_new_sidecar {
-                candidate.push(format!("{new_stem}.xmp"));
+                candidate.push(format!("{bucket}/{new_stem}.xmp"));
             }
             if candidate
                 .iter()
@@ -1124,7 +1173,7 @@ pub fn plan(
 
 - [ ] **Step 4: Run to verify pass**
 Run: `cargo test -p culler-core`
-Expected: PASS (all `xmp` and `plan` tests: 3 + 4 = 7 new tests, plus Phases 1–2).
+Expected: PASS (all `xmp` and `plan` tests: 3 + 5 = 8 new tests, plus Phases 1–2).
 
 - [ ] **Step 5: Commit**
 ```bash
@@ -1136,8 +1185,8 @@ git commit -m "feat(plan): per-bucket counts and total-byte preflight sum"
 
 ## Phase 3 done — definition of done
 
-- `culler-core/src/xmp.rs`: `build_xmp` (dc:subject bag + xmp:Rating, xpacket-wrapped, round-trips) and `write_sidecar` (atomic temp + rename), fully unit-tested.
-- `culler-core/src/plan.rs`: pure `plan(...)` → `ApplyPlan` — bucket assignment, deterministic whole-stem collision suffixing (existing + intra-plan), fresh-sidecar intents vs pre-existing carry + skip report, per-bucket counts, total bytes; `stale` empty (binary-populated). **No filesystem I/O in `plan`.**
+- `culler-core/src/xmp.rs`: `build_xmp` (dc:subject bag + xmp:Rating, xpacket-wrapped, round-trips) and `write_sidecar` (atomic temp + fsync + **NOREPLACE** rename — no-clobber, `AlreadyExists` on an occupied target), fully unit-tested.
+- `culler-core/src/plan.rs`: pure `plan(...)` → `ApplyPlan` — bucket assignment, deterministic whole-stem collision suffixing over **bucket-relative** paths (existing + intra-plan; a name in a different bucket never forces a suffix), fresh-sidecar intents vs pre-existing carry + skip report, per-bucket counts, total bytes; `stale` empty (binary-populated). **No filesystem I/O in `plan`.**
 - `culler-core/src/lib.rs`: `pub mod xmp;` and `pub mod plan;`.
 - New public types: `FileMove`, `SidecarWrite` (README refinement), `ShotOp` (with `write_sidecar: Option<SidecarWrite>`), `TierCountsPlan`, `ApplyPlan`.
 - `cargo test -p culler-core` green; each task committed with a conventional-commit message.

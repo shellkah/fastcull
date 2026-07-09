@@ -6,7 +6,14 @@
 
 **Architecture:** `scan` consumes the Phase 1 `model` types verbatim (`Shot`, `CaptureTime`, `RAW_EXTS`, `JPEG_EXTS`) and produces `pub fn scan(dir: &Path) -> Result<Vec<Shot>, ScanError>`. All grouping, RAW/sidecar detection and sorting are pure functions over a directory listing; the only I/O is `read_dir` and reading each JPEG's EXIF header. A shot **requires** a JPEG in v1, so `scan` also exposes `scan_report`, which additionally returns the RAW-only stems that are not cullable shots, so they are never silently dropped.
 
-**Tech Stack:** Rust 2021, kamadak-exif, std::fs.
+**Tech Stack:** Rust 2024, kamadak-exif 0.6, std::fs.
+
+> **Known edge (documented, accepted):** two display files sharing one stem
+> (`IMG_1.jpg` + `IMG_1.jpeg`, or `.JPG` + `.jpg` on a case-sensitive FS) keep
+> only the first (sorted path order) as the shot's display file; the other is
+> untouched and surfaces in the Apply preview as a generic "stays behind"
+> leftover via Phase 6's readdir diff. Real cameras don't produce this; no
+> special handling in v1.
 
 > **Assumption (spec §5 vs §10/§13):** §5 says the JPEG is "required in v1"; §10 says a RAW-only stem gets a "no preview" placeholder and is "still movable"; §13 defers "RAW-only shots via embedded-preview extraction" to **phase 2 (not v1)**. Resolved for v1: **`scan` produces `Shot`s only for stems that have a JPEG. A stem with only a RAW (no JPEG sibling) is NOT a cullable shot in v1.** To avoid silently dropping such files, `scan_report(dir) -> Result<(Vec<Shot>, Vec<PathBuf> /*raw_only*/), ScanError>` returns the RAW-only paths alongside the shots; `scan` calls `scan_report` and discards the second element. Embedded-preview extraction that would turn RAW-only stems into displayable shots is a phase-2 item.
 
@@ -14,7 +21,7 @@
 
 These bind every task in this phase (copied from [README.md](README.md), tailored to `scan`):
 
-- **Language / edition:** Rust, edition 2021. Work inside the existing workspace; all code lands in `culler-core` (lib).
+- **Language / edition:** Rust, edition 2024. Work inside the existing workspace; all code lands in `culler-core` (lib).
 - **`culler-core` has zero GUI dependencies.** No `slint`, no Slint types. `scan` returns plain `model` types only.
 - **Nothing touches disk until Apply.** `scan` is **read-only**: it lists the directory and reads each JPEG's EXIF header. It never writes, moves, or deletes a file.
 - **Decisions are keyed by filename stem** so resume re-attaches them after a rescan — therefore the shot key is `Shot.stem`, and the stable sort keeps burst order fixed across sessions.
@@ -649,8 +656,8 @@ git commit -m "feat(scan): detect Adobe and darktable sidecar conventions" -m "C
 **Interfaces:**
 - Consumes: `scan_report` (Task 4); Phase 1 `model::CaptureTime`
 - Produces:
-  - each shot's `capture` is read from its JPEG's EXIF: `DateTimeOriginal` → `CaptureTime.datetime` (the raw `"YYYY:MM:DD HH:MM:SS"` ASCII, verbatim), `SubSecTimeOriginal` → `CaptureTime.subsec` (parsed to `u32`). Undecodable/absent EXIF must **not** fail the scan → `CaptureTime::default()`.
-  - **Private helpers (phase-2-local):** `fn read_capture_time(jpeg) -> CaptureTime`, `fn ascii_field(exif, tag) -> Option<String>`.
+  - each shot's `capture` is read from its JPEG's EXIF: `DateTimeOriginal` → `CaptureTime.datetime` (the raw `"YYYY:MM:DD HH:MM:SS"` ASCII, verbatim), `SubSecTimeOriginal` → `CaptureTime.subsec` **normalized to milliseconds** — EXIF subsec is a decimal *fraction* digit string, so the digits are right-padded/truncated to a fixed 3 (`"5"`→500, `"05"`→50, `"123456"`→123); a plain integer parse would misorder mixed widths (`"9"`=0.9s would sort before `"10"`=0.10s). Undecodable/absent EXIF must **not** fail the scan → `CaptureTime::default()`.
+  - **Private helpers (phase-2-local):** `fn read_capture_time(jpeg) -> CaptureTime`, `fn ascii_field(exif, tag) -> Option<String>`, `fn parse_subsec(&str) -> Option<u32>`.
 
 **Fixture strategy:** No committed binaries. The test builds a minimal valid JPEG in memory (`jpeg_with_exif`) carrying an EXIF APP1 block with a big-endian TIFF holding `DateTimeOriginal` + `SubSecTimeOriginal` — full byte-builder shown, no hand-waving.
 
@@ -748,7 +755,8 @@ Add inside `scan.rs`'s `#[cfg(test)] mod tests` block (the `jpeg_with_exif` help
             shots[0].capture.datetime,
             Some("2026:07:08 10:11:12".to_string())
         );
-        assert_eq!(shots[0].capture.subsec, Some(42));
+        // "42" = 0.42s → right-padded to milliseconds: 420 (NOT integer 42).
+        assert_eq!(shots[0].capture.subsec, Some(420));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -770,12 +778,12 @@ Expected: FAIL — runtime assertion `assertion \`left == right\` failed` (left:
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add the EXIF dependency to `culler-core/Cargo.toml` (package name `kamadak-exif`; the crate is imported as `exif`):
+Add the EXIF dependency to `culler-core/Cargo.toml` (package name `kamadak-exif`; the crate is imported as `exif`; 0.6 API verified by probe build 2026-07-09):
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-kamadak-exif = "0.5"
+kamadak-exif = "0.6"
 ```
 In `scan_report`, change the JPEG-bearing arm to read capture time before moving `jpeg` into the shot:
 ```rust
@@ -806,9 +814,21 @@ fn read_capture_time(jpeg: &Path) -> CaptureTime {
         Err(_) => return CaptureTime::default(),
     };
     let datetime = ascii_field(&exif, exif::Tag::DateTimeOriginal);
-    let subsec =
-        ascii_field(&exif, exif::Tag::SubSecTimeOriginal).and_then(|s| s.trim().parse::<u32>().ok());
+    let subsec = ascii_field(&exif, exif::Tag::SubSecTimeOriginal).and_then(|s| parse_subsec(&s));
     CaptureTime { datetime, subsec }
+}
+
+/// EXIF SubSecTime* is a DECIMAL FRACTION digit string, not an integer:
+/// "5" means .5s and "05" means .05s. Normalize to milliseconds by
+/// right-padding/truncating the digits to a fixed width of 3, so
+/// mixed-width values order correctly ("5"→500, "05"→50, "123456"→123).
+fn parse_subsec(s: &str) -> Option<u32> {
+    let digits: String = s.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let padded = format!("{digits:0<3}");
+    padded[..3].parse::<u32>().ok()
 }
 
 /// The first ASCII string of `tag` in the primary IFD, trimmed. `None` when the
