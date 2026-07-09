@@ -706,6 +706,30 @@ mod tests {
     }
 
     #[test]
+    fn scan_report_itself_returns_shots_in_capture_time_order() {
+        let dir = unique_temp_dir("reportsort");
+        // BTreeMap stem order would be (a_late, b_early); capture order is the
+        // reverse — this must hold for scan_report itself, not just scan().
+        std::fs::write(
+            dir.join("a_late.jpg"),
+            jpeg_with_exif("2026:07:08 10:00:00", "00"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b_early.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:00", "00"),
+        )
+        .unwrap();
+
+        let (shots, _raw_only) = scan_report(&dir).unwrap();
+        assert_eq!(
+            stems(&shots),
+            vec!["b_early".to_string(), "a_late".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn undated_shots_alone_sort_by_filename() {
         let dir = unique_temp_dir("undated");
         touch(&dir.join("IMG_0003.JPG"));
