@@ -79,6 +79,11 @@ fn suffixed_stem(stem: &str, suffix: Option<u32>) -> String {
 /// readdir per bucket). Collisions are PER TARGET DIRECTORY — the same name in
 /// a different bucket must not force a suffix (rev 3). `sizes` = stem → total
 /// bytes. `buckets` = resolved bucket names, order [rejected, rest, keep, picks, bests].
+///
+/// The carried sidecar is exactly the file in `Shot.sidecar`: when scan found
+/// both the Adobe (`stem.xmp`) and darktable (`stem.ext.xmp`) conventions on
+/// disk for one stem, it chose the darktable one, and the Adobe file stays
+/// behind on disk as an untracked leftover — `plan` never moves or writes it.
 pub fn plan(
     session: &Session,
     dest: &Path,
@@ -420,5 +425,44 @@ mod tests {
         assert_eq!(p.skipped_sidecar_writes, vec!["C".to_string()]);
         // D: nothing to write
         assert_eq!(p.ops[3].write_sidecar, None);
+    }
+
+    /// Pins the sidecar-carry contract at plan level: the carried sidecar is
+    /// exactly the file in `Shot.sidecar`. Background (scan, already landed):
+    /// when both the Adobe (`stem.xmp`) and darktable (`stem.ext.xmp`)
+    /// conventions exist on disk for one stem, the darktable one wins and is
+    /// stored in `Shot.sidecar`; the Adobe file stays on disk as an untracked
+    /// leftover. `plan` must emit exactly one sidecar move — for the scanned
+    /// file, full after-stem suffix preserved — and never touch the other name.
+    #[test]
+    fn plan_carries_exactly_the_scanned_sidecar() {
+        let buckets = default_buckets();
+        let shots = vec![shot("E", "JPG", Some("CR3"), Some("/src/E.CR3.xmp"))];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            "E".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session { shots, decisions, ..Default::default() };
+
+        let p = plan(&session, Path::new("/dest"), &buckets, &BTreeSet::new(), &HashMap::new());
+
+        // The darktable-convention name is preserved via the after-stem rest.
+        assert!(p.ops[0]
+            .moves
+            .iter()
+            .any(|m| m.to == PathBuf::from("/dest/02_keep/E.CR3.xmp")));
+        assert_eq!(p.ops[0].write_sidecar, None);
+        assert_eq!(p.skipped_sidecar_writes, vec!["E".to_string()]);
+        // Neither a move nor a fresh SidecarWrite ever targets the Adobe name —
+        // plan only knows about the sidecar scan chose (`Shot.sidecar`).
+        assert!(!p.ops[0]
+            .moves
+            .iter()
+            .any(|m| m.to == PathBuf::from("/dest/02_keep/E.xmp")));
     }
 }
