@@ -6,6 +6,7 @@
 
 pub mod model;
 pub mod persist;
+pub mod plan;
 pub mod scan;
 pub mod xmp;
 
