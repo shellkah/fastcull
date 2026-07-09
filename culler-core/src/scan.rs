@@ -211,8 +211,8 @@ fn ascii_field(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
 /// Stable filmstrip order: by (capture.datetime, capture.subsec, jpeg filename).
 /// Shots with no datetime sort AFTER all dated shots, then by filename, so burst
 /// order stays put across sessions.
-fn sort_shots(shots: &mut Vec<Shot>) {
-    shots.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+fn sort_shots(shots: &mut [Shot]) {
+    shots.sort_by_key(sort_key);
 }
 
 /// Ordering key. The leading bool puts dated shots (`false`) before undated
