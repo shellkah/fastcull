@@ -6,13 +6,13 @@
 
 **Architecture:** `culler-core/src/decode.rs` is the last core module and is logically independent of Phases 1–4. It wraps **turbojpeg** for JPEG decode (using its native 1/1·1/2·1/4·1/8 scaled decode), **fast_image_resize** for the SIMD downscale that finishes a `Fit` request, and **kamadak-exif** for the Orientation tag and the embedded-thumbnail bytes. The pixel-reorientation step is factored into a pure `apply_orientation` fn so the highest-value logic is unit-tested with zero external files; turbojpeg round-trips (compress-then-decode synthetic buffers) and one committed real rotated fixture cover the rest.
 
-**Tech Stack:** Rust 2021, turbojpeg (libjpeg-turbo), fast_image_resize, kamadak-exif.
+**Tech Stack:** Rust 2024, turbojpeg 1 (libjpeg-turbo), fast_image_resize 6, kamadak-exif 0.6 (fir/kamadak APIs verified by probe build 2026-07-09; turbojpeg spellings hedged below).
 
 ## Global Constraints
 
 Copied verbatim from [README.md](README.md); every task in this phase implicitly includes them:
 
-- **Language / edition:** Rust, edition 2021. Workspace with two member crates: `culler-core` (lib) and `culler` (bin). This phase touches only `culler-core`.
+- **Language / edition:** Rust, edition 2024. Workspace with two member crates: `culler-core` (lib) and `culler` (bin). This phase touches only `culler-core`.
 - **`culler-core` has zero GUI dependencies.** No `slint`, no Slint types, in the library. `decode` emits plain `Vec<u8>` RGBA, never `slint::Image`.
 - **Platform:** Linux only. `rustix`/`renameat2`/`statvfs` are fine to use directly; no cross-platform abstraction needed.
 - **TDD, DRY, YAGNI, frequent commits.** Every task: failing test → run-it-fails → minimal impl → run-it-passes → commit. Conventional-commit messages (`feat:`, `test:`, `refactor:`).
@@ -406,7 +406,7 @@ Add inside `#[cfg(test)] mod tests`:
 Add to `culler-core/Cargo.toml` under `[dependencies]`:
 
 ```toml
-fast_image_resize = "5"
+fast_image_resize = "6"
 ```
 
 Add to `culler-core/src/decode.rs` (above `mod tests`):
@@ -487,7 +487,7 @@ git commit -m "feat(decode): Fit target via scaled decode + fast_image_resize fi
 
 **Interfaces:** Consumes: `apply_orientation`, `decompress_scaled`, `decode_fit`. Produces: private `fn read_orientation(path: &Path) -> u16`; `decode` output is now upright for all 8 EXIF orientations.
 
-> **kamadak-exif note:** the crate is named `kamadak-exif` in `Cargo.toml` but imported as `exif`. API used: `exif::Reader::new().read_from_container(&mut BufReader)?` → `exif::Exif`; `exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)`; `field.value.get_uint(0) -> Option<u32>`.
+> **kamadak-exif note:** the crate is named `kamadak-exif` in `Cargo.toml` but imported as `exif`. API used (verified against 0.6 by probe build): `exif::Reader::new().read_from_container(&mut impl BufRead+Seek)?` (a `Cursor<&[u8]>` over the already-read bytes) → `exif::Exif`; `exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)`; `field.value.get_uint(0) -> Option<u32>`.
 
 - [ ] **Step 0 (REQUIRED, non-code — supply the fixture; do NOT fake it):**
   Obtain **one real, tiny (<50 KB) JPEG shot in portrait with EXIF `Orientation = 6`** (a phone/camera portrait: stored landscape `w > h`, tagged 6). Verify its tag with `exiftool -Orientation -ImageWidth -ImageHeight orientation_6.jpg` (expect `Rotate 90 CW`, width > height). Commit it as `culler-core/tests/fixtures/orientation_6.jpg`. Optionally add `orientation_1.jpg` (a normal upright JPEG) for future coverage.
@@ -497,8 +497,12 @@ git commit -m "feat(decode): Fit target via scaled decode + fast_image_resize fi
   # Test fixtures
   orientation_6.jpg — tiny portrait JPEG, EXIF Orientation=6 (stored landscape,
     displays upright rotated 90 CW). Source: <camera/phone model, own photo>.
-    Downscaled to <50 KB with `magick input.jpg -resize 200x -strip-none out.jpg`
-    (EXIF preserved). Used by decode.rs orientation + embedded-thumbnail tests.
+    Downscaled to <50 KB with `magick input.jpg -resize 200x out.jpg`
+    (ImageMagick preserves EXIF including the embedded thumbnail by default —
+    do NOT pass `-strip`, which removes it). Verified after resizing with
+    `exiftool -Orientation -ThumbnailImage out.jpg` (expect `Rotate 90 CW`
+    and a non-empty thumbnail — Task 6 depends on it).
+    Used by decode.rs orientation + embedded-thumbnail tests.
   ```
   If the fixture is absent the tests in Task 5/6 fail loudly with an actionable message — that is intended; they must not silently pass.
 
@@ -537,21 +541,21 @@ Add inside `#[cfg(test)] mod tests`:
 Add to `culler-core/Cargo.toml` under `[dependencies]`:
 
 ```toml
-kamadak-exif = "0.5"
+kamadak-exif = "0.6"
 ```
+(Already present if Phase 2 landed — it added the same dep for capture-time reading.)
 
 Add to `culler-core/src/decode.rs` (above `mod tests`):
 
 ```rust
-/// Read the EXIF Orientation tag (1..=8). Returns 1 (identity) if the file is
-/// unreadable or has no EXIF — orientation reading never fails a decode.
-fn read_orientation(path: &Path) -> u16 {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return 1,
-    };
-    let mut reader = std::io::BufReader::new(file);
-    match exif::Reader::new().read_from_container(&mut reader) {
+/// Read the EXIF Orientation tag (1..=8) from the already-loaded JPEG bytes —
+/// `decode` has the whole file in memory, so no second file read / reopen
+/// (kamadak-exif reads from any BufRead+Seek; `Cursor<&[u8]>` qualifies,
+/// verified by probe build). Returns 1 (identity) when EXIF is absent or
+/// undecodable — orientation reading never fails a decode.
+fn read_orientation(data: &[u8]) -> u16 {
+    let mut cursor = std::io::Cursor::new(data);
+    match exif::Reader::new().read_from_container(&mut cursor) {
         Ok(exif) => exif
             .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
             .and_then(|f| f.value.get_uint(0))
@@ -568,7 +572,7 @@ Replace the whole `decode` fn with the orientation-aware version (note `decode_f
 /// Decode `path`'s JPEG at/around `target`, apply EXIF orientation, return straight RGBA8.
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
-    let orientation = read_orientation(path);
+    let orientation = read_orientation(&data);
     let decoded = match target {
         TargetSize::Full => decompress_scaled(&data, 1)?,
         TargetSize::Scaled(n) => match n {
@@ -783,7 +787,7 @@ pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeErr
     if !is_jpeg(&data) {
         return Err(DecodeError::Unsupported);
     }
-    let orientation = read_orientation(path);
+    let orientation = read_orientation(&data);
     let decoded = match target {
         TargetSize::Full => decompress_scaled(&data, 1)?,
         TargetSize::Scaled(n) => match n {

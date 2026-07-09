@@ -6,7 +6,7 @@
 
 **Architecture:** Thin Slint glue over unit-tested pure logic. All keymap/filter/scheduling/apply-preview decisions live in pure Rust functions (`key_to_action`, `apply_action`, `passes`, `next_filter`, `Scheduler`, `LruCache`, `prefetch_set`, `dest_is_source_root`, `gather_apply_inputs`, `build_preview`, `find_crashed_apply`) with real `#[test]`s; only rendering, threading, and `slint::invoke_from_event_loop` marshaling are manually verified. The core stays swappable — the binary only translates UI events into `culler-core` calls and marshals `DecodedImage → slint::Image` at the boundary.
 
-**Tech Stack:** Rust 2021, Slint 1.8 (Skia renderer), std threads + channels, clap (derive) for args, serde_json for journal reads, tempfile (dev) for temp-dir tests.
+**Tech Stack:** Rust 2024, Slint 1.17 (Skia renderer), std threads + channels, clap (derive) for args, serde_json for journal reads, tempfile (dev) for temp-dir tests.
 
 ## Visual design source (authoritative)
 
@@ -34,7 +34,7 @@ Two design surfaces — **`2e` keymap sheet** and **`2g` toasts** — have no de
 
 Copied verbatim from [README.md](README.md); every task's requirements implicitly include this section.
 
-- **Language / edition:** Rust, edition 2021. Workspace with two member crates: `culler-core` (lib) and `culler` (bin). This phase builds `culler`.
+- **Language / edition:** Rust, edition 2024. Workspace with two member crates: `culler-core` (lib) and `culler` (bin). This phase builds `culler`.
 - **`culler-core` has zero GUI dependencies.** No `slint`, no Slint types, in the library. `decode` emits plain `Vec<u8>` RGBA, never `slint::Image`. The binary is the *only* place `DecodedImage → slint::Image` marshaling happens (via `SharedPixelBuffer`), at the boundary.
 - **v1 performs no deletions of user data.** Rejects are **moved** to `00_rejected`, never deleted. The binary never unlinks a source shot; it only calls `culler_core::apply`, which owns the sole cross-FS source-removal path.
 - **Nothing touches disk until Apply.** All culling decisions live in memory + the autosaved session sidecar. `plan` is pure and performs **no I/O**; the binary gathers `existing`/`sizes` via readdir/stat and hands them in.
@@ -42,7 +42,8 @@ Copied verbatim from [README.md](README.md); every task's requirements implicitl
 - **A destination file appearing between plan and apply must fail loudly** (NOREPLACE returns `EEXIST`) — surfaced by `apply`, reported by the binary; never silently overwrite.
 - **Decisions are keyed by filename stem** so resume re-attaches them after a rescan. Corrupt session file → renamed to `.fastcull.json.bad`, reported, fresh session started (handled by `load_or_fresh`).
 - **Destination = source root itself is refused** (a source *subfolder* is allowed). Pure guard, unit-tested.
-- **Crash detection:** on launch / when a dest is chosen, if `dest/.fastcull-apply.json` exists, offer resume-or-report (`resume()` or a formatted report). At minimum detect + surface.
+- **Crash detection (spec §6/§8 rev 3):** the journal lives in the *destination* but launches open the *source* — the link between them is the **`Session.pending_apply` breadcrumb**, set + autosaved just before an apply's first move and cleared on success. On launch, probe the breadcrumb's dest (and the source dir itself, in case it was a prior run's destination); when a dest is chosen in the dialog, probe it directly. `find_crashed_apply` only reports a journal with ≥1 non-`Done` entry (success removes the journal, so this is defense in depth) — an all-`Done` leftover must never trigger a recovery offer or hijack a fresh apply. Offer resume-or-report (`resume()` or a formatted report).
+- **Apply never runs on the UI thread.** `apply`/`resume` execute on a worker thread; the UI polls the journal (rewritten as moves complete) for the 2c progress screen and receives completion via `invoke_from_event_loop`. **Autosave is debounced** (dirty-flag + timer), never a synchronous fsync per keypress — spec §12's sub-frame navigation is a hard target.
 - **Platform:** Linux only. `rustix`/`renameat2`/`statvfs` live in core; the binary uses `culler_core::RealFs` for filesystem probes (`same_filesystem`, `free_space`).
 - **TDD, DRY, YAGNI, frequent commits.** Every logic task: failing test → run-it-fails → minimal impl → run-it-passes → commit. Conventional-commit messages (`feat:`, `test:`). Purely-visual tasks replace Steps 1–4 with a Manual verification checklist but still show complete code.
 - **No v1 config file.** All configurable names/behaviors are CLI flags (bucket names, `--no-auto-advance`, destination typed in the Apply dialog).
@@ -84,12 +85,12 @@ path = "src/main.rs"
 
 [dependencies]
 culler-core = { path = "../culler-core" }
-slint = { version = "1.8", features = ["backend-winit", "renderer-skia"] }
+slint = { version = "1.17", features = ["backend-winit", "renderer-skia"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-slint-build = "1.8"
+slint-build = "1.17"
 
 [dev-dependencies]
 tempfile = "3"
@@ -171,9 +172,17 @@ Pure-visual setup task (no unit tests). This is **the single source of visual tr
 
 - [ ] **Step 1: Bundle fonts.** Place IBM Plex Sans + Mono (weights 400/500/600) `.ttf` under `culler/ui/fonts/` (IBM Plex is OFL — redistributable). Register at startup so they render regardless of system fonts, in `main()` after `slint::include_modules!();`:
 ```rust
-// register each bundled weight of Sans + Mono before building the window
-slint::register_font_from_path(std::path::Path::new("culler/ui/fonts/IBMPlexMono-Regular.ttf")).ok();
-// … Medium/SemiBold, and IBMPlexSans-Regular/Medium/SemiBold.  (Or embed via build.rs / rely on system Fontconfig.)
+// register each bundled weight of Sans + Mono before building the window.
+// CARGO_MANIFEST_DIR-anchored — a bare "culler/ui/…" path is CWD-relative and
+// breaks whenever the binary is run from anywhere but the workspace root.
+slint::register_font_from_path(std::path::Path::new(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/ui/fonts/IBMPlexMono-Regular.ttf"
+)))
+.ok();
+// … Medium/SemiBold, and IBMPlexSans-Regular/Medium/SemiBold.  (Or, better for
+// an installed binary: embed the .ttf bytes with include_bytes! and
+// slint::register_font_from_data — path-free.)
 ```
 
 - [ ] **Step 2: Create `culler/ui/theme.slint`** — copy the `export global Theme { … }` block **verbatim** from [DESIGN.md §3](../../../design/DESIGN.md). Tokens cover surfaces, borders, the text ramp, the 5-tier palette, type, radii, and `tier-color(code)` (0 rest / 1 keep / 2 pick / 3 best / 4 reject — matches `ui::tier_color_code` and `FilmstripItem.color-code`).
@@ -404,6 +413,7 @@ mod filter_tests {
             shots,
             decisions,
             current: 0,
+            pending_apply: None,
             undo: Vec::new(),
         }
     }
@@ -604,7 +614,7 @@ mod action_tests {
             });
             decisions.insert(stem, Decision { tier: *t, tags: vec![], visited: false });
         }
-        Session { source_dir: "/src".into(), shots, decisions, current: 0, undo: Vec::new() }
+        Session { source_dir: "/src".into(), shots, decisions, current: 0, pending_apply: None, undo: Vec::new() }
     }
 
     #[test]
@@ -1838,6 +1848,7 @@ mod startup_tests {
             shots: vec![shot("IMG_0001", dir), shot("IMG_0002", dir)],
             decisions: prev_decisions,
             current: 5, // stale index from before a rescan removed shots
+            pending_apply: None,
             undo: vec![],
         };
         let scanned = vec![shot("IMG_0001", dir)]; // only one shot remains on disk
@@ -1847,6 +1858,24 @@ mod startup_tests {
         assert_eq!(s.decision(0).tier, Some(Tier::Best)); // re-attached by stem
         assert_eq!(s.decision(0).tags, vec!["hero".to_string()]);
         assert!(s.undo.is_empty()); // undo not restored across sessions
+    }
+
+    #[test]
+    fn reattach_carries_the_crash_breadcrumb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let prev = Session {
+            source_dir: dir.to_path_buf(),
+            shots: vec![shot("IMG_0001", dir)],
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            pending_apply: Some(dir.join("sorted")), // crashed mid-apply last run
+            undo: vec![],
+        };
+        let s = reattach(dir, vec![shot("IMG_0001", dir)], Some(prev));
+        // The breadcrumb must survive the rescan — it is how the next launch
+        // finds the dest journal (spec §6 rev 3).
+        assert_eq!(s.pending_apply, Some(dir.join("sorted")));
     }
 
     #[test]
@@ -1933,6 +1962,7 @@ pub fn reattach(source: &Path, scanned: Vec<Shot>, prev: Option<Session>) -> Ses
                 shots: scanned,
                 decisions: p.decisions, // stem-keyed; survives a rescan
                 current,
+                pending_apply: p.pending_apply, // crash breadcrumb survives the rescan
                 undo: Vec::new(),
             }
         }
@@ -1941,6 +1971,7 @@ pub fn reattach(source: &Path, scanned: Vec<Shot>, prev: Option<Session>) -> Ses
             shots: scanned,
             decisions: std::collections::HashMap::new(),
             current: 0,
+            pending_apply: None,
             undo: Vec::new(),
         },
     }
@@ -1993,10 +2024,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanned = scan(&source)?;
     let session = reattach(&source, scanned, prev);
 
-    // Crash detection on the source dir (in case it was a prior destination) — Task 13.
-    if let Some(j) = startup::find_crashed_apply(&source) {
-        eprintln!("{}", startup::journal_report(&j).unwrap_or_default());
-        // UI surfaces resume-or-report; see Task 13.
+    // Crash detection (spec §6 rev 3): the session breadcrumb points at the
+    // in-flight dest of a crashed apply — that is what makes "detected on next
+    // launch" work, since the journal lives in DEST while launches open SOURCE.
+    // The source dir itself is also probed (it may have been a prior run's
+    // destination). UI surfaces resume-or-report (Task 12 dialog / Task 13 banner).
+    let mut crash_dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dest) = session.pending_apply.clone() {
+        crash_dirs.push(dest);
+    }
+    crash_dirs.push(source.clone());
+    for dir in crash_dirs {
+        if let Some(j) = startup::find_crashed_apply(&dir) {
+            eprintln!("{}", startup::journal_report(&j).unwrap_or_default());
+        }
     }
 
     let app = AppWindow::new()?;
@@ -2005,26 +2046,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let zoom = Rc::new(RefCell::new(ui::ZoomState::default()));
     let cache = Arc::new(Mutex::new(pipeline::LruCache::new(CACHE_BUDGET)));
     let full_slot = Arc::new(Mutex::new(FullSlot::default()));
+    // The shot the loupe is showing — the delivery-time freshness check reads
+    // this on the event loop before painting any decode result.
+    let current_shot = Arc::new(std::sync::atomic::AtomicUsize::new(session.borrow().current));
+    // Debounced-autosave dirty flag (spec §12: never a sync fsync per keypress).
+    let dirty = Rc::new(std::cell::Cell::new(false));
 
-    // Decode pipeline. on_ready drops stale results at delivery, then updates cache/loupe.
+    // Decode pipeline. on_ready DROPS STALE RESULTS AT DELIVERY (§12): results
+    // land in completion order, so a prefetched NEIGHBOR or a superseded decode
+    // must never repaint the loupe — cache everything, paint only the current
+    // shot's result. (This check is load-bearing: without it, holding → paints
+    // whichever of the ±N prefetches decodes last.)
     let weak = app.as_weak();
     let cache_w = cache.clone();
     let full_w = full_slot.clone();
+    let cur_w = current_shot.clone();
     let pipeline = Arc::new(Pipeline::spawn(3, move |res| {
         let weak = weak.clone();
         let cache_w = cache_w.clone();
         let full_w = full_w.clone();
+        let cur_w = cur_w.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = weak.upgrade() {
+                let is_current = res.req.index == cur_w.load(Ordering::SeqCst);
                 match res.target {
                     TargetSize::Full => {
                         full_w.lock().unwrap().set(res.req.index, res.image.clone());
-                        app.set_current_image(to_slint_image(&res.image));
+                        if is_current {
+                            app.set_current_image(to_slint_image(&res.image));
+                        }
                     }
                     _ => {
                         cache_w.lock().unwrap().put(res.req.index, res.image.clone());
-                        // Only paint if still the current shot (delivery-time freshness).
-                        app.set_current_image(to_slint_image(&res.image));
+                        if is_current {
+                            app.set_current_image(to_slint_image(&res.image));
+                        }
                     }
                 }
             }
@@ -2038,6 +2094,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cache = cache.clone();
         let full_slot = full_slot.clone();
         let pipeline = pipeline.clone();
+        let current_shot = current_shot.clone();
         let app_w = app.as_weak();
         move || {
             let s = session.borrow();
@@ -2045,6 +2102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (fw, fh) = (1600u32, 1000u32);
             pipeline.bump(); // latest-wins: supersede in-flight requests
             let cur = s.current;
+            current_shot.store(cur, Ordering::SeqCst); // delivery freshness anchor
             let z = *zoom.borrow();
             // Show the best already-cached scale immediately.
             if let Some(app) = app_w.upgrade() {
@@ -2098,6 +2156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let refresh_view = refresh_view.clone();
         let app_w = app.as_weak();
         let source = source.clone();
+        let dirty = dirty.clone();
         app.on_key_pressed(move |text, ctrl| {
             let Some(app) = app_w.upgrade() else { return false };
             let ctx = if app.get_tag_open() {
@@ -2128,6 +2187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Action::OpenApply => { app.set_apply_open(true); }
                 Action::ForceSave => {
+                    // Ctrl+S: immediate, and the debounce flag is satisfied.
+                    dirty.set(false);
                     let _ = save(&session.borrow(), &source.join(culler_core::SESSION_FILE));
                 }
                 other => {
@@ -2137,8 +2198,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         zoom.borrow_mut().on_navigate();
                         request_current();
                     }
-                    // Autosave after every model change.
-                    let _ = save(&session.borrow(), &source.join(culler_core::SESSION_FILE));
+                    // Autosave is DEBOUNCED (flag + timer below) — a synchronous
+                    // serialize+fsync per keypress fights §12 sub-frame navigation.
+                    dirty.set(true);
                     refresh_view();
                 }
             }
@@ -2167,14 +2229,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let session = session.clone();
         let refresh_view = refresh_view.clone();
-        let source = source.clone();
+        let dirty = dirty.clone();
         let app_w = app.as_weak();
         app.on_tag_committed(move |text| {
             let Some(app) = app_w.upgrade() else { return };
             let idx = session.borrow().current;
             session.borrow_mut().set_tags(idx, parse_tags(&text));
             app.set_tag_open(false);
-            let _ = save(&session.borrow(), &source.join(culler_core::SESSION_FILE));
+            dirty.set(true); // picked up by the debounced autosave
             refresh_view();
         });
     }
@@ -2199,6 +2261,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Apply dialog callbacks are wired in Task 12 (applyflow).
     applyflow::wire_apply_dialog(&app, session.clone(), buckets.clone());
 
+    // Debounced autosave: flush the dirty flag at most every 2s, off the hot
+    // key path. The Timer binding must outlive run() or it is cancelled.
+    let autosave_timer = slint::Timer::default();
+    {
+        let session = session.clone();
+        let source = source.clone();
+        let dirty = dirty.clone();
+        autosave_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(2),
+            move || {
+                if dirty.replace(false) {
+                    let _ = save(&session.borrow(), &source.join(culler_core::SESSION_FILE));
+                }
+            },
+        );
+    }
+
     // First paint.
     {
         let mut s = session.borrow_mut();
@@ -2210,6 +2290,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     request_current();
     refresh_view();
     app.run()?;
+    // Flush any still-debounced state on the way out.
+    let _ = save(&session.borrow(), &source.join(culler_core::SESSION_FILE));
     Ok(())
 }
 ```
@@ -2237,9 +2319,41 @@ git commit -m "feat(main): CLI parse, startup scan/reattach, dest guard, event-l
 **Interfaces:** Consumes: `culler_core::{plan, apply, resume, save, RealFs, FsOps, ApplyPlan, Journal, OpState, TierCountsPlan, ApplyReport, JOURNAL_FILE, SESSION_FILE}`, `startup::{dest_is_source_root, default_buckets}`. Produces: `pub fn gather_apply_inputs(&Session, &Path, &[String;5]) -> (BTreeSet<String>, HashMap<String,u64>, usize)`, `ApplyPreview`, `pub fn build_preview(&ApplyPlan, usize, bool, Option<u64>) -> ApplyPreview`, `pub fn compute_preview(&Session, &Path, &[String;5]) -> (ApplyPlan, ApplyPreview)`, `pub fn run_apply(&Session, &Path, &[String;5]) -> Result<ApplyReport,String>`, `pub fn wire_apply_dialog(&AppWindow, Rc<RefCell<Session>>, [String;5])`; and in `startup`: `pub fn find_crashed_apply(&Path) -> Option<PathBuf>`, `pub fn journal_report(&Path) -> io::Result<String>`.
 **Design ref:** [`screens/2b-apply-dialog.png`](../../../design/screens/2b-apply-dialog.png), [`screens/2c-apply-progress.png`](../../../design/screens/2c-apply-progress.png), [`screens/2d-crash-recovery.png`](../../../design/screens/2d-crash-recovery.png) — scrim (`Theme.scrim`) + centered `Theme.panel-dialog` modal (r-xl), per-bucket table with tier dots, **green confirm** (`Theme.accent-confirm`) / **bordered cancel**, **gold resume** (`Theme.accent-warn`). **Replace the placeholder hex in the `.slint` below** (`#262626`, `#f0a35e`, `#99bbee`, `#f85149`, `#ccaa88`, `#000000cc`, …) with `Theme.*`; [DESIGN.md](../../../design/DESIGN.md) §4 (2b–2d).
 
-The full §6 Apply workflow. `A` (already mapped) sets `apply_open`. The dialog takes a destination path; the **dest == source root** guard is `startup::dest_is_source_root` from Task 11 (reused, not duplicated — a source subfolder is allowed). `gather_apply_inputs` reads `existing` names + per-stem `sizes` + the leftover unrecognized-file count from disk so `plan` stays pure; `build_preview` folds in collision resolutions (`ShotOp.suffix`), skipped-sidecar and stale counts, and a cross-filesystem free-space check. Confirm calls `apply` (journaling to `dest/.fastcull-apply.json`) — or `resume` if a journal is already there — then relocates `source/.fastcull.json` into `dest` as the audit record (the responsibility Phase 4 left to `main`). Launch-time crash detection referenced in Task 11's `main` is implemented here (`find_crashed_apply` + `journal_report`) and the dialog also offers resume-or-report for the chosen dest.
+The full §6 Apply workflow. `A` (already mapped) sets `apply_open`. The dialog takes a destination path; the **dest == source root** guard is `startup::dest_is_source_root` from Task 11 (reused, not duplicated — a source subfolder is allowed). `gather_apply_inputs` reads `existing` bucket-relative paths + per-stem `sizes` + the leftover unrecognized-file count from disk so `plan` stays pure; `build_preview` folds in collision resolutions (`ShotOp.suffix`), skipped-sidecar and stale counts, and a cross-filesystem free-space check. Confirm (rev 3): sets + autosaves the **`pending_apply` breadcrumb first**, then runs `apply` — or `resume` only when `find_crashed_apply` says the journal is genuinely interrupted — **on a worker thread** (the UI polls the journal for the 2c progress screen and receives completion via `upgrade_in_event_loop` → `apply_finished`), then clears the breadcrumb and relocates `source/.fastcull.json` into `dest` as the audit record, no-clobber (the responsibility Phase 4 left to `main`). Launch-time crash detection referenced in Task 11's `main` is implemented here (`find_crashed_apply` + `journal_report`) and the dialog also offers resume-or-report for the chosen dest.
+
+> **New `.slint` surface for the async flow** (add to `app.slint` alongside the existing dialog properties): `in-out property <bool> apply-running;`, `in property <string> apply-progress;` (rendered by the 2c progress overlay), and `callback apply-finished(bool, string);` — invoked from the worker's completion hop; its handler (registered in `wire_apply_dialog`) owns all Rc-held state, because `Rc`/`RefCell` must never cross the thread boundary (only the `AppWindow` Weak does, via `upgrade_in_event_loop`).
 
 **Crash-journal resume-or-report landed in Task 12** (functions live in `startup.rs`, called from Task 11's `main` and from this dialog).
+
+- [ ] **Step 0: add the `Session.pending_apply` breadcrumb to the landed model (TDD, `culler-core`)**
+
+The README canonical `Session` (rev 3) carries the crash-detection breadcrumb; the landed Phase-1 model predates it. Failing test first (append to `culler-core/src/model.rs` tests):
+```rust
+    #[test]
+    fn pending_apply_breadcrumb_serde_defaults_and_round_trips() {
+        // Pre-rev-3 session files have no `pending_apply` — they must still load.
+        let old_json = r#"{"source_dir":"/src","shots":[],"decisions":{},"current":0}"#;
+        let old: Session = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old.pending_apply, None);
+
+        // The breadcrumb round-trips when set, and is omitted when None.
+        let mut s = Session::default();
+        assert!(!serde_json::to_string(&s).unwrap().contains("pending_apply"));
+        s.pending_apply = Some(std::path::PathBuf::from("/shoot/sorted"));
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pending_apply, Some(std::path::PathBuf::from("/shoot/sorted")));
+    }
+```
+Run `cargo test -p culler-core pending_apply` → FAIL (no such field). Then add to `Session` (between `current` and `undo`, exactly as in the README):
+```rust
+    /// In-flight Apply destination (crash-detection breadcrumb, spec §6/§8
+    /// rev 3). Set + autosaved just before an apply's first move; cleared on
+    /// success. `default` keeps pre-rev-3 session files loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_apply: Option<std::path::PathBuf>,
+```
+Run again → PASS (the whole `culler-core` suite stays green — `Default` covers the new field). Commit: `git commit -m "feat(model): pending_apply crash-detection breadcrumb on Session"`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2276,6 +2390,7 @@ mod applyflow_tests {
             shots: vec![mk_shot("IMG_1", src), mk_shot("IMG_2", src)],
             decisions,
             current: 0,
+            pending_apply: None,
             undo: vec![],
         };
         let buckets = crate::startup::default_buckets();
@@ -2352,6 +2467,20 @@ mod crash_tests {
         assert!(report.contains("done: 1"));
         assert!(report.contains("pending: 1"));
         assert!(report.contains("failed: 0"));
+
+        // An all-Done journal is a FINISHED run, not a crash (spec §8 rev 3):
+        // no recovery offer, and a fresh apply into this dest must not be
+        // hijacked into resuming it.
+        let finished = culler_core::Journal {
+            plan: journal.plan.clone(),
+            statuses: vec![culler_core::OpState::Done, culler_core::OpState::Done],
+        };
+        std::fs::write(
+            dest.join(culler_core::JOURNAL_FILE),
+            serde_json::to_vec(&finished).unwrap(),
+        )
+        .unwrap();
+        assert!(find_crashed_apply(dest).is_none());
     }
 }
 ```
@@ -2363,12 +2492,26 @@ mod crash_tests {
 Append to the non-test region of `culler/src/startup.rs`:
 ```rust
 /// Detect an interrupted apply: a journal left in `dir` by a prior crashed run.
+/// Only a journal with UNFINISHED work (≥1 non-`Done` status) counts — success
+/// removes the journal, so this is defense in depth: an all-`Done` leftover or
+/// copy must never trigger a recovery offer or hijack a fresh apply into this
+/// dest (spec §8 rev 3). An unreadable/corrupt journal IS surfaced (returned),
+/// not silently ignored — `journal_report` will show the parse failure.
 pub fn find_crashed_apply(dir: &Path) -> Option<PathBuf> {
     let j = dir.join(culler_core::JOURNAL_FILE);
-    if j.is_file() {
+    if !j.is_file() {
+        return None;
+    }
+    let Ok(bytes) = std::fs::read(&j) else {
+        return Some(j); // unreadable: surface it, don't ignore it
+    };
+    let Ok(journal) = serde_json::from_slice::<culler_core::Journal>(&bytes) else {
+        return Some(j); // corrupt: surface it, don't ignore it
+    };
+    if journal.statuses.iter().any(|s| *s != culler_core::OpState::Done) {
         Some(j)
     } else {
-        None
+        None // finished run — nothing to resume
     }
 }
 
@@ -2411,7 +2554,7 @@ pub struct ApplyPreview {
 }
 
 /// Gather the plan's I/O-derived inputs so `plan` itself stays pure:
-///  - `existing`: file names already under any dest bucket (collision detection)
+///  - `existing`: bucket-relative paths already under the dest buckets (per-directory collision detection, rev 3)
 ///  - `sizes`: stem -> total bytes of the shot's files (free-space preflight)
 ///  - leftover count: source files belonging to no shot (they stay behind)
 pub fn gather_apply_inputs(
@@ -2419,12 +2562,15 @@ pub fn gather_apply_inputs(
     dest: &Path,
     buckets: &[String; 5],
 ) -> (BTreeSet<String>, HashMap<String, u64>, usize) {
+    // `existing` holds BUCKET-RELATIVE paths ("02_keep/IMG_1.JPG") — rev 3:
+    // plan()'s collisions are per target directory, so a name occupied in a
+    // different bucket must not force a suffix.
     let mut existing = BTreeSet::new();
     for b in buckets {
         if let Ok(rd) = std::fs::read_dir(dest.join(b)) {
             for e in rd.flatten() {
                 if let Some(name) = e.file_name().to_str() {
-                    existing.insert(name.to_string());
+                    existing.insert(format!("{b}/{name}"));
                 }
             }
         }
@@ -2512,26 +2658,61 @@ pub fn compute_preview(session: &Session, dest: &Path, buckets: &[String; 5]) ->
     (planned, preview)
 }
 
-/// Move the session sidecar into dest as the audit record (Phase 4 left this to main).
+/// Move the session sidecar into dest as the audit record (Phase 4 left this
+/// to main). NO-CLOBBER like every other destination write (rev 3): if dest
+/// already holds a `.fastcull.json` (it was a FastCull folder before), the
+/// record lands at the first free numbered sibling instead of overwriting
+/// history. Always finishes by writing the passed (breadcrumb-cleared)
+/// in-memory state and retiring the stale source copy.
 fn relocate_session(session: &Session, dest: &Path) -> std::io::Result<()> {
     let from = session.source_dir.join(culler_core::SESSION_FILE);
-    let to = dest.join(culler_core::SESSION_FILE);
-    if std::fs::rename(&from, &to).is_err() {
-        // cross-fs or already-moved: write a fresh copy of the record instead
-        save(session, &to)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+    let to = first_free(dest, culler_core::SESSION_FILE);
+    match RealFs.rename_noreplace(&from, &to) {
+        Ok(()) => {
+            // The moved file still holds pre-apply state (breadcrumb set);
+            // atomically rewrite it with the cleared session.
+            save(session, &to).map_err(|e| std::io::Error::other(format!("{e:?}")))
+        }
+        Err(_) => {
+            // Cross-FS or source already gone: write the record fresh, then
+            // retire any stale source copy (it would resurrect the breadcrumb
+            // on the next launch). Our own metadata — not a user-data delete.
+            save(session, &to).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            let _ = std::fs::remove_file(&from);
+            Ok(())
+        }
     }
-    Ok(())
 }
 
-/// Fresh apply: gather -> plan -> journaled apply -> relocate session record.
-pub fn run_apply(session: &Session, dest: &Path, buckets: &[String; 5]) -> Result<ApplyReport, String> {
-    let (existing, sizes, _leftovers) = gather_apply_inputs(session, dest, buckets);
-    let planned = plan(session, dest, buckets, &existing, &sizes);
+/// `base`, then `base.1`, `base.2`, … — first name not present in `dir`.
+fn first_free(dir: &Path, base: &str) -> std::path::PathBuf {
+    let candidate = dir.join(base);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let mut n = 1u32;
+    loop {
+        let c = dir.join(format!("{base}.{n}"));
+        if !c.exists() {
+            return c;
+        }
+        n += 1;
+    }
+}
+
+/// Fresh apply: gather -> plan -> journaled apply -> clear breadcrumb ->
+/// relocate session record. Takes the session BY VALUE — this runs on a worker
+/// thread against a snapshot, never on the UI thread.
+pub fn run_apply(mut session: Session, dest: &Path, buckets: &[String; 5]) -> Result<ApplyReport, String> {
+    let (existing, sizes, _leftovers) = gather_apply_inputs(&session, dest, buckets);
+    let planned = plan(&session, dest, buckets, &existing, &sizes);
     let fs = RealFs;
     let journal_path = dest.join(culler_core::JOURNAL_FILE);
     let report = apply(&planned, &fs, &journal_path).map_err(|e| format!("{e:?}"))?;
-    relocate_session(session, dest).map_err(|e| format!("session relocation: {e}"))?;
+    // Success: the breadcrumb has served its purpose (spec §6 rev 3) — clear it
+    // before the session becomes the immutable audit record in dest.
+    session.pending_apply = None;
+    relocate_session(&session, dest).map_err(|e| format!("session relocation: {e}"))?;
     Ok(report)
 }
 
@@ -2552,8 +2733,9 @@ fn to_ui_preview(p: &ApplyPreview) -> crate::ApplyPreviewUi {
     }
 }
 
-/// Wire the Apply dialog callbacks: dest validation + crash-journal probe, preview,
-/// confirm (apply or resume) + session relocation, cancel.
+/// Wire the Apply dialog callbacks: dest validation + crash-journal probe,
+/// preview, confirm (worker-thread apply-or-resume with breadcrumb + journal
+/// polling), completion sink, cancel.
 pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets: [String; 5]) {
     // Destination typed: guard dest==source root, probe for a crashed journal.
     {
@@ -2604,11 +2786,36 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
         });
     }
 
-    // Confirm: resume a crashed run if a journal exists, else fresh apply.
+    // Completion sink — registered on the UI thread, so it may touch Rc state.
+    // The worker thread reaches it via `invoke_apply_finished` (Rc/RefCell are
+    // not Send; only the AppWindow Weak crosses the thread boundary).
+    let progress_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+    {
+        let session = session.clone();
+        let progress_timer = progress_timer.clone();
+        let app_w = app.as_weak();
+        app.on_apply_finished(move |ok, msg| {
+            let Some(app) = app_w.upgrade() else { return };
+            progress_timer.borrow_mut().take(); // dropping the Timer stops the polling
+            app.set_apply_running(false);
+            app.set_dest_error(msg);
+            if ok {
+                // Mirror the on-disk clear in the live session.
+                session.borrow_mut().pending_apply = None;
+                app.set_apply_open(false);
+            }
+        });
+    }
+
+    // Confirm: resume a GENUINELY interrupted run (find_crashed_apply is
+    // non-Done-aware — an all-Done leftover never hijacks a fresh apply), else
+    // fresh apply. Always on a worker thread: a 2k-file move must not freeze
+    // the window. Progress = polling the journal the engine rewrites per move.
     {
         let session = session.clone();
         let buckets = buckets.clone();
         let app_w = app.as_weak();
+        let progress_timer = progress_timer.clone();
         app.on_apply_confirmed(move || {
             let Some(app) = app_w.upgrade() else { return };
             let dest = std::path::PathBuf::from(app.get_dest_path().to_string());
@@ -2616,31 +2823,68 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
             if crate::startup::dest_is_source_root(&source, &dest) {
                 return;
             }
-            let journal_path = dest.join(culler_core::JOURNAL_FILE);
-            let result = if journal_path.exists() {
-                resume(&journal_path, &RealFs)
-                    .map_err(|e| format!("{e:?}"))
-                    .and_then(|r| {
-                        relocate_session(&session.borrow(), &dest)
+
+            // Breadcrumb FIRST (spec §6 rev 3): record + autosave the in-flight
+            // dest BEFORE any move, so a crash is detectable on next launch.
+            {
+                let mut s = session.borrow_mut();
+                s.pending_apply = Some(dest.clone());
+                let _ = save(&s, &source.join(culler_core::SESSION_FILE));
+            }
+
+            let resume_journal = crate::startup::find_crashed_apply(&dest);
+            let snapshot = session.borrow().clone(); // worker-thread copy
+            let buckets = buckets.clone();
+            let jpath = dest.join(culler_core::JOURNAL_FILE);
+            app.set_apply_running(true);
+
+            // 2c progress screen: poll the journal at 200 ms while the worker runs.
+            let timer = slint::Timer::default();
+            {
+                let app_w = app_w.clone();
+                let jp = jpath.clone();
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    std::time::Duration::from_millis(200),
+                    move || {
+                        if let Some(app) = app_w.upgrade() {
+                            if let Ok(r) = crate::startup::journal_report(&jp) {
+                                app.set_apply_progress(r.into());
+                            }
+                        }
+                    },
+                );
+            }
+            *progress_timer.borrow_mut() = Some(timer);
+
+            let app_w2 = app_w.clone();
+            let dest2 = dest.clone();
+            std::thread::spawn(move || {
+                let result = match resume_journal {
+                    Some(j) => resume(&j, &RealFs).map_err(|e| format!("{e:?}")).and_then(|r| {
+                        // Post-resume housekeeping mirrors run_apply's tail.
+                        let mut s = snapshot;
+                        s.pending_apply = None;
+                        relocate_session(&s, &dest2)
                             .map(|_| r)
                             .map_err(|e| format!("session relocation: {e}"))
-                    })
-            } else {
-                run_apply(&session.borrow(), &dest, &buckets)
-            };
-            match result {
-                Ok(report) => {
-                    app.set_dest_error(
+                    }),
+                    None => run_apply(snapshot, &dest2, &buckets),
+                };
+                let (ok, msg) = match result {
+                    Ok(report) => (
+                        true,
                         format!(
                             "Applied: {} shots, {} files moved, {} sidecars written.",
                             report.moved_shots, report.moved_files, report.sidecars_written
-                        )
-                        .into(),
-                    );
-                    app.set_apply_open(false);
-                }
-                Err(e) => app.set_dest_error(format!("Apply failed: {e}").into()),
-            }
+                        ),
+                    ),
+                    Err(e) => (false, format!("Apply failed: {e}")),
+                };
+                let _ = app_w2.upgrade_in_event_loop(move |app| {
+                    app.invoke_apply_finished(ok, msg.into());
+                });
+            });
         });
     }
 
@@ -2662,9 +2906,10 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
   - `A` opens the dialog; typing the source root itself shows the refusal error and disables Confirm; a source *subfolder* (e.g. `sorted`) is accepted.
   - "Compute preview" shows per-bucket counts including `00_rejected`, collision auto-suffix count, skipped-sidecar count, stale count, unrecognized-files-left-behind count, and total MB.
   - Choosing a destination on another filesystem shows a free-space line; Confirm is disabled when space is insufficient.
-  - Confirm executes the move: buckets appear in dest, rejects land in `00_rejected` (never deleted), the session `.fastcull.json` is relocated into dest, and the source is left with only the unrecognized files.
-  - Pointing the dialog at a dest that already holds a `.fastcull-apply.json` shows the interrupted-apply report and Confirm **resumes** it (verify against a deliberately half-written journal).
-  - Launch-time: starting `culler` on a folder that contains a leftover journal prints the report to stderr (Task 11 `main`), confirming detection.
+  - Confirm executes the move **on a worker thread — the window stays responsive and the 2c progress line updates from the polled journal**: buckets appear in dest, rejects land in `00_rejected` (never deleted), the journal is **gone** afterwards, the session `.fastcull.json` is relocated into dest **with `pending_apply` cleared**, and the source is left with only the unrecognized files.
+  - Pointing the dialog at a dest that holds a genuinely interrupted `.fastcull-apply.json` (≥1 non-Done) shows the report and Confirm **resumes** it (verify against a deliberately half-written journal). Applying **again into the same dest after a successful run must perform a fresh apply** — no stale-journal hijack (the journal was removed; `find_crashed_apply` is non-Done-aware as defense in depth).
+  - Crash breadcrumb: kill the app mid-apply (large fixture), relaunch on the **source** — the interrupted-apply report appears via `session.pending_apply` even though the journal lives in dest; after resuming successfully, relaunch shows nothing.
+  - Launch-time: starting `culler` on a folder that contains a leftover *interrupted* journal prints the report to stderr (Task 11 `main`), confirming detection.
 
 `culler/ui/applydialog.slint`:
 ```slint
@@ -2810,7 +3055,7 @@ Phase 6 delivers the running `culler` binary — the last piece of FastCull v1, 
 
 **Unit-tested pure/public symbols** (run headless, no window): `to_key`, `key_to_action` (full §9 keymap incl. `Ctrl+S`, modal gating); `next_filter`, `passes`, `step_filtered`, `parse_tags`; `apply_action` (auto-advance on/off, clear-never-advances, filter-confined nav, undo, UI-only no-ops); `Scheduler` (generation-counter staleness); `LruCache` (budget eviction, MRU touch, update-in-place), `prefetch_set` (forward-biased, clamped); `tier_color_code`, `dim_flag`, `build_filmstrip_window` (virtualized window + filter); `suggest_tags`, `hud_text`; `ZoomState` (sticky zoom + pan across nav); `default_buckets`, `resolve_buckets`, `reattach`, `dest_is_source_root`; `gather_apply_inputs` + `build_preview` (temp-dir assembly), `find_crashed_apply` + `journal_report` (temp-dir). `to_slint_image` dimensions are asserted without a window.
 
-**Manual-checklist (visual) parts**: window bring-up; loupe fit/zoom/pan rendering; color-coded virtualized filmstrip; HUD + tag-entry autocomplete widgets; latest-wins scrubbing with no backlog/rubber-band; embedded-thumbnail first paint; full-res dedicated slot not spiking the LRU; the Apply dialog (dest guard, preview, confirm/apply/resume) end-to-end; launch-time crash-journal surfacing.
+**Manual-checklist (visual) parts**: window bring-up; loupe fit/zoom/pan rendering; color-coded virtualized filmstrip; HUD + tag-entry autocomplete widgets; latest-wins scrubbing with no backlog/rubber-band **and no neighbor-repaint (delivery-time freshness)**; embedded-thumbnail first paint; full-res dedicated slot not spiking the LRU; the Apply dialog (dest guard, preview, **worker-thread** confirm/apply/resume with journal-polled 2c progress, breadcrumb set/cleared, journal removed on success, no stale-journal hijack) end-to-end; launch-time crash surfacing via `pending_apply` **and** source-dir probe; debounced autosave (no per-keypress fsync).
 
 **Consumes from `culler-core` (Phases 1–5):** `Session`, `Shot`, `Decision`, `Tier`, `CaptureTime`, `TierCounts`, `TierCountsPlan`, `ApplyPlan`, `Journal`, `OpState`, `ApplyReport`, `DecodedImage`, `TargetSize`, `RealFs`, `FsOps`; functions `scan`, `load_or_fresh`, `save`, `plan`, `apply`, `resume`, `decode`, `embedded_thumbnail`; `Session` methods `decision`, `set_tier`, `set_tags`, `add_tag`, `mark_visited`, `undo`, `counts`, `visited_count`, `next_unvisited`, `all_tags`; constants `BUCKET_*`, `SESSION_FILE`, `JOURNAL_FILE`.
 
