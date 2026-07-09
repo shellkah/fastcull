@@ -589,4 +589,47 @@ mod tests {
         assert_eq!(p.total_bytes, 105);
         assert!(p.stale.is_empty());
     }
+
+    #[test]
+    fn plan_reports_all_skipped_sidecar_writes() {
+        let buckets = default_buckets();
+        let shots = vec![
+            shot("Skip1", "JPG", None, Some("/src/Skip1.xmp")), // has sidecar + tags => report
+            shot("Skip2", "JPG", None, Some("/src/Skip2.xmp")), // has sidecar + tier => report
+            shot("NoReport", "JPG", None, Some("/src/NoReport.xmp")), // has sidecar but no content => do NOT report
+        ];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            "Skip1".to_string(),
+            Decision {
+                tier: None,
+                tags: vec!["hero".to_string()],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "Skip2".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        // NoReport: no decision entry => no tier, no tags => no content => not reported
+        let session = Session {
+            shots,
+            decisions,
+            ..Default::default()
+        };
+
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &BTreeSet::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(p.skipped_sidecar_writes, vec!["Skip1".to_string(), "Skip2".to_string()]);
+    }
 }
