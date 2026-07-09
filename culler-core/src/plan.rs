@@ -66,6 +66,14 @@ fn rest_after_stem(file_name: &str, stem: &str) -> String {
     file_name.get(stem.len()..).unwrap_or_default().to_string()
 }
 
+/// Apply the whole-stem collision suffix: None => "IMG_1234", Some(1) => "IMG_1234-1".
+fn suffixed_stem(stem: &str, suffix: Option<u32>) -> String {
+    match suffix {
+        None => stem.to_string(),
+        Some(n) => format!("{stem}-{n}"),
+    }
+}
+
 /// PURE — no filesystem I/O. `existing` = BUCKET-RELATIVE destination paths
 /// ("02_keep/IMG_1234.JPG") already on disk (gathered by the binary via one
 /// readdir per bucket). Collisions are PER TARGET DIRECTORY — the same name in
@@ -75,10 +83,12 @@ pub fn plan(
     session: &Session,
     dest: &Path,
     buckets: &[String; 5],
-    _existing: &BTreeSet<String>,
+    existing: &BTreeSet<String>,
     _sizes: &HashMap<String, u64>,
 ) -> ApplyPlan {
     let mut ops = Vec::with_capacity(session.shots.len());
+    // Names this plan has already claimed in the destination (across all ops).
+    let mut claimed: BTreeSet<String> = BTreeSet::new();
 
     for (i, shot) in session.shots.iter().enumerate() {
         let decision = session.decision(i);
@@ -87,18 +97,44 @@ pub fn plan(
         let dest_dir = dest.join(bucket);
 
         let files = shot.files();
+        let rests: Vec<String> = files
+            .iter()
+            .map(|f| {
+                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                rest_after_stem(name, &shot.stem)
+            })
+            .collect();
+
+        // Resolve a whole-stem suffix so no BUCKET-RELATIVE target path
+        // ("01_rest/IMG_1234.JPG") collides with the destination (`existing`)
+        // or with a path already claimed by this plan. Per-directory keys mean
+        // the same name in a DIFFERENT bucket never forces a suffix (rev 3).
+        let mut suffix: Option<u32> = None;
+        let names = loop {
+            let new_stem = suffixed_stem(&shot.stem, suffix);
+            let candidate: Vec<String> = rests
+                .iter()
+                .map(|rest| format!("{bucket}/{new_stem}{rest}"))
+                .collect();
+            if candidate
+                .iter()
+                .all(|n| !existing.contains(n) && !claimed.contains(n))
+            {
+                break candidate;
+            }
+            suffix = Some(suffix.map_or(1, |s| s + 1));
+        };
+        for n in &names {
+            claimed.insert(n.clone());
+        }
+        let new_stem = suffixed_stem(&shot.stem, suffix);
+
         let moves: Vec<FileMove> = files
             .iter()
-            .map(|from| {
-                let name = from
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                let rest = rest_after_stem(name, &shot.stem);
-                FileMove {
-                    from: from.clone(),
-                    to: dest_dir.join(format!("{}{}", shot.stem, rest)),
-                }
+            .zip(rests.iter())
+            .map(|(from, rest)| FileMove {
+                from: from.clone(),
+                to: dest_dir.join(format!("{new_stem}{rest}")),
             })
             .collect();
 
@@ -107,7 +143,7 @@ pub fn plan(
             bucket: bucket.clone(),
             moves,
             write_sidecar: None,
-            suffix: None,
+            suffix,
         });
     }
 
@@ -217,5 +253,97 @@ mod tests {
         );
 
         assert!(p.stale.is_empty());
+    }
+
+    #[test]
+    fn plan_auto_suffixes_existing_and_intra_plan() {
+        let buckets = default_buckets();
+        // Realistic intra-plan collision: IMG_0002 gets suffixed to IMG_0002-1 by
+        // `existing`, which then collides with the REAL stem IMG_0002-1. (Two shots
+        // sharing one stem is impossible — scan groups by stem and decisions are
+        // stem-keyed — so the old duplicate-stem fixture modeled an unreachable state.)
+        let shots = vec![
+            shot("IMG_0001", "JPG", Some("CR3"), None), // both files collide with `existing`
+            shot("IMG_0002", "JPG", None, None),        // suffixed to -1 by `existing`…
+            shot("IMG_0002-1", "JPG", None, None),      // …colliding with that claimed name
+        ];
+        // all undecided => all land in 01_rest
+        let session = Session {
+            shots,
+            decisions: HashMap::new(),
+            ..Default::default()
+        };
+
+        // `existing` holds BUCKET-RELATIVE paths (rev 3).
+        let mut existing = BTreeSet::new();
+        existing.insert("01_rest/IMG_0001.JPG".to_string());
+        existing.insert("01_rest/IMG_0001.CR3".to_string());
+        existing.insert("01_rest/IMG_0002.JPG".to_string());
+
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &existing,
+            &HashMap::new(),
+        );
+
+        // existing collision suffixes the WHOLE stem, keeping jpeg + raw matched
+        assert_eq!(p.ops[0].suffix, Some(1));
+        assert_eq!(
+            p.ops[0].moves,
+            vec![
+                FileMove {
+                    from: PathBuf::from("/src/IMG_0001.JPG"),
+                    to: PathBuf::from("/dest/01_rest/IMG_0001-1.JPG"),
+                },
+                FileMove {
+                    from: PathBuf::from("/src/IMG_0001.CR3"),
+                    to: PathBuf::from("/dest/01_rest/IMG_0001-1.CR3"),
+                },
+            ],
+        );
+
+        // IMG_0002 is taken in 01_rest => suffixed to IMG_0002-1
+        assert_eq!(p.ops[1].suffix, Some(1));
+        assert_eq!(
+            p.ops[1].moves[0].to,
+            PathBuf::from("/dest/01_rest/IMG_0002-1.JPG")
+        );
+
+        // the real stem IMG_0002-1 collides with the name op[1] claimed => IMG_0002-1-1
+        assert_eq!(p.ops[2].suffix, Some(1));
+        assert_eq!(
+            p.ops[2].moves[0].to,
+            PathBuf::from("/dest/01_rest/IMG_0002-1-1.JPG")
+        );
+    }
+
+    #[test]
+    fn plan_ignores_same_name_in_a_different_bucket() {
+        let buckets = default_buckets();
+        let shots = vec![shot("IMG_0009", "JPG", None, None)]; // undecided -> 01_rest
+        let session = Session {
+            shots,
+            decisions: HashMap::new(),
+            ..Default::default()
+        };
+
+        let mut existing = BTreeSet::new();
+        existing.insert("02_keep/IMG_0009.JPG".to_string()); // same NAME, different bucket
+
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &existing,
+            &HashMap::new(),
+        );
+        // rev 3: collisions are per target directory — no spurious rename.
+        assert_eq!(p.ops[0].suffix, None);
+        assert_eq!(
+            p.ops[0].moves[0].to,
+            PathBuf::from("/dest/01_rest/IMG_0009.JPG")
+        );
     }
 }
