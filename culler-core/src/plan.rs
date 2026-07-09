@@ -87,7 +87,7 @@ pub fn plan(
     _sizes: &HashMap<String, u64>,
 ) -> ApplyPlan {
     let mut ops = Vec::with_capacity(session.shots.len());
-    // Names this plan has already claimed in the destination (across all ops).
+    let mut skipped_sidecar_writes = Vec::new();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
 
     for (i, shot) in session.shots.iter().enumerate() {
@@ -105,17 +105,21 @@ pub fn plan(
             })
             .collect();
 
-        // Resolve a whole-stem suffix so no BUCKET-RELATIVE target path
-        // ("01_rest/IMG_1234.JPG") collides with the destination (`existing`)
-        // or with a path already claimed by this plan. Per-directory keys mean
-        // the same name in a DIFFERENT bucket never forces a suffix (rev 3).
+        // A fresh sidecar is written only when the shot has a tier or tags AND
+        // has no pre-existing sidecar (which we carry untouched instead).
+        let has_content = decision.tier.is_some() || !decision.tags.is_empty();
+        let write_new_sidecar = shot.sidecar.is_none() && has_content;
+
+        // Resolve a whole-stem suffix so no target name — including the fresh
+        // `.xmp` — collides with `existing` or with a name this plan claimed.
         let mut suffix: Option<u32> = None;
         let names = loop {
             let new_stem = suffixed_stem(&shot.stem, suffix);
-            let candidate: Vec<String> = rests
-                .iter()
-                .map(|rest| format!("{bucket}/{new_stem}{rest}"))
-                .collect();
+            let mut candidate: Vec<String> =
+                rests.iter().map(|rest| format!("{bucket}/{new_stem}{rest}")).collect();
+            if write_new_sidecar {
+                candidate.push(format!("{bucket}/{new_stem}.xmp"));
+            }
             if candidate
                 .iter()
                 .all(|n| !existing.contains(n) && !claimed.contains(n))
@@ -129,6 +133,7 @@ pub fn plan(
         }
         let new_stem = suffixed_stem(&shot.stem, suffix);
 
+        // Moves: jpeg, raw?, and a pre-existing sidecar? — carried untouched.
         let moves: Vec<FileMove> = files
             .iter()
             .zip(rests.iter())
@@ -138,11 +143,25 @@ pub fn plan(
             })
             .collect();
 
+        let write_sidecar = if write_new_sidecar {
+            Some(SidecarWrite {
+                path: dest_dir.join(format!("{new_stem}.xmp")),
+                tags: decision.tags.clone(),
+                rating: decision.xmp_rating(),
+            })
+        } else {
+            None
+        };
+        // Report a skipped tag-write only when there was something to write.
+        if shot.sidecar.is_some() && has_content {
+            skipped_sidecar_writes.push(shot.stem.clone());
+        }
+
         ops.push(ShotOp {
             stem: shot.stem.clone(),
             bucket: bucket.clone(),
             moves,
-            write_sidecar: None,
+            write_sidecar,
             suffix,
         });
     }
@@ -152,7 +171,7 @@ pub fn plan(
         buckets: buckets.clone(),
         ops,
         per_bucket_counts: TierCountsPlan::default(),
-        skipped_sidecar_writes: Vec::new(),
+        skipped_sidecar_writes,
         stale: Vec::new(),
         total_bytes: 0,
     }
@@ -345,5 +364,61 @@ mod tests {
             p.ops[0].moves[0].to,
             PathBuf::from("/dest/01_rest/IMG_0009.JPG")
         );
+    }
+
+    #[test]
+    fn plan_writes_new_sidecar_and_skips_preexisting() {
+        let buckets = default_buckets();
+        let shots = vec![
+            shot("A", "JPG", None, None),                      // Keep tier => write new sidecar (rating 3)
+            shot("B", "JPG", None, None),                      // tags only => write new sidecar (rating None)
+            shot("C", "JPG", Some("CR3"), Some("/src/C.xmp")), // pre-existing sidecar => skip + carry
+            shot("D", "JPG", None, None),                      // no tier, no tags => no sidecar
+        ];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            "A".to_string(),
+            Decision { tier: Some(Tier::Keep), tags: vec![], visited: true },
+        );
+        decisions.insert(
+            "B".to_string(),
+            Decision { tier: None, tags: vec!["sky".to_string()], visited: true },
+        );
+        decisions.insert(
+            "C".to_string(),
+            Decision { tier: Some(Tier::Pick), tags: vec!["hero".to_string()], visited: true },
+        );
+        // D: no entry
+        let session = Session { shots, decisions, ..Default::default() };
+
+        let p = plan(&session, Path::new("/dest"), &buckets, &BTreeSet::new(), &HashMap::new());
+
+        // A: Keep => 02_keep, fresh sidecar with rating 3, no tags
+        assert_eq!(
+            p.ops[0].write_sidecar,
+            Some(SidecarWrite {
+                path: PathBuf::from("/dest/02_keep/A.xmp"),
+                tags: vec![],
+                rating: Some(3),
+            })
+        );
+        // B: tags only => 01_rest, fresh sidecar, rating None
+        assert_eq!(
+            p.ops[1].write_sidecar,
+            Some(SidecarWrite {
+                path: PathBuf::from("/dest/01_rest/B.xmp"),
+                tags: vec!["sky".to_string()],
+                rating: None,
+            })
+        );
+        // C: pre-existing sidecar carried in moves, no new write, reported as skipped
+        assert_eq!(p.ops[2].write_sidecar, None);
+        assert!(p.ops[2]
+            .moves
+            .iter()
+            .any(|m| m.to == PathBuf::from("/dest/03_picks/C.xmp")));
+        assert_eq!(p.skipped_sidecar_writes, vec!["C".to_string()]);
+        // D: nothing to write
+        assert_eq!(p.ops[3].write_sidecar, None);
     }
 }
