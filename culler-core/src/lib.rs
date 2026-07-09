@@ -4,6 +4,7 @@
 //! then `scan`, `xmp`, `plan`, `apply`, `decode` in later phases.
 //! Nothing in this crate depends on Slint or any GUI type.
 
+pub mod fsops;
 pub mod model;
 pub mod persist;
 pub mod plan;
