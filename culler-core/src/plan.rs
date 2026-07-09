@@ -446,7 +446,7 @@ mod tests {
             p.ops[2]
                 .moves
                 .iter()
-                .any(|m| m.to == PathBuf::from("/dest/03_picks/C.xmp"))
+                .any(|m| m.to == Path::new("/dest/03_picks/C.xmp"))
         );
         assert_eq!(p.skipped_sidecar_writes, vec!["C".to_string()]);
         // D: nothing to write
