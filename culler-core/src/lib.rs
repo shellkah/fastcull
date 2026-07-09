@@ -6,6 +6,7 @@
 
 pub mod model;
 pub mod persist;
+pub mod scan;
 
 #[cfg(test)]
 mod tests {
