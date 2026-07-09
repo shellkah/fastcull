@@ -632,4 +632,127 @@ mod tests {
 
         assert_eq!(p.skipped_sidecar_writes, vec!["Skip1".to_string(), "Skip2".to_string()]);
     }
+
+    #[test]
+    fn plan_claimed_names_are_scoped_per_bucket() {
+        let buckets = default_buckets();
+
+        // Case (a): different bucket — no collision with intra-plan claim
+        {
+            let shots = vec![
+                shot("M", "JPG", None, None),     // Keep tier (02_keep), collides with existing
+                shot("M-1", "JPG", None, None),   // Pick tier (03_picks), should NOT collide
+            ];
+            let mut decisions = HashMap::new();
+            decisions.insert(
+                "M".to_string(),
+                Decision {
+                    tier: Some(Tier::Keep),
+                    tags: vec![],
+                    visited: true,
+                },
+            );
+            decisions.insert(
+                "M-1".to_string(),
+                Decision {
+                    tier: Some(Tier::Pick),
+                    tags: vec![],
+                    visited: true,
+                },
+            );
+            let session = Session {
+                shots,
+                decisions,
+                ..Default::default()
+            };
+
+            let mut existing = BTreeSet::new();
+            existing.insert("02_keep/M.JPG".to_string()); // collides with shot M
+
+            let p = plan(
+                &session,
+                Path::new("/dest"),
+                &buckets,
+                &existing,
+                &HashMap::new(),
+            );
+
+            // Shot M in 02_keep collides with existing, gets suffix
+            assert_eq!(p.ops[0].stem, "M");
+            assert_eq!(p.ops[0].bucket, "02_keep");
+            assert_eq!(p.ops[0].suffix, Some(1));
+            assert_eq!(
+                p.ops[0].moves[0].to,
+                PathBuf::from("/dest/02_keep/M-1.JPG")
+            );
+
+            // Shot M-1 in 03_picks does NOT collide with the claim in 02_keep (different bucket)
+            assert_eq!(p.ops[1].stem, "M-1");
+            assert_eq!(p.ops[1].bucket, "03_picks");
+            assert_eq!(p.ops[1].suffix, None);
+            assert_eq!(
+                p.ops[1].moves[0].to,
+                PathBuf::from("/dest/03_picks/M-1.JPG")
+            );
+        }
+
+        // Case (b): same bucket — DOES collide with intra-plan claim
+        {
+            let shots = vec![
+                shot("M", "JPG", None, None),     // Keep tier (02_keep), collides with existing
+                shot("M-1", "JPG", None, None),   // Keep tier (02_keep), collides with M's claim
+            ];
+            let mut decisions = HashMap::new();
+            decisions.insert(
+                "M".to_string(),
+                Decision {
+                    tier: Some(Tier::Keep),
+                    tags: vec![],
+                    visited: true,
+                },
+            );
+            decisions.insert(
+                "M-1".to_string(),
+                Decision {
+                    tier: Some(Tier::Keep),
+                    tags: vec![],
+                    visited: true,
+                },
+            );
+            let session = Session {
+                shots,
+                decisions,
+                ..Default::default()
+            };
+
+            let mut existing = BTreeSet::new();
+            existing.insert("02_keep/M.JPG".to_string()); // collides with shot M
+
+            let p = plan(
+                &session,
+                Path::new("/dest"),
+                &buckets,
+                &existing,
+                &HashMap::new(),
+            );
+
+            // Shot M in 02_keep collides with existing, gets suffix
+            assert_eq!(p.ops[0].stem, "M");
+            assert_eq!(p.ops[0].bucket, "02_keep");
+            assert_eq!(p.ops[0].suffix, Some(1));
+            assert_eq!(
+                p.ops[0].moves[0].to,
+                PathBuf::from("/dest/02_keep/M-1.JPG")
+            );
+
+            // Shot M-1 in 02_keep DOES collide with M's claim (same bucket), gets suffix
+            assert_eq!(p.ops[1].stem, "M-1");
+            assert_eq!(p.ops[1].bucket, "02_keep");
+            assert_eq!(p.ops[1].suffix, Some(1));
+            assert_eq!(
+                p.ops[1].moves[0].to,
+                PathBuf::from("/dest/02_keep/M-1-1.JPG")
+            );
+        }
+    }
 }
