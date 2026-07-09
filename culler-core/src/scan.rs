@@ -109,6 +109,7 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
             }
         }
     }
+    sort_shots(&mut shots);
     Ok((shots, raw_only))
 }
 
@@ -205,6 +206,32 @@ fn ascii_field(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Stable filmstrip order: by (capture.datetime, capture.subsec, jpeg filename).
+/// Shots with no datetime sort AFTER all dated shots, then by filename, so burst
+/// order stays put across sessions.
+fn sort_shots(shots: &mut Vec<Shot>) {
+    shots.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+}
+
+/// Ordering key. The leading bool puts dated shots (`false`) before undated
+/// (`true`); `Option<u32>`/`String` then order within each group.
+fn sort_key(shot: &Shot) -> (bool, Option<String>, Option<u32>, String) {
+    (
+        shot.capture.datetime.is_none(),
+        shot.capture.datetime.clone(),
+        shot.capture.subsec,
+        file_name_string(&shot.jpeg),
+    )
+}
+
+/// The final path component (with extension) as an owned `String`.
+fn file_name_string(path: &Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -535,5 +562,76 @@ mod tests {
         assert_eq!(parse_subsec(""), None);
         assert_eq!(parse_subsec("abc"), None);
         assert_eq!(parse_subsec(" 42 "), Some(420));
+    }
+
+    #[test]
+    fn shots_sort_by_capture_time_with_stable_tiebreakers() {
+        let dir = unique_temp_dir("sort");
+
+        // Same datetime AND subsec → filename tiebreak (a_same < b_same).
+        std::fs::write(
+            dir.join("a_same.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:00", "20"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b_same.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:00", "20"),
+        )
+        .unwrap();
+        // Same datetime, different subsec → subsec tiebreak (lo < hi).
+        std::fs::write(
+            dir.join("sub_hi.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:01", "50"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("sub_lo.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:01", "05"),
+        )
+        .unwrap();
+        // Latest dated shot.
+        std::fs::write(
+            dir.join("late.jpg"),
+            jpeg_with_exif("2026:07:08 10:00:00", "00"),
+        )
+        .unwrap();
+        // Undated shots → after all dated, then by filename.
+        touch(&dir.join("undated_a.jpg"));
+        touch(&dir.join("undated_b.jpg"));
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            stems(&shots),
+            vec![
+                "a_same".to_string(),
+                "b_same".to_string(),
+                "sub_lo".to_string(),
+                "sub_hi".to_string(),
+                "late".to_string(),
+                "undated_a".to_string(),
+                "undated_b".to_string(),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undated_shots_alone_sort_by_filename() {
+        let dir = unique_temp_dir("undated");
+        touch(&dir.join("IMG_0003.JPG"));
+        touch(&dir.join("IMG_0001.JPG"));
+        touch(&dir.join("IMG_0002.JPG"));
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            stems(&shots),
+            vec![
+                "IMG_0001".to_string(),
+                "IMG_0002".to_string(),
+                "IMG_0003".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
