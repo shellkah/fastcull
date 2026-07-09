@@ -84,10 +84,9 @@ pub fn write_sidecar(path: &Path, tags: &[String], rating: Option<i32>) -> io::R
         std::process::id()
     ));
 
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
+    if let Err(e) = write_temp_and_sync(&tmp, content.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp); // create/write/fsync failure leaves no litter
+        return Err(e);
     }
     use rustix::fs::{CWD, RenameFlags, renameat_with};
     if let Err(e) = renameat_with(CWD, &tmp, CWD, path, RenameFlags::NOREPLACE) {
@@ -97,9 +96,78 @@ pub fn write_sidecar(path: &Path, tags: &[String], rating: Option<i32>) -> io::R
     Ok(())
 }
 
+/// Create `tmp`, write `content`, and fsync it. Split out of `write_sidecar`
+/// so every failure in this sequence (create, write, sync) is a single `Err`
+/// that the caller can clean up uniformly, alongside the existing
+/// rename-failure cleanup.
+fn write_temp_and_sync(tmp: &Path, content: &[u8]) -> io::Result<()> {
+    let mut f = std::fs::File::create(tmp)?;
+    #[cfg(test)]
+    if test_hooks::should_fail_write() {
+        return Err(io::Error::other("injected write failure (test)"));
+    }
+    f.write_all(content)?;
+    f.sync_all()
+}
+
+/// Test-only failure-injection seam for `write_sidecar`. Kept deliberately
+/// tiny and private: a thread-local flag lets a test force the write/sync
+/// step to fail deterministically right after the temp file is created,
+/// without resorting to OS-level `RLIMIT_FSIZE` + `SIGXFSZ` manipulation
+/// (which is process-wide state and would be racy/destructive in a
+/// multi-threaded `cargo test` binary where other tests run concurrently on
+/// other OS threads).
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_WRITE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn should_fail_write() -> bool {
+        FAIL_WRITE.with(Cell::get)
+    }
+
+    /// RAII guard: arms failure injection for the current thread while
+    /// alive; disarms on drop, including on test panic (`Drop` still runs
+    /// under the default per-test `catch_unwind`), so a failure in one test
+    /// can never leak into another test that reuses the same OS thread.
+    pub struct FailWriteGuard(());
+
+    impl FailWriteGuard {
+        pub fn new() -> Self {
+            FAIL_WRITE.with(|f| f.set(true));
+            FailWriteGuard(())
+        }
+    }
+
+    impl Drop for FailWriteGuard {
+        fn drop(&mut self) {
+            FAIL_WRITE.with(|f| f.set(false));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "fastcull-xmp-{}-{}-{}",
+            tag,
+            std::process::id(),
+            nanos
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
 
     #[test]
     fn build_xmp_emits_dc_subject_bag() {
@@ -172,22 +240,6 @@ mod tests {
 
     #[test]
     fn write_sidecar_writes_atomically_and_parses_back() {
-        fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let mut p = std::env::temp_dir();
-            p.push(format!(
-                "fastcull-xmp-{}-{}-{}",
-                tag,
-                std::process::id(),
-                nanos
-            ));
-            std::fs::create_dir_all(&p).unwrap();
-            p
-        }
-
         let dir = unique_tmp_dir("sidecar");
         let path = dir.join("IMG_1234.xmp");
         write_sidecar(&path, &["red".to_string()], Some(5)).expect("write_sidecar");
@@ -226,6 +278,28 @@ mod tests {
         );
         let count = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(count, 1, "refused publish leaves no temp litter");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_sidecar_cleans_up_temp_on_write_failure() {
+        let dir = unique_tmp_dir("write-fail");
+        let path = dir.join("IMG_5678.xmp");
+
+        let guard = test_hooks::FailWriteGuard::new();
+        let err = write_sidecar(&path, &["red".to_string()], Some(3)).unwrap_err();
+        drop(guard);
+        assert_eq!(err.kind(), std::io::ErrorKind::Other, "error was: {err:?}");
+
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "temp file left behind after write failure: {entries:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
