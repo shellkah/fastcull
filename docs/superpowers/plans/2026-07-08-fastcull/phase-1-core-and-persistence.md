@@ -1,23 +1,25 @@
 # FastCull Phase 1 — Core Domain & Persistence — Implementation Plan
 
+> **STATUS: LANDED on `master`** (fast-forward 42ba998..100daee, 2026-07-08; final review "ready to merge"; 38 tests green). **The code on master is authoritative, not this document.** Two post-plan review fixes are folded into the snippets below so this document no longer teaches the defective versions: `9b4f6b6` (`save` fsyncs the temp file before the rename) and `e1a20b1` (corrupt-session quarantine uses the first FREE numbered `.bad` / `.bad.1` / `.bad.2`… sibling instead of clobbering). Post-landing the workspace was also bumped to **edition 2024 / resolver 3** (2026-07-09). Do not re-execute this plan; use it as the design record.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax. Canonical types/constants are in [README.md](README.md); use them verbatim.
 
 **Goal:** Stand up the Cargo workspace and build `culler-core`'s pure, GUI-free domain engine — bucket/tier model, per-shot decisions, the in-memory `Session` state machine with bounded undo, and an atomic, corruption-safe JSON session sidecar — all fully unit-tested.
 
 **Architecture:** A two-crate workspace: `culler-core` (library, zero GUI deps) holds all domain logic; `culler` (binary) is a compile-only stub in this phase. Phase 1 delivers two `culler-core` modules — `model` (types + pure `Session` transitions) and `persist` (atomic save / load / corrupt-quarantine of the `.fastcull.json` sidecar). No pixels, no file moves; just a resumable, testable state engine.
 
-**Tech Stack:** Rust 2021, serde/serde_json.
+**Tech Stack:** Rust 2024, serde/serde_json.
 
 ## Global Constraints
 
 These bind every task in this phase (copied from [README.md](README.md)):
 
-- **Language / edition:** Rust, edition 2021. Workspace with two member crates: `culler-core` (lib) and `culler` (bin).
+- **Language / edition:** Rust, edition 2024 (workspace resolver 3). Workspace with two member crates: `culler-core` (lib) and `culler` (bin).
 - **`culler-core` has zero GUI dependencies.** No `slint`, no Slint types, in the library.
 - **Nothing touches disk until Apply.** All culling decisions live in memory + the autosaved session sidecar. Phase 1 delivers exactly that sidecar; it performs **no file moves** and no destructive I/O.
-- **Atomic writes everywhere:** session saves use write-temp-then-rename (write `<path>.tmp`, then `rename` over the target).
+- **Atomic writes everywhere:** session saves use write-temp-then-**fsync**-then-rename (write `<path>.tmp`, `sync_all`, then `rename` over the target — without the fsync a crash can commit the rename before the data blocks land, publishing a truncated sidecar).
 - **Decisions are keyed by filename stem** so resume re-attaches them after a rescan.
-- **Corrupt session file → renamed to `.fastcull.json.bad`**, reported, and a fresh session is started — never silently overwritten (evidence is preserved).
+- **Corrupt session file → renamed to the first FREE `.fastcull.json.bad` / `.bad.1` / `.bad.2`… sibling**, reported, and a fresh session is started — never silently overwritten, and a later corruption never clobbers earlier quarantined evidence.
 - **Undo is bounded** at `UNDO_LIMIT = 200`; oldest entries drop when exceeded. `set_tier` / `add_tag` / `set_tags` push the PREVIOUS decision onto the undo stack; `mark_visited` does NOT. The undo stack is `#[serde(skip)]`.
 - **Platform:** Linux only.
 - **TDD, DRY, YAGNI, frequent commits.** Every task: failing test → run-it-fails → minimal impl → run-it-passes → commit. Conventional-commit messages (`feat:`, `test:`, `chore:`, `refactor:`).
@@ -1217,11 +1219,17 @@ impl std::fmt::Display for PersistError {
 impl std::error::Error for PersistError {}
 
 /// Serialize `session` to `path` atomically: write `<path>.tmp` in the same
-/// directory, then `rename` it over `path` (rename is atomic on the same FS).
+/// directory, fsync it, then `rename` it over `path` (rename is atomic on the
+/// same FS). *(rev: fsync added by post-review fix 9b4f6b6 — without it a crash
+/// can commit the rename before the data blocks reach disk, publishing a
+/// truncated sidecar.)*
 pub fn save(session: &Session, path: &Path) -> Result<(), PersistError> {
     let json = serde_json::to_vec_pretty(session).map_err(PersistError::Corrupt)?;
     let tmp = tmp_path(path);
-    std::fs::write(&tmp, &json).map_err(PersistError::Io)?;
+    let mut file = std::fs::File::create(&tmp).map_err(PersistError::Io)?;
+    std::io::Write::write_all(&mut file, &json).map_err(PersistError::Io)?;
+    file.sync_all().map_err(PersistError::Io)?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(PersistError::Io)?;
     Ok(())
 }
@@ -1330,8 +1338,11 @@ Then add this function to `persist.rs` (below `load`, above the `#[cfg(test)]` m
 /// Load the session sidecar from `source_dir/SESSION_FILE`.
 /// - Missing file → `Ok(None)` (start a fresh session).
 /// - Valid file → `Ok(Some(session))`.
-/// - Corrupt file → rename it to the `SESSION_BAD_FILE` sibling (preserving the
-///   evidence, never overwriting) and return `Ok(None)`.
+/// - Corrupt file → rename it to the first free `SESSION_BAD_FILE` sibling
+///   (`.bad`, then `.bad.1`, `.bad.2`, …) so every corruption's evidence is
+///   preserved, and return `Ok(None)`. *(rev: numbered siblings added by
+///   post-review fix e1a20b1 — a plain rename onto `.bad` clobbered the
+///   evidence of an earlier corruption.)*
 /// - Other I/O errors → `Err(PersistError::Io)`.
 pub fn load_or_fresh(source_dir: &Path) -> Result<Option<Session>, PersistError> {
     let path = source_dir.join(SESSION_FILE);
@@ -1343,10 +1354,28 @@ pub fn load_or_fresh(source_dir: &Path) -> Result<Option<Session>, PersistError>
     match serde_json::from_slice::<Session>(&bytes) {
         Ok(session) => Ok(Some(session)),
         Err(_) => {
-            let bad = source_dir.join(SESSION_BAD_FILE);
+            let bad = quarantine_path(source_dir);
             std::fs::rename(&path, &bad).map_err(PersistError::Io)?;
             Ok(None)
         }
+    }
+}
+
+/// First quarantine name with no existing file: `SESSION_BAD_FILE`, then
+/// numbered `.1`, `.2`, … siblings, so a rename there never destroys evidence
+/// from an earlier corruption.
+fn quarantine_path(source_dir: &Path) -> PathBuf {
+    let bad = source_dir.join(SESSION_BAD_FILE);
+    if !bad.exists() {
+        return bad;
+    }
+    let mut n: u32 = 1;
+    loop {
+        let candidate = source_dir.join(format!("{}.{}", SESSION_BAD_FILE, n));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
     }
 }
 ```

@@ -8,7 +8,7 @@
 
 **Architecture:** Two Cargo crates in a workspace. `culler-core` is a pure, GUI-free library holding all domain logic (model, scan, decode, persist, xmp, plan, apply) so it is fully unit-testable. `culler` is the Slint binary (pipeline, input, ui, main) that renders the core and is deliberately swappable.
 
-**Tech Stack:** Rust (2021 edition), Slint (Skia), turbojpeg, fast_image_resize, kamadak-exif, rustix, serde/serde_json, quick-xml, blake3 (phase-2, unused in v1).
+**Tech Stack:** Rust (2024 edition), Slint 1.17 (Skia), turbojpeg 1, fast_image_resize 6, kamadak-exif 0.6, rustix 1, serde/serde_json, quick-xml 0.41. *(BLAKE3 verification belongs to the spec's post-v1 "Phase 2" — an unrelated numbering to these plan phases. Do **not** add the `blake3` dep anywhere in v1.)*
 
 ---
 
@@ -35,13 +35,14 @@ Each phase file repeats the plan header, its own goal, and per-task `Interfaces:
 
 Copied verbatim from the spec. Every task's requirements implicitly include this section.
 
-- **Language / edition:** Rust, edition 2021. Workspace with two member crates: `culler-core` (lib) and `culler` (bin).
+- **Language / edition:** Rust, edition **2024** (workspace `resolver = "3"`). Workspace with two member crates: `culler-core` (lib) and `culler` (bin).
 - **`culler-core` has zero GUI dependencies.** No `slint`, no Slint types, in the library. `decode` emits plain `Vec<u8>` RGBA, never `slint::Image`.
 - **v1 performs no deletions of user data.** There is no `unlink` of a source shot anywhere in v1 except the *cross-FS copy path removing its own verified source after the destination copy is fsynced and length-verified*. Rejects are **moved** to `00_rejected`, never deleted. There is no delete step, no "moves-before-deletes" ordering.
 - **Nothing touches disk until Apply.** All culling decisions live in memory + the autosaved session sidecar. `plan` is pure and performs **no I/O**.
-- **Atomic writes everywhere:** session saves and journal writes use write-temp-then-rename. File moves use `renameat2(RENAME_NOREPLACE)` (no-clobber) same-FS, and copy→fsync→verify→rename cross-FS.
-- **A destination file appearing between plan and apply must fail loudly** (NOREPLACE returns `EEXIST`); never silently overwrite.
-- **Decisions are keyed by filename stem** so resume re-attaches them after a rescan. Corrupt session file → renamed to `.fastcull.json.bad`, reported, fresh session started (never silently overwritten).
+- **Atomic writes everywhere:** session saves and journal writes use write-temp-then-**fsync**-then-rename. File moves use `renameat2(RENAME_NOREPLACE)` (no-clobber) same-FS, and copy→fsync file→verify→rename(NOREPLACE)→**fsync dir**→remove source cross-FS (spec §8 rev 3: the dir fsync comes *after* the publish rename).
+- **A destination file appearing between plan and apply must fail loudly** (NOREPLACE returns `EEXIST`); never silently overwrite. **This includes fresh `.xmp` sidecar writes** — `write_sidecar` publishes with NOREPLACE too; on resume an already-present sidecar target is skipped, not clobbered and not an error.
+- **Journal lifecycle (spec §8 rev 3):** the session records the in-flight destination (`Session.pending_apply`) before the first move — that breadcrumb is what makes next-launch crash detection work, since the journal lives in *dest* while launches open *source*. On full success the journal is **removed** and the breadcrumb cleared (the journal is FastCull's own metadata — the no-deletion guarantee protects user photos, not our bookkeeping). A "crashed" journal is one with ≥1 non-`Done` entry; an all-`Done` journal must never trigger a recovery offer or be resumed in place of a fresh apply.
+- **Decisions are keyed by filename stem** so resume re-attaches them after a rescan. Corrupt session file → renamed to the first free `.fastcull.json.bad` / `.bad.1` / `.bad.2` … sibling (evidence never clobbered), reported, fresh session started.
 - **Platform:** Linux only. `rustix`/`renameat2`/`statvfs` are fine to use directly; no cross-platform abstraction needed.
 - **TDD, DRY, YAGNI, frequent commits.** Every task: failing test → run-it-fails → minimal impl → run-it-passes → commit. Conventional-commit messages (`feat:`, `test:`, `refactor:`).
 - **No v1 config file.** All configurable names/behaviors are CLI flags (bucket names, `--no-auto-advance`, destination).
@@ -59,8 +60,8 @@ pub const BUCKET_PICKS:    &str = "03_picks";
 pub const BUCKET_BESTS:    &str = "04_bests";
 
 pub const SESSION_FILE:      &str = ".fastcull.json";       // in source dir
-pub const SESSION_BAD_FILE:  &str = ".fastcull.json.bad";   // corrupt-session rename target
-pub const JOURNAL_FILE:      &str = ".fastcull-apply.json"; // in dest dir
+pub const SESSION_BAD_FILE:  &str = ".fastcull.json.bad";   // first quarantine name; later corruptions get .bad.1, .bad.2, …
+pub const JOURNAL_FILE:      &str = ".fastcull-apply.json"; // in dest dir; removed on successful apply
 
 // RAW extensions recognized as siblings (compared case-insensitively, no leading dot)
 pub const RAW_EXTS: &[&str] = &["cr3", "cr2", "nef", "arw", "raf", "rw2", "orf", "dng", "pef", "srw"];
@@ -99,7 +100,9 @@ impl Decision {
 #[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct CaptureTime {
     pub datetime: Option<String>, // "YYYY:MM:DD HH:MM:SS" exactly as EXIF stores it (lexically sortable)
-    pub subsec: Option<u32>,      // SubSecTimeOriginal parsed to a number
+    pub subsec: Option<u32>,      // SubSecTimeOriginal: first 3 digits RIGHT-PADDED to milliseconds
+                                  // ("5"→500, "05"→50, "123456"→123) — EXIF subsec is a decimal
+                                  // FRACTION, so integer-parsing raw digits would misorder mixed widths
 }
 
 /// One shot = all files sharing a filename stem. Produced by `scan`.
@@ -125,6 +128,12 @@ pub struct Session {
     pub shots: Vec<Shot>,
     pub decisions: std::collections::HashMap<String, Decision>, // keyed by Shot.stem
     pub current: usize,                                          // index into shots
+    /// In-flight Apply destination (crash-detection breadcrumb, spec §6/§8 rev 3).
+    /// Set + autosaved just before an apply's first move; cleared on success.
+    /// `#[serde(default)]` so pre-rev-3 session files still load.
+    /// (Added by Phase 6 Task 12 in a small TDD step against the landed model.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_apply: Option<std::path::PathBuf>,
     #[serde(skip)]
     pub undo: Vec<UndoEntry>,                                    // bounded, most-recent last
 }
@@ -145,12 +154,13 @@ pub struct TierCounts { pub rejected: usize, pub rest: usize, pub keep: usize, p
 //   fn all_tags(&self) -> Vec<String>                             // sorted unique, for autocomplete
 // UNDO_LIMIT: usize = 200 (bounded stack)
 
-// ---- persist ----
+// ---- persist ----  (LANDED on master; these comments match the shipped code)
 #[derive(Debug)]
 pub enum PersistError { Io(std::io::Error), Corrupt(serde_json::Error) }
-pub fn save(session: &Session, path: &std::path::Path) -> Result<(), PersistError>; // atomic temp+rename
+pub fn save(session: &Session, path: &std::path::Path) -> Result<(), PersistError>; // atomic temp + fsync + rename
 pub fn load(path: &std::path::Path) -> Result<Session, PersistError>;
-/// Loads if present & valid; on Corrupt renames path → SESSION_BAD_FILE sibling and returns Ok(None).
+/// Loads if present & valid; on Corrupt renames path to the FIRST FREE quarantine
+/// sibling (.bad, .bad.1, .bad.2, …) so earlier evidence is never clobbered, and returns Ok(None).
 pub fn load_or_fresh(source_dir: &std::path::Path) -> Result<Option<Session>, PersistError>;
 
 // ---- scan ----
@@ -163,15 +173,19 @@ pub enum ScanError { Io(std::io::Error), NotADir(std::path::PathBuf) }
 /// (RAW-only via embedded preview is phase 2 — see Phase 2's assumption note).
 pub fn scan(dir: &std::path::Path) -> Result<Vec<Shot>, ScanError>;
 /// Same walk, but also returns the RAW-only stems' paths (second element) so they are never
-/// silently dropped. `scan` delegates to this and discards the report. The binary uses the
-/// raw-only list to inform the Apply preview's "stays behind" reporting.
+/// silently dropped. `scan` delegates to this and discards the report. Note: the binary counts
+/// generic "stays behind" leftovers itself via a readdir diff (Phase 6 `gather_apply_inputs`);
+/// this list exists so the preview can additionally name the RAW-only files as a distinct line.
 pub fn scan_report(dir: &std::path::Path)
     -> Result<(Vec<Shot>, Vec<std::path::PathBuf>), ScanError>;
 
 // ---- xmp ----
 /// Build an XMP sidecar document string: `dc:subject` bag from tags, `xmp:Rating` from rating.
 pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String;
-/// Write build_xmp(..) to `path` (atomically). Caller decides the path (`stem.xmp`, Adobe style).
+/// Write build_xmp(..) to `path` atomically AND no-clobber: temp file → fsync →
+/// rename with RENAME_NOREPLACE. An existing `path` yields ErrorKind::AlreadyExists
+/// (never silently overwritten — same guarantee as file moves; spec §8 rev 3).
+/// Caller decides the path (`stem.xmp`, Adobe style).
 pub fn write_sidecar(path: &std::path::Path, tags: &[String], rating: Option<i32>) -> std::io::Result<()>;
 
 // ---- plan (PURE, no I/O) ----
@@ -210,8 +224,11 @@ pub struct ApplyPlan {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TierCountsPlan { pub rejected: usize, pub rest: usize, pub keep: usize, pub picks: usize, pub bests: usize }
 
-/// Pure. `existing` = set of file NAMES already present anywhere under dest buckets (gathered by the binary via readdir).
-/// `sizes` = map stem→total bytes (gathered by binary; plan stays I/O-free). Bucket names come from `buckets`.
+/// Pure. `existing` = set of BUCKET-RELATIVE paths ("02_keep/IMG_1234.JPG") already present in the
+/// destination (gathered by the binary via readdir, one prefix per bucket). Collisions are per
+/// target directory — a name occupied in a *different* bucket must NOT force a suffix (rev 3;
+/// a flat name-set caused spurious renames). `sizes` = map stem→total bytes (gathered by binary;
+/// plan stays I/O-free). Bucket names come from `buckets`.
 pub fn plan(
     session: &Session,
     dest: &std::path::Path,
@@ -237,7 +254,9 @@ pub struct RealFs; // impl FsOps via rustix
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum OpState { Pending, Done, Failed }
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub struct Journal { pub plan: ApplyPlan, pub statuses: Vec<OpState> } // statuses parallel to a flattened move list
+pub struct Journal { pub plan: ApplyPlan, pub statuses: Vec<OpState> } // statuses parallel to the flattened
+// file-move list (ops × moves, in order). Sidecar writes are NOT journaled: they are idempotent —
+// no-clobber NOREPLACE publish, and an already-present target is skipped on resume.
 
 #[derive(Debug)]
 pub enum ApplyError { Preflight(String), Fs { path: std::path::PathBuf, source: std::io::Error }, Collision(std::path::PathBuf) }
@@ -245,6 +264,12 @@ pub enum ApplyError { Preflight(String), Fs { path: std::path::PathBuf, source: 
 pub struct ApplyReport { pub moved_shots: usize, pub moved_files: usize, pub sidecars_written: usize, pub stopped_at: Option<String> }
 
 /// Journals first, then executes each ShotOp group atomically. Resumable from an existing journal.
+/// On FULL SUCCESS the journal file is removed (FastCull metadata, not user data). `resume`
+/// RECONCILES the journal against the disk before executing (Pending + source-gone + dest-exists
+/// ⇒ done; Done + dest-missing + source-present ⇒ re-execute) so a crash between a move and its
+/// journal update never strands the run. Progress reporting: the journal is rewritten as moves
+/// complete, so a UI runs apply/resume on a worker thread and POLLS the journal for done/total —
+/// no progress callback in the signature (kept stable).
 pub fn apply(plan: &ApplyPlan, fs: &dyn FsOps, journal_path: &std::path::Path) -> Result<ApplyReport, ApplyError>;
 pub fn resume(journal_path: &std::path::Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError>;
 
