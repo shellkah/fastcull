@@ -88,13 +88,16 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
     let mut raw_only: Vec<PathBuf> = Vec::new();
     for (stem, group) in groups {
         match group.jpeg {
-            Some(jpeg) => shots.push(Shot {
-                stem,
-                jpeg,
-                raw: group.raw,
-                sidecar: group.sidecar,
-                capture: CaptureTime::default(),
-            }),
+            Some(jpeg) => {
+                let capture = read_capture_time(&jpeg);
+                shots.push(Shot {
+                    stem,
+                    jpeg,
+                    raw: group.raw,
+                    sidecar: group.sidecar,
+                    capture,
+                });
+            }
             None => {
                 // No JPEG → not a cullable shot in v1. Report the RAW so a
                 // RAW-only stem isn't silently dropped (embedded-preview
@@ -154,6 +157,54 @@ fn sidecar_stem(path: &Path) -> String {
         }
     }
     inner.to_string()
+}
+
+/// Read `DateTimeOriginal` / `SubSecTimeOriginal` from a JPEG's EXIF header.
+/// Undecodable or EXIF-less files never fail the scan — they yield a default
+/// (empty) `CaptureTime`, so such shots simply sort after all dated ones.
+fn read_capture_time(jpeg: &Path) -> CaptureTime {
+    let file = match std::fs::File::open(jpeg) {
+        Ok(f) => f,
+        Err(_) => return CaptureTime::default(),
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let exif = match exif::Reader::new().read_from_container(&mut reader) {
+        Ok(e) => e,
+        Err(_) => return CaptureTime::default(),
+    };
+    let datetime = ascii_field(&exif, exif::Tag::DateTimeOriginal);
+    let subsec = ascii_field(&exif, exif::Tag::SubSecTimeOriginal).and_then(|s| parse_subsec(&s));
+    CaptureTime { datetime, subsec }
+}
+
+/// EXIF SubSecTime* is a DECIMAL FRACTION digit string, not an integer:
+/// "5" means .5s and "05" means .05s. Normalize to milliseconds by
+/// right-padding/truncating the digits to a fixed width of 3, so
+/// mixed-width values order correctly ("5"→500, "05"→50, "123456"→123).
+fn parse_subsec(s: &str) -> Option<u32> {
+    let digits: String = s
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let padded = format!("{digits:0<3}");
+    padded[..3].parse::<u32>().ok()
+}
+
+/// The first ASCII string of `tag` in the primary IFD, trimmed. `None` when the
+/// tag is absent or not an ASCII value. Returns the bytes verbatim (no reformat),
+/// so `DateTimeOriginal` stays the lexically-sortable `"YYYY:MM:DD HH:MM:SS"`.
+fn ascii_field(exif: &exif::Exif, tag: exif::Tag) -> Option<String> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    match &field.value {
+        exif::Value::Ascii(vec) if !vec.is_empty() => {
+            Some(String::from_utf8_lossy(&vec[0]).trim().to_string())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -361,6 +412,112 @@ mod tests {
         let (shots, raw_only) = scan_report(&dir).unwrap();
         assert!(shots.is_empty());
         assert!(raw_only.is_empty()); // an orphan sidecar is neither a shot nor RAW-only
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a minimal but valid JPEG carrying an EXIF APP1 block (big-endian
+    /// "MM" TIFF) with DateTimeOriginal and SubSecTimeOriginal. Enough for
+    /// kamadak-exif to parse; it is not a real image. `subsec` must be ≤ 3 chars
+    /// so the ASCII value (plus NUL) fits inline in the 4-byte IFD value field.
+    fn jpeg_with_exif(datetime: &str, subsec: &str) -> Vec<u8> {
+        fn be16(v: u16) -> [u8; 2] {
+            v.to_be_bytes()
+        }
+        fn be32(v: u32) -> [u8; 4] {
+            v.to_be_bytes()
+        }
+
+        let mut dt = datetime.as_bytes().to_vec();
+        dt.push(0); // NUL-terminate
+        let dt_count = dt.len() as u32;
+
+        let mut ss = subsec.as_bytes().to_vec();
+        ss.push(0);
+        let ss_count = ss.len() as u32;
+        assert!(ss_count <= 4, "subsec must fit inline (<= 3 chars)");
+
+        // TIFF offsets, relative to the "MM" byte:
+        //   0  TIFF header (8 bytes) → IFD0 at offset 8
+        //   8  IFD0:      2 + 1*12 + 4 = 18 bytes → ends at 26
+        //   26 Exif IFD:  2 + 2*12 + 4 = 30 bytes → ends at 56
+        //   56 DateTimeOriginal string (dt_count bytes)
+        const IFD0_OFF: u32 = 8;
+        const EXIF_IFD_OFF: u32 = 26;
+        const DT_STR_OFF: u32 = 56;
+
+        let mut tiff: Vec<u8> = Vec::new();
+        tiff.extend_from_slice(b"MM"); // big-endian byte order
+        tiff.extend_from_slice(&be16(42)); // TIFF magic
+        tiff.extend_from_slice(&be32(IFD0_OFF));
+
+        // IFD0: one entry, ExifIFDPointer (0x8769, LONG) → EXIF_IFD_OFF
+        tiff.extend_from_slice(&be16(1));
+        tiff.extend_from_slice(&be16(0x8769));
+        tiff.extend_from_slice(&be16(4)); // LONG
+        tiff.extend_from_slice(&be32(1)); // count
+        tiff.extend_from_slice(&be32(EXIF_IFD_OFF));
+        tiff.extend_from_slice(&be32(0)); // no next IFD
+
+        // Exif IFD: two entries
+        tiff.extend_from_slice(&be16(2));
+        // DateTimeOriginal (0x9003), ASCII → DT_STR_OFF
+        tiff.extend_from_slice(&be16(0x9003));
+        tiff.extend_from_slice(&be16(2)); // ASCII
+        tiff.extend_from_slice(&be32(dt_count));
+        tiff.extend_from_slice(&be32(DT_STR_OFF));
+        // SubSecTimeOriginal (0x9291), ASCII, stored inline
+        tiff.extend_from_slice(&be16(0x9291));
+        tiff.extend_from_slice(&be16(2)); // ASCII
+        tiff.extend_from_slice(&be32(ss_count));
+        let mut inline = [0u8; 4];
+        inline[..ss.len()].copy_from_slice(&ss);
+        tiff.extend_from_slice(&inline);
+        tiff.extend_from_slice(&be32(0)); // no next IFD
+
+        // DateTimeOriginal string payload lands exactly at DT_STR_OFF.
+        assert_eq!(tiff.len() as u32, DT_STR_OFF);
+        tiff.extend_from_slice(&dt);
+
+        // Wrap the TIFF in a JPEG APP1 "Exif" segment.
+        let mut jpeg: Vec<u8> = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        let seg_len = (2 + 6 + tiff.len()) as u16; // len field + "Exif\0\0" + TIFF
+        jpeg.extend_from_slice(&be16(seg_len));
+        jpeg.extend_from_slice(b"Exif\0\0");
+        jpeg.extend_from_slice(&tiff);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        jpeg
+    }
+
+    #[test]
+    fn reads_datetime_and_subsec_from_exif() {
+        let dir = unique_temp_dir("exif");
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            jpeg_with_exif("2026:07:08 10:11:12", "42"),
+        )
+        .unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(
+            shots[0].capture.datetime,
+            Some("2026:07:08 10:11:12".to_string())
+        );
+        // "42" = 0.42s → right-padded to milliseconds: 420 (NOT integer 42).
+        assert_eq!(shots[0].capture.subsec, Some(420));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn undecodable_jpeg_scans_with_default_capture() {
+        let dir = unique_temp_dir("badexif");
+        touch(&dir.join("IMG_0001.JPG")); // empty file → no EXIF, must not fail
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].capture, CaptureTime::default());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
