@@ -2,22 +2,22 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use `- [ ]`. Canonical types in [README.md](README.md). **Depends on Phases 1–3.** This is the most-tested unit — data loss would happen here.
 
-**Goal:** Build `culler-core`'s safe-move `apply` engine: an injectable `FsOps` filesystem trait (`RealFs` via rustix + a fault-injecting `FakeFs` test double), a journal-first crash-recoverable executor that moves each shot's fileset atomically (same-FS `renameat2(NOREPLACE)`, cross-FS copy→fsync→verify→rename→remove), and `resume()` — never deleting a source except the cross-FS path unlinking its own verified copy.
+**Goal:** Build `culler-core`'s safe-move `apply` engine: an injectable `FsOps` filesystem trait (`RealFs` via rustix + a fault-injecting `FakeFs` test double), a journal-first crash-recoverable executor that moves each shot's fileset atomically (same-FS `renameat2(NOREPLACE)`, cross-FS copy→fsync file→verify→rename→**fsync dir**→remove), and a **reconciling** `resume()` — never deleting a source except the cross-FS path unlinking its own verified copy, and removing its own journal on full success.
 
 **Architecture:** All dangerous filesystem effects go through the `FsOps` trait so tests inject `EXDEV`, `ENOSPC`, permission errors, and surprise collisions deterministically against an in-memory `FakeFs`; `RealFs` (rustix) is exercised by real temp-dir tests for happy paths. `apply` serializes the plan to a journal **before the first move**, marks each file `Done` incrementally (atomic temp+rename), and stops loudly on the first failure with the journal as the durable stop-of-record; `resume` replays that journal, skipping `Done` moves. There is **no deletion step** — rejects are moved like any bucket.
 
-**Tech Stack:** Rust 2021, rustix (renameat2/statvfs/fsync/stat), serde_json (journal), tempfile (dev-dependency, real-FS tests).
+**Tech Stack:** Rust 2024, rustix 1 (renameat2/statvfs/fsync/stat — dep already added by Phase 3; API verified by probe build 2026-07-09), serde_json (journal), tempfile (dev-dependency, real-FS tests).
 
 ## Global Constraints
 
 These bind every task in this phase (copied from [README.md](README.md)):
 
 - **v1 performs no deletions of user data.** There is no `unlink` of a source shot anywhere in v1 **except the cross-FS copy path removing its own verified source after the destination copy is fsynced and length-verified**. Rejects are **moved** to `00_rejected`, never deleted. There is no delete step, no "moves-before-deletes" ordering.
-- **Atomic writes everywhere:** journal writes use write-temp-then-rename. File moves use `renameat2(RENAME_NOREPLACE)` (no-clobber) same-FS, and copy→fsync→verify→rename cross-FS.
-- **A destination file appearing between plan and apply must fail loudly** (NOREPLACE returns `EEXIST` → `ApplyError::Collision`); never silently overwrite. Plan-time collision checks are advisory only.
-- **Journal-first crash recovery:** the serialized plan lands in `dest/.fastcull-apply.json` **before the first move**; each file is marked complete as it executes; a crashed/aborted run is resumable via `resume()`.
+- **Atomic writes everywhere:** journal writes use write-temp-then-rename (fsynced at the checkpoints below). File moves use `renameat2(RENAME_NOREPLACE)` (no-clobber) same-FS, and **copy→fsync file→verify→rename(NOREPLACE)→fsync dir→remove source** cross-FS — the dir fsync comes *after* the publish rename (spec §8 rev 3): the source unlink is on a *different filesystem*, so power loss could persist the unlink while an un-fsynced rename is lost, leaving the data reachable only as a hidden `.partial`.
+- **A destination file appearing between plan and apply must fail loudly** (NOREPLACE returns `EEXIST` → `ApplyError::Collision`); never silently overwrite. Plan-time collision checks are advisory only. Sidecar writes carry the same guarantee (Phase 3's `write_sidecar` publishes with NOREPLACE) and are **skip-idempotent** here: an already-present sidecar target is skipped on resume, not clobbered and not an error.
+- **Journal-first crash recovery:** the serialized plan lands in `dest/.fastcull-apply.json` **before the first move** (fsynced); each file is marked complete as it executes (fsynced every 64th move, on failure, and at stop — `resume()`'s reconciliation makes an unsynced tail harmless, so per-move fsync isn't needed). A crashed/aborted run is resumable via `resume()`, which **reconciles the journal against the disk in both directions** before executing (spec §8 rev 3). **On full success the journal is removed** — it is FastCull's own metadata, not user data; a finished run must never read as a crashed one or hijack a later apply into the same dest.
 - **Preflight:** before a cross-filesystem run, check destination free space (`statvfs`) against the plan's total byte count; refuse (`ApplyError::Preflight`) rather than abort halfway.
-- **Never add BLAKE3** — cross-FS verification is byte-length only in v1 (BLAKE3 is a phase-2 paranoia setting). **Never add a delete step.**
+- **Never add BLAKE3** — cross-FS verification is byte-length only in v1 (BLAKE3 is a spec-Phase-2 paranoia setting). **Never add a delete step for user data.** (Removing FastCull's own retired journal and cleaning its own `.partial`/`.tmp` files is bookkeeping, not a delete step.)
 - **Platform:** Linux only. `rustix`/`renameat2`/`statvfs`/`stat` are used directly; no cross-platform abstraction.
 - **`culler-core` has zero GUI dependencies.**
 - **TDD, DRY, YAGNI, frequent commits.** Every task: failing test → run-it-fails → minimal impl → run-it-passes → commit. Conventional-commit messages (`feat:`, `test:`, `refactor:`, `chore:`).
@@ -42,12 +42,12 @@ These bind every task in this phase (copied from [README.md](README.md)):
 
 - [ ] **Step 1: Write the failing test**
 
-First add dependencies to `culler-core/Cargo.toml`:
+First ensure dependencies in `culler-core/Cargo.toml` (`rustix` is already present if Phase 3 landed — it added it for the no-clobber sidecar publish):
 ```toml
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rustix = { version = "0.38", features = ["fs"] }
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -239,7 +239,7 @@ git commit -m "feat(fsops): FsOps trait + RealFs rustix impl with no-clobber ren
 
 **Interfaces:**
 - Consumes: `FsOps` (Task 1).
-- Produces (test-only, crate-visible so `apply` tests reuse it): `crate::fsops::fake::FakeFs`, an in-memory model that can inject **EXDEV** on rename (forcing the cross-FS copy path), **ENOSPC** on copy, a **surprise collision** (seed a file at a dest so `rename_noreplace` returns `EEXIST`), **permission errors** (deny rename/remove of a specific path), and a **controllable `free_space`**. It records fsynced files/dirs for assertions.
+- Produces (test-only, crate-visible so `apply` tests reuse it): `crate::fsops::fake::FakeFs`, an in-memory model that can inject **EXDEV** on rename (forcing the cross-FS copy path), **ENOSPC** on copy, a **surprise collision** (seed a file at a dest so `rename_noreplace` returns `EEXIST`), **permission errors** (deny rename/remove of a specific path), and a **controllable `free_space`**. It records fsynced files/dirs for assertions **and an ordered `events()` log (`rename:from->to`, `copy:from->to`, `fsync_file:p`, `fsync_dir:p`, `remove:p`) so tests can assert durability ORDERING, not just membership** (the spec §8 rev-3 rename-before-dir-fsync guarantee is an ordering property).
 
 > `FakeFs` is the backbone of every later apply test. It is real committed code under `#[cfg(test)]`; tasks 3–10 reuse it via `use crate::fsops::fake::FakeFs;`. It is shown in full here and never re-pasted.
 
@@ -247,7 +247,7 @@ git commit -m "feat(fsops): FsOps trait + RealFs rustix impl with no-clobber ren
 
 Append to `culler-core/src/fsops.rs` (inside the `#[cfg(test)] mod tests` block, or a sibling test fn — the `FakeFs` type it references does not exist yet → red):
 ```rust
-    use fake::FakeFs;
+    use super::fake::FakeFs; // NB: `use fake::…` would not resolve inside `mod tests`
     use std::path::PathBuf;
 
     #[test]
@@ -313,6 +313,7 @@ pub(crate) mod fake {
         deny_remove: Option<PathBuf>,      // remove_file(path) -> EACCES
         fsynced_files: Vec<PathBuf>,
         fsynced_dirs: Vec<PathBuf>,
+        events: Vec<String>, // ordered op log — durability ORDERING assertions
     }
 
     fn eacces() -> io::Error { io::Error::from(io::ErrorKind::PermissionDenied) }
@@ -334,6 +335,7 @@ pub(crate) mod fake {
                     deny_remove: None,
                     fsynced_files: Vec::new(),
                     fsynced_dirs: Vec::new(),
+                    events: Vec::new(),
                 }),
             }
         }
@@ -365,6 +367,9 @@ pub(crate) mod fake {
         pub(crate) fn dir_exists(&self, p: &Path) -> bool { self.st.borrow().dirs.contains(p) }
         pub(crate) fn fsynced_files(&self) -> Vec<PathBuf> { self.st.borrow().fsynced_files.clone() }
         pub(crate) fn fsynced_dirs(&self) -> Vec<PathBuf> { self.st.borrow().fsynced_dirs.clone() }
+        /// Ordered log of successful ops ("rename:a->b", "copy:a->b",
+        /// "fsync_file:p", "fsync_dir:p", "remove:p") for ordering assertions.
+        pub(crate) fn events(&self) -> Vec<String> { self.st.borrow().events.clone() }
     }
 
     impl FsOps for FakeFs {
@@ -398,6 +403,7 @@ pub(crate) mod fake {
             }
             let len = s.files.remove(from).unwrap();
             s.files.insert(to.to_path_buf(), len);
+            s.events.push(format!("rename:{}->{}", from.display(), to.display()));
             Ok(())
         }
 
@@ -418,6 +424,7 @@ pub(crate) mod fake {
             }
             s.files.insert(to.to_path_buf(), len);
             s.free -= len;
+            s.events.push(format!("copy:{}->{}", from.display(), to.display()));
             Ok(len)
         }
 
@@ -427,11 +434,14 @@ pub(crate) mod fake {
                 return Err(enoent());
             }
             s.fsynced_files.push(path.to_path_buf());
+            s.events.push(format!("fsync_file:{}", path.display()));
             Ok(())
         }
 
         fn fsync_dir(&self, path: &Path) -> io::Result<()> {
-            self.st.borrow_mut().fsynced_dirs.push(path.to_path_buf());
+            let mut s = self.st.borrow_mut();
+            s.fsynced_dirs.push(path.to_path_buf());
+            s.events.push(format!("fsync_dir:{}", path.display()));
             Ok(())
         }
 
@@ -443,6 +453,7 @@ pub(crate) mod fake {
             if s.files.remove(path).is_none() {
                 return Err(enoent());
             }
+            s.events.push(format!("remove:{}", path.display()));
             Ok(())
         }
 
@@ -575,11 +586,11 @@ mod tests {
         assert_eq!(report.moved_files, 3);
         assert_eq!(report.stopped_at, None);
 
-        // Journal exists on disk and records every move Done.
-        let bytes = std::fs::read(&jpath).unwrap();
-        let j: Journal = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(j.statuses.len(), 3);
-        assert!(j.statuses.iter().all(|s| *s == OpState::Done));
+        // Success REMOVES the journal (spec §8 rev 3): a finished run must never
+        // read as a crashed one or hijack a later apply into the same dest.
+        // (Journal-first existence + incremental Done marking are proven by the
+        // failure-path tests in Task 4.)
+        assert!(!jpath.exists(), "journal removed on full success");
     }
 }
 ```
@@ -654,12 +665,16 @@ fn total_move_count(plan: &ApplyPlan) -> usize {
     plan.ops.iter().map(|o| o.moves.len()).sum()
 }
 
-/// Serialize the journal atomically (temp file → fsync → rename). Real I/O — the
-/// journal must survive a real crash, so it does NOT go through `FsOps`.
-fn write_journal(journal: &Journal, path: &Path) -> Result<(), ApplyError> {
+/// Serialize the journal atomically (temp file → optional fsync → rename). Real
+/// I/O — the journal must survive a real crash, so it does NOT go through
+/// `FsOps`. `sync` fsyncs the temp before publishing: required at checkpoints
+/// (journal-first write, failure stop), optional for incremental progress —
+/// `resume`'s reconciliation (Task 8) makes an unsynced tail harmless, so
+/// per-move fsync (brutal on multi-thousand-file shoots) is unnecessary.
+fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), ApplyError> {
     let bytes = serde_json::to_vec(journal).map_err(|e| ApplyError::Fs {
         path: path.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::Other, e),
+        source: io::Error::other(e),
     })?;
     let name = path
         .file_name()
@@ -668,7 +683,9 @@ fn write_journal(journal: &Journal, path: &Path) -> Result<(), ApplyError> {
     let tmp = path.with_file_name(format!("{name}.tmp"));
     let mut f = std::fs::File::create(&tmp).map_err(|e| ApplyError::Fs { path: tmp.clone(), source: e })?;
     f.write_all(&bytes).map_err(|e| ApplyError::Fs { path: tmp.clone(), source: e })?;
-    f.sync_all().map_err(|e| ApplyError::Fs { path: tmp.clone(), source: e })?;
+    if sync {
+        f.sync_all().map_err(|e| ApplyError::Fs { path: tmp.clone(), source: e })?;
+    }
     drop(f);
     std::fs::rename(&tmp, path).map_err(|e| ApplyError::Fs { path: path.to_path_buf(), source: e })
 }
@@ -712,14 +729,26 @@ fn execute(journal: &mut Journal, fs: &dyn FsOps, journal_path: &Path) -> Result
         }
 
         if let Some(sw) = &op.write_sidecar {
-            crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating)
-                .map_err(|e| ApplyError::Fs { path: sw.path.clone(), source: e })?;
-            report.sidecars_written += 1;
+            // Skip-idempotent (spec §8 rev 3): sidecars are not journaled, so a
+            // resume re-visits every op — an already-written target is skipped,
+            // and write_sidecar's NOREPLACE publish turns a lost race into
+            // AlreadyExists, which is also a skip. Never a clobber.
+            if !sw.path.exists() {
+                match crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating) {
+                    Ok(()) => report.sidecars_written += 1,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(ApplyError::Fs { path: sw.path.clone(), source: e }),
+                }
+            }
         }
         report.moved_shots += 1;
     }
 
-    write_journal(journal, journal_path)?; // persist final all-Done state
+    // Full success: the journal has served its purpose — remove it so a later
+    // launch or apply into this dest never mistakes a finished run for a
+    // crashed one (spec §8 rev 3; the journal is FastCull metadata, not user
+    // data — the no-deletion guarantee protects photos, not our bookkeeping).
+    let _ = std::fs::remove_file(journal_path);
     Ok(report)
 }
 
@@ -730,7 +759,7 @@ pub fn apply(plan: &ApplyPlan, fs: &dyn FsOps, journal_path: &Path) -> Result<Ap
         plan: plan.clone(),
         statuses: vec![OpState::Pending; total_move_count(plan)],
     };
-    write_journal(&journal, journal_path)?; // JOURNAL FIRST — before any move
+    write_journal(&journal, journal_path, true)?; // JOURNAL FIRST — durable before any move
     execute(&mut journal, fs, journal_path)
 }
 ```
@@ -835,12 +864,16 @@ In `execute`, replace the move loop body so each move is persisted immediately a
             match move_one(fs, &mv.from, &mv.to) {
                 Ok(()) => {
                     journal.statuses[gidx] = OpState::Done;
-                    write_journal(journal, journal_path)?; // persist progress incrementally
                     report.moved_files += 1;
+                    // Persist progress incrementally; fsync only every 64th move
+                    // (and at checkpoints) — reconciliation (Task 8) makes an
+                    // unsynced tail harmless, and this doubles as the progress
+                    // feed the Phase-6 UI polls from a worker thread.
+                    write_journal(journal, journal_path, report.moved_files % 64 == 0)?;
                 }
                 Err(e) => {
                     journal.statuses[gidx] = OpState::Failed;
-                    let _ = write_journal(journal, journal_path); // best-effort durable stop record
+                    let _ = write_journal(journal, journal_path, true); // durable stop record
                     return Err(e);
                 }
             }
@@ -848,16 +881,22 @@ In `execute`, replace the move loop body so each move is persisted immediately a
         }
 
         if let Some(sw) = &op.write_sidecar {
-            crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating)
-                .map_err(|e| ApplyError::Fs { path: sw.path.clone(), source: e })?;
-            report.sidecars_written += 1;
+            // Skip-idempotent; NOREPLACE inside write_sidecar — see Task 3.
+            if !sw.path.exists() {
+                match crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating) {
+                    Ok(()) => report.sidecars_written += 1,
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(ApplyError::Fs { path: sw.path.clone(), source: e }),
+                }
+            }
         }
         report.moved_shots += 1;
     }
 
+    let _ = std::fs::remove_file(journal_path); // success: journal retired (spec §8 rev 3)
     Ok(report)
 ```
-(The former `write_journal(journal, journal_path)?; Ok(report)` tail is removed — the final move's incremental write already persists the all-`Done` state.)
+(The former end-of-run `write_journal` tail is replaced by the journal removal — on success there is nothing left to resume, and a lingering all-`Done` journal would read as a crash or hijack a later apply into the same dest.)
 
 - [ ] **Step 4: Run to verify pass**
 Run: `cargo test -p culler-core apply::tests`
@@ -871,7 +910,7 @@ git commit -m "feat(apply): incremental Done journaling + durable stop-of-record
 
 ---
 
-### Task 5: Cross-FS `EXDEV` path — copy → fsync → verify → fsync_dir → rename → remove
+### Task 5: Cross-FS `EXDEV` path — copy → fsync → verify → rename → fsync_dir → remove
 
 **Files:**
 - Modify: `culler-core/src/apply.rs` (`move_one` EXDEV branch + `move_cross_fs`)
@@ -879,7 +918,7 @@ git commit -m "feat(apply): incremental Done journaling + durable stop-of-record
 
 **Interfaces:**
 - Consumes: Task-3 `move_one`, `FakeFs` cross-FS injection + fsync recorders.
-- Produces: `move_cross_fs(fs, from, to)` — copies to a hidden `.<name>.partial`, fsyncs it, verifies `file_len(dest) == file_len(src)`, fsyncs the bucket dir, publishes with NOREPLACE, and **only then** removes the source. A mid-copy failure leaves the source untouched and cleans the partial.
+- Produces: `move_cross_fs(fs, from, to)` — copies to a hidden `.<name>.partial`, fsyncs it, verifies `file_len(dest) == file_len(src)`, publishes with NOREPLACE, **fsyncs the bucket dir (after the publish — spec §8 rev 3)**, and **only then** removes the source. A mid-copy failure leaves the source untouched and cleans the partial.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -913,6 +952,20 @@ Append inside `apply::tests`:
         // Durability ordering was exercised: partial fsynced, bucket dir fsynced.
         assert!(fs.fsynced_files().contains(&jpg_partial));
         assert!(fs.fsynced_dirs().contains(&dest.join(BUCKET_BESTS)));
+
+        // ORDER (spec §8 rev 3), asserted on the event log, not just membership:
+        // publish rename BEFORE the dir fsync, source unlink strictly last.
+        let ev = fs.events();
+        let pos = |needle: &str| {
+            ev.iter()
+                .position(|e| e == needle)
+                .unwrap_or_else(|| panic!("missing {needle} in {ev:?}"))
+        };
+        let publish = pos(&format!("rename:{}->{}", jpg_partial.display(), jpg_final.display()));
+        let dirsync = pos(&format!("fsync_dir:{}", dest.join(BUCKET_BESTS).display()));
+        let unlink = pos("remove:/src/IMG_0100.JPG");
+        assert!(publish < dirsync, "dir fsync must FOLLOW the publish rename: {ev:?}");
+        assert!(dirsync < unlink, "source unlink must follow the dir fsync: {ev:?}");
     }
 ```
 
@@ -986,13 +1039,13 @@ fn move_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyErro
             source: io::Error::new(io::ErrorKind::InvalidData, format!("short copy: {dest_len} of {src_len} bytes")),
         });
     }
-    // Make the new directory entry durable, then publish partial → final (no clobber).
-    if let Some(dir) = to.parent() {
-        if let Err(e) = fs.fsync_dir(dir) {
-            let _ = fs.remove_file(&partial);
-            return Err(ApplyError::Fs { path: dir.to_path_buf(), source: e });
-        }
-    }
+    // Publish partial → final (no clobber), THEN make the rename durable.
+    // ORDER MATTERS (spec §8 rev 3): the source unlink below happens on a
+    // DIFFERENT filesystem, so the rename's directory entry must be durable
+    // before the source disappears — power loss could otherwise persist the
+    // unlink while the rename is lost, leaving the data reachable only as a
+    // hidden `.partial`. (rev 2 fsynced the dir BEFORE the rename, which made
+    // the `.partial` entry durable instead of the final one.)
     match fs.rename_noreplace(&partial, to) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1004,7 +1057,15 @@ fn move_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyErro
             return Err(ApplyError::Fs { path: to.to_path_buf(), source: e });
         }
     }
-    // ONLY NOW remove the verified source (the sole unlink in v1).
+    if let Some(dir) = to.parent() {
+        if let Err(e) = fs.fsync_dir(dir) {
+            // The final is already published — do NOT touch it or the source if
+            // durability can't be proven. Stop loudly; worst case a duplicate
+            // (source + dest both present), never a loss.
+            return Err(ApplyError::Fs { path: dir.to_path_buf(), source: e });
+        }
+    }
+    // ONLY NOW remove the verified, durably-published source (the sole unlink in v1).
     fs.remove_file(from).map_err(|e| ApplyError::Fs { path: from.to_path_buf(), source: e })
 }
 ```
@@ -1165,8 +1226,16 @@ git commit -m "test(apply): group atomicity stops at failing shot with durable p
 - Test: `culler-core/src/apply.rs` (inline)
 
 **Interfaces:**
-- Consumes: `execute` (skips `Done`), `write_journal`, `FakeFs::clear_faults`.
-- Produces: `pub fn resume(journal_path: &Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError>` — reads the on-disk journal, skips `Done` moves, continues the rest to completion.
+- Consumes: `execute` (skips `Done`), `write_journal`, `FakeFs::{clear_faults, seed_file}`.
+- Produces: `pub fn resume(journal_path: &Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError>` — reads the on-disk journal, **reconciles it against the disk in both directions (spec §8 rev 3)**, skips `Done` moves, continues the rest to completion, and removes the journal on success. Private `fn reconcile(&mut Journal, &dyn FsOps)`.
+
+> **Why reconciliation is load-bearing:** a crash can land *between* a move and
+> its journal update (move done, journal still `Pending`) or — with batched
+> fsyncs — the reverse (journal says `Done`, the rename never became durable).
+> Without reconciliation, resume re-runs a completed move and dies on a bogus
+> `ENOENT` (source gone) or `EEXIST`-as-`Collision` (dest occupied by its own
+> work) — precisely the "forensic mystery" the spec forbids. Reconciliation is
+> also what makes the Task-4 fsync batching safe.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1205,9 +1274,55 @@ Append inside `apply::tests`:
         assert!(!fs.exists(&PathBuf::from("/src/IMG_0400.xmp")));
         assert_eq!(fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0400.CR3")), Some(100));
 
-        // Journal now fully Done.
-        let j: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
-        assert!(j.statuses.iter().all(|s| *s == OpState::Done));
+        // Success retires the journal (spec §8 rev 3).
+        assert!(!jpath.exists(), "journal removed once the resume completes");
+    }
+
+    #[test]
+    fn resume_reconciles_crash_between_move_and_journal_update() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0410", BUCKET_KEEP, &[("IMG_0410.JPG", 100), ("IMG_0410.CR3", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // The crashed run moved the JPG but died BEFORE journaling it:
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0410.JPG"), 100);
+        fs.seed_file("/src/IMG_0410.CR3", 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal { plan: plan.clone(), statuses: vec![OpState::Pending, OpState::Pending] };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        // rev 3: reconciliation sees from-gone + to-present ⇒ Done, so resume
+        // completes instead of dying on ENOENT / EEXIST-as-Collision.
+        let report = resume(&jpath, &fs).unwrap();
+        assert_eq!(report.moved_files, 1, "only the CR3 actually moved this run");
+        assert_eq!(fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0410.CR3")), Some(100));
+        assert!(!jpath.exists(), "journal removed on success");
+    }
+
+    #[test]
+    fn resume_reexecutes_a_done_move_the_disk_never_saw() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0420", BUCKET_KEEP, &[("IMG_0420.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // Journal was fsynced Done, but the rename itself was lost to the crash:
+        fs.seed_file("/src/IMG_0420.JPG", 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal { plan: plan.clone(), statuses: vec![OpState::Done] };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        // rev 3: Done + dest-missing + source-present ⇒ re-execute, not skip —
+        // otherwise the shot is silently left behind while the run reports success.
+        let report = resume(&jpath, &fs).unwrap();
+        assert_eq!(report.moved_files, 1);
+        assert_eq!(fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0420.JPG")), Some(100));
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0420.JPG")));
     }
 ```
 
@@ -1228,11 +1343,44 @@ fn read_journal(path: &Path) -> Result<Journal, ApplyError> {
     })
 }
 
-/// Resume a crashed/aborted run from its journal: skip `Done` moves, continue the
-/// rest. Detected + offered on next launch (the offer UX is Phase 6). Does not
-/// re-run the free-space preflight — the journal is trusted as the source of truth.
+/// The crash window can strand the journal on either side of reality (spec §8
+/// rev 3). Reconcile it against the observable filesystem BEFORE executing:
+///  - `Pending`/`Failed` move whose source is GONE and destination EXISTS →
+///    the crashed run already did it: mark `Done` (a re-run would fail ENOENT
+///    or, worse, surface its own work as a Collision).
+///  - `Done` move whose destination is MISSING while the source still exists →
+///    the journal outran a lost rename: mark `Pending`, re-execute.
+/// Anything else (both present, both absent) is left alone and will surface
+/// loudly through the normal NOREPLACE/ENOENT paths.
+fn reconcile(journal: &mut Journal, fs: &dyn FsOps) {
+    let mut gidx = 0usize;
+    let ops = journal.plan.ops.clone();
+    for op in &ops {
+        for mv in &op.moves {
+            let src = fs.file_len(&mv.from).is_ok();
+            let dst = fs.file_len(&mv.to).is_ok();
+            match journal.statuses[gidx] {
+                OpState::Pending | OpState::Failed if !src && dst => {
+                    journal.statuses[gidx] = OpState::Done;
+                }
+                OpState::Done if !dst && src => {
+                    journal.statuses[gidx] = OpState::Pending;
+                }
+                _ => {}
+            }
+            gidx += 1;
+        }
+    }
+}
+
+/// Resume a crashed/aborted run from its journal: reconcile against the disk
+/// (rev 3), skip `Done` moves, continue the rest; the journal is removed on
+/// success by `execute`. Detected + offered on next launch (the offer UX is
+/// Phase 6). Does not re-run the free-space preflight — the journal is trusted
+/// as the source of truth for WHAT to do; the disk for what already happened.
 pub fn resume(journal_path: &Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError> {
     let mut journal = read_journal(journal_path)?;
+    reconcile(&mut journal, fs);
     execute(&mut journal, fs, journal_path)
 }
 ```
@@ -1244,7 +1392,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 ```bash
 git add culler-core/src/apply.rs
-git commit -m "feat(apply): resume() replays journal skipping Done moves" -m "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
+git commit -m "feat(apply): reconciling resume() heals journal-disk drift, skips Done moves" -m "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```
 
 ---
@@ -1366,7 +1514,7 @@ pub fn apply(plan: &ApplyPlan, fs: &dyn FsOps, journal_path: &Path) -> Result<Ap
         plan: plan.clone(),
         statuses: vec![OpState::Pending; total_move_count(plan)],
     };
-    write_journal(&journal, journal_path)?; // JOURNAL FIRST — before any move
+    write_journal(&journal, journal_path, true)?; // JOURNAL FIRST — durable before any move
     execute(&mut journal, fs, journal_path)
 }
 ```
@@ -1555,8 +1703,8 @@ git commit -m "test(apply): fresh XMP sidecar written into bucket during apply (
 - [ ] `culler-core/src/apply.rs`: `OpState`, `Journal`, `ApplyError`, `ApplyReport`, `apply`, `resume`.
 - [ ] `lib.rs` exports `pub mod fsops;` and `pub mod apply;`.
 - [ ] `Cargo.toml`: `rustix` (features `["fs"]`) dependency, `tempfile` dev-dependency.
-- [ ] §11 highest-value matrix covered: same-FS rename (T3, +RealFs T1), injected-EXDEV copy-verify (T5), collision between plan and apply fails loudly (T6), group atomicity stop+report (T7), crash-mid-apply → resume (T8), preflight refuse + mid-copy ENOSPC source-intact (T9), permission failures (T10), sidecar write (T11), journal-first + incremental Done (T4).
-- [ ] `cargo test -p culler-core` fully green; **no BLAKE3, no delete step** anywhere.
+- [ ] §11 highest-value matrix covered: same-FS rename (T3, +RealFs T1), injected-EXDEV copy-verify **with rename-before-dir-fsync ORDER asserted on the event log** (T5), collision between plan and apply fails loudly (T6), group atomicity stop+report (T7), crash-mid-apply → resume **including both reconciliation directions** (T8), preflight refuse + mid-copy ENOSPC source-intact (T9), permission failures (T10), sidecar write **+ skip-idempotent re-run** (T11), journal-first + incremental Done + **journal removed on success** (T3/T4).
+- [ ] `cargo test -p culler-core` fully green; **no BLAKE3, no delete step for user data** anywhere (journal/partial/tmp cleanup is bookkeeping, not deletion).
 
 ## Notes for the executor — spec ambiguities & how they were resolved
 
@@ -1568,4 +1716,6 @@ git commit -m "test(apply): fresh XMP sidecar written into bucket during apply (
 
 4. **Journal I/O is real, not `FsOps`.** The journal must survive a real power-loss crash, so `write_journal`/`read_journal` use `std::fs` (temp → `sync_all` → atomic rename) directly rather than the injectable `FsOps`. FakeFs apply tests therefore pass a **real** temp `journal_path` while their file moves stay in-memory — this is intentional and lets the crash-recovery test (T8) round-trip a real journal.
 
-5. **`same_filesystem` heuristic for preflight.** `RealFs::same_filesystem` compares `st_dev` of each path's containing directory (spec §8). For a top-level distinct-mount dest this can misjudge in a rare edge case, but preflight is only an optimization to fail fast on space — the per-file move path handles `EXDEV` correctly regardless, so a wrong preflight verdict never causes data loss (worst case: a cross-FS run isn't space-pre-checked and instead surfaces `ENOSPC` mid-copy with the source left intact, per T9).
+5. **Rev-3 hardening summary (2026-07-09 plan audit).** Four changes relative to the original rev of this phase: (a) cross-FS dir fsync moved *after* the publish rename (a spec §8 defect this plan had faithfully copied); (b) `resume` reconciles journal↔disk in both directions, which also licenses (c) batched journal fsyncs (every 64th move instead of every move — a 4k-file shoot no longer pays 4k fsyncs of a plan-sized JSON); (d) the journal is removed on success and sidecar writes are skip-idempotent no-clobber, so a finished run can never masquerade as a crashed one, hijack a later apply, or overwrite anything.
+
+6. **`same_filesystem` heuristic for preflight.** `RealFs::same_filesystem` compares `st_dev` of each path's containing directory (spec §8). For a top-level distinct-mount dest this can misjudge in a rare edge case, but preflight is only an optimization to fail fast on space — the per-file move path handles `EXDEV` correctly regardless, so a wrong preflight verdict never causes data loss (worst case: a cross-FS run isn't space-pre-checked and instead surfaces `ENOSPC` mid-copy with the source left intact, per T9).
