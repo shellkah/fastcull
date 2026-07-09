@@ -520,4 +520,20 @@ mod tests {
         assert_eq!(shots[0].capture, CaptureTime::default());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn parse_subsec_normalizes_fraction_digits() {
+        // EXIF subsec is a decimal FRACTION: right-pad/truncate to milliseconds.
+        assert_eq!(parse_subsec("5"), Some(500));
+        assert_eq!(parse_subsec("05"), Some(50));
+        assert_eq!(parse_subsec("42"), Some(420));
+        assert_eq!(parse_subsec("123"), Some(123));
+        assert_eq!(parse_subsec("123456"), Some(123));
+        // "9" = 0.9s must order AFTER "10" = 0.10s once normalized.
+        assert!(parse_subsec("9") > parse_subsec("10"));
+        // Non-digit / empty inputs yield None; leading digits before junk still parse.
+        assert_eq!(parse_subsec(""), None);
+        assert_eq!(parse_subsec("abc"), None);
+        assert_eq!(parse_subsec(" 42 "), Some(420));
+    }
 }
