@@ -80,20 +80,25 @@ fn suffixed_stem(stem: &str, suffix: Option<u32>) -> String {
 /// a different bucket must not force a suffix (rev 3). `sizes` = stem → total
 /// bytes. `buckets` = resolved bucket names, order [rejected, rest, keep, picks, bests].
 ///
-/// The carried sidecar is exactly the file in `Shot.sidecar`: when scan found
-/// both the Adobe (`stem.xmp`) and darktable (`stem.ext.xmp`) conventions on
-/// disk for one stem, it chose the darktable one, and the Adobe file stays
-/// behind on disk as an untracked leftover — `plan` never moves or writes it.
+/// `stale` is left empty: `plan` does no I/O, so the binary pre-verifies file
+/// existence, drops missing shots before calling `plan`, and fills `stale` for
+/// the preview post-hoc.
+///
+/// The carried sidecar is the one in `Shot.sidecar`: when both the Adobe
+/// (`stem.xmp`) and darktable (`stem.ext.xmp`) conventions existed on disk,
+/// scan chose the darktable one and left the Adobe file as an untracked leftover.
 pub fn plan(
     session: &Session,
     dest: &Path,
     buckets: &[String; 5],
     existing: &BTreeSet<String>,
-    _sizes: &HashMap<String, u64>,
+    sizes: &HashMap<String, u64>,
 ) -> ApplyPlan {
     let mut ops = Vec::with_capacity(session.shots.len());
+    let mut counts = TierCountsPlan::default();
     let mut skipped_sidecar_writes = Vec::new();
     let mut claimed: BTreeSet<String> = BTreeSet::new();
+    let mut total_bytes: u64 = 0;
 
     for (i, shot) in session.shots.iter().enumerate() {
         let decision = session.decision(i);
@@ -110,13 +115,9 @@ pub fn plan(
             })
             .collect();
 
-        // A fresh sidecar is written only when the shot has a tier or tags AND
-        // has no pre-existing sidecar (which we carry untouched instead).
         let has_content = decision.tier.is_some() || !decision.tags.is_empty();
         let write_new_sidecar = shot.sidecar.is_none() && has_content;
 
-        // Resolve a whole-stem suffix so no target name — including the fresh
-        // `.xmp` — collides with `existing` or with a name this plan claimed.
         let mut suffix: Option<u32> = None;
         let names = loop {
             let new_stem = suffixed_stem(&shot.stem, suffix);
@@ -140,7 +141,6 @@ pub fn plan(
         }
         let new_stem = suffixed_stem(&shot.stem, suffix);
 
-        // Moves: jpeg, raw?, and a pre-existing sidecar? — carried untouched.
         let moves: Vec<FileMove> = files
             .iter()
             .zip(rests.iter())
@@ -159,10 +159,18 @@ pub fn plan(
         } else {
             None
         };
-        // Report a skipped tag-write only when there was something to write.
         if shot.sidecar.is_some() && has_content {
             skipped_sidecar_writes.push(shot.stem.clone());
         }
+
+        match idx {
+            0 => counts.rejected += 1,
+            1 => counts.rest += 1,
+            2 => counts.keep += 1,
+            3 => counts.picks += 1,
+            _ => counts.bests += 1,
+        }
+        total_bytes += sizes.get(&shot.stem).copied().unwrap_or(0);
 
         ops.push(ShotOp {
             stem: shot.stem.clone(),
@@ -177,10 +185,10 @@ pub fn plan(
         dest: dest.to_path_buf(),
         buckets: buckets.clone(),
         ops,
-        per_bucket_counts: TierCountsPlan::default(),
+        per_bucket_counts: counts,
         skipped_sidecar_writes,
         stale: Vec::new(),
-        total_bytes: 0,
+        total_bytes,
     }
 }
 
@@ -504,5 +512,81 @@ mod tests {
                 .iter()
                 .any(|m| m.to == Path::new("/dest/02_keep/E.xmp"))
         );
+    }
+
+    #[test]
+    fn plan_counts_buckets_and_sums_bytes() {
+        let buckets = default_buckets();
+        let shots = vec![
+            shot("R", "JPG", None, None), // Reject => 00_rejected
+            shot("K", "JPG", None, None), // Keep    => 02_keep
+            shot("P", "JPG", None, None), // Pick    => 03_picks
+            shot("B", "JPG", None, None), // Best    => 04_bests
+            shot("Z", "JPG", None, None), // undecided => 01_rest
+        ];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            "R".to_string(),
+            Decision {
+                tier: Some(Tier::Reject),
+                ..Default::default()
+            },
+        );
+        decisions.insert(
+            "K".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                ..Default::default()
+            },
+        );
+        decisions.insert(
+            "P".to_string(),
+            Decision {
+                tier: Some(Tier::Pick),
+                ..Default::default()
+            },
+        );
+        decisions.insert(
+            "B".to_string(),
+            Decision {
+                tier: Some(Tier::Best),
+                ..Default::default()
+            },
+        );
+        // Z: no entry
+        let session = Session {
+            shots,
+            decisions,
+            ..Default::default()
+        };
+
+        let mut sizes = HashMap::new();
+        sizes.insert("R".to_string(), 10u64);
+        sizes.insert("K".to_string(), 20u64);
+        sizes.insert("P".to_string(), 30u64);
+        sizes.insert("B".to_string(), 40u64);
+        sizes.insert("Z".to_string(), 5u64);
+        // a stem with no size entry contributes 0 (defensive)
+
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &BTreeSet::new(),
+            &sizes,
+        );
+
+        assert_eq!(
+            p.per_bucket_counts,
+            TierCountsPlan {
+                rejected: 1,
+                rest: 1,
+                keep: 1,
+                picks: 1,
+                bests: 1
+            }
+        );
+        assert_eq!(p.total_bytes, 105);
+        assert!(p.stale.is_empty());
     }
 }
