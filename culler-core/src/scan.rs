@@ -31,6 +31,7 @@ impl std::error::Error for ScanError {}
 struct Group {
     jpeg: Option<PathBuf>,
     raw: Option<PathBuf>,
+    sidecar: Option<PathBuf>,
 }
 
 /// Flat (non-recursive) walk of `dir`. Groups files by filename stem, emits a
@@ -72,6 +73,13 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
                 .or_default()
                 .raw
                 .get_or_insert_with(|| path.clone());
+        } else if ext == "xmp" {
+            let stem = sidecar_stem(path);
+            groups
+                .entry(stem)
+                .or_default()
+                .sidecar
+                .get_or_insert_with(|| path.clone());
         }
         // Everything else (videos, session sidecar, …) is unrecognized → ignored.
     }
@@ -84,7 +92,7 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
                 stem,
                 jpeg,
                 raw: group.raw,
-                sidecar: None,
+                sidecar: group.sidecar,
                 capture: CaptureTime::default(),
             }),
             None => {
@@ -121,6 +129,31 @@ fn file_stem_string(path: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or_default()
         .to_string()
+}
+
+/// The shot stem an `.xmp` sidecar belongs to, handling both conventions:
+///  - Adobe:     `IMG_1234.xmp`      → "IMG_1234"
+///  - darktable: `IMG_1234.CR3.xmp`  → "IMG_1234" (strip the inner RAW/JPEG ext)
+///
+/// `file_stem` removes only the trailing ".xmp"; if what remains itself ends in
+/// a recognized (case-insensitive) RAW or JPEG extension, that is stripped too.
+fn sidecar_stem(path: &Path) -> String {
+    let inner = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) => s,
+        None => return String::new(),
+    };
+    let inner_path = Path::new(inner);
+    if let Some(inner_ext) = inner_path.extension().and_then(|e| e.to_str()) {
+        let inner_ext = inner_ext.to_ascii_lowercase();
+        if RAW_EXTS.contains(&inner_ext.as_str()) || JPEG_EXTS.contains(&inner_ext.as_str()) {
+            return inner_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+        }
+    }
+    inner.to_string()
 }
 
 #[cfg(test)]
@@ -279,6 +312,55 @@ mod tests {
         touch(&dir.join("IMG_0001.JPG"));
         let shots = scan(&dir).unwrap();
         assert_eq!(shots[0].raw, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn adobe_sidecar_is_detected() {
+        let dir = unique_temp_dir("adobexmp");
+        touch(&dir.join("IMG_0001.JPG"));
+        touch(&dir.join("IMG_0001.xmp")); // Adobe convention: stem.xmp
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].sidecar, Some(dir.join("IMG_0001.xmp")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn darktable_sidecar_is_detected() {
+        let dir = unique_temp_dir("dtxmp");
+        touch(&dir.join("IMG_0001.JPG"));
+        touch(&dir.join("IMG_0001.CR3"));
+        touch(&dir.join("IMG_0001.CR3.xmp")); // darktable convention: file.ext.xmp
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].raw, Some(dir.join("IMG_0001.CR3")));
+        assert_eq!(shots[0].sidecar, Some(dir.join("IMG_0001.CR3.xmp")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn darktable_sidecar_inner_ext_is_case_insensitive() {
+        let dir = unique_temp_dir("dtxmpcase");
+        touch(&dir.join("IMG_0001.JPG"));
+        touch(&dir.join("IMG_0001.jpg.XMP")); // darktable sidecar for the JPEG, mixed case
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].sidecar, Some(dir.join("IMG_0001.jpg.XMP")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orphan_sidecar_without_jpeg_is_ignored() {
+        let dir = unique_temp_dir("orphanxmp");
+        touch(&dir.join("IMG_0001.xmp")); // no JPEG, no RAW
+
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        assert!(shots.is_empty());
+        assert!(raw_only.is_empty()); // an orphan sidecar is neither a shot nor RAW-only
         std::fs::remove_dir_all(&dir).ok();
     }
 }
