@@ -155,4 +155,264 @@ mod tests {
         let err = fs_ops.copy_create_new(&src, &dst).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
     }
+
+    use super::fake::FakeFs; // NB: `use fake::…` would not resolve inside `mod tests`
+    use std::path::PathBuf;
+
+    #[test]
+    fn fake_rename_moves_entry_and_injects_faults() {
+        let fs = FakeFs::new();
+        fs.seed_file("/src/a.jpg", 10);
+
+        // Happy rename moves the entry.
+        fs.rename_noreplace(&PathBuf::from("/src/a.jpg"), &PathBuf::from("/dst/a.jpg"))
+            .unwrap();
+        assert!(!fs.exists(&PathBuf::from("/src/a.jpg")));
+        assert_eq!(fs.len_of(&PathBuf::from("/dst/a.jpg")), Some(10));
+
+        // Surprise collision: seeding the target makes rename fail EEXIST.
+        fs.seed_file("/src/b.jpg", 3);
+        fs.seed_file("/dst/b.jpg", 99);
+        let e = fs
+            .rename_noreplace(&PathBuf::from("/src/b.jpg"), &PathBuf::from("/dst/b.jpg"))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+
+        // EXDEV injection forces the copy path.
+        fs.set_cross_fs(true);
+        let e = fs
+            .rename_noreplace(&PathBuf::from("/src/b.jpg"), &PathBuf::from("/other/b.jpg"))
+            .unwrap_err();
+        assert!(e.raw_os_error().is_some(), "EXDEV carries an errno");
+        assert!(
+            !fs.same_filesystem(&PathBuf::from("/src/x"), &PathBuf::from("/dst/x"))
+                .unwrap()
+        );
+        fs.set_cross_fs(false);
+
+        // ENOSPC injection on copy; source untouched, partial not created.
+        fs.set_enospc_on_copy(true);
+        let e = fs
+            .copy_create_new(
+                &PathBuf::from("/src/b.jpg"),
+                &PathBuf::from("/dst/b.partial"),
+            )
+            .unwrap_err();
+        assert_eq!(
+            e.raw_os_error(),
+            Some(rustix::io::Errno::NOSPC.raw_os_error())
+        );
+        assert!(fs.exists(&PathBuf::from("/src/b.jpg")));
+        assert!(!fs.exists(&PathBuf::from("/dst/b.partial")));
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod fake {
+    //! In-memory `FsOps` for deterministic fault injection in apply tests.
+    use super::FsOps;
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    pub(crate) struct FakeFs {
+        st: RefCell<State>,
+    }
+
+    struct State {
+        files: BTreeMap<PathBuf, u64>, // path -> byte length
+        dirs: BTreeSet<PathBuf>,
+        free: u64,
+        cross_fs: bool,       // same_filesystem -> false; rename_noreplace -> EXDEV
+        enospc_on_copy: bool, // copy_create_new -> ENOSPC (source untouched)
+        deny_rename_from: Option<PathBuf>, // rename_noreplace(from, _) -> EACCES
+        deny_remove: Option<PathBuf>, // remove_file(path) -> EACCES
+        fsynced_files: Vec<PathBuf>,
+        fsynced_dirs: Vec<PathBuf>,
+        events: Vec<String>, // ordered op log — durability ORDERING assertions
+    }
+
+    fn eacces() -> io::Error {
+        io::Error::from(io::ErrorKind::PermissionDenied)
+    }
+    fn enoent() -> io::Error {
+        io::Error::from(io::ErrorKind::NotFound)
+    }
+    fn eexist() -> io::Error {
+        io::Error::from(io::ErrorKind::AlreadyExists)
+    }
+    fn exdev() -> io::Error {
+        io::Error::from_raw_os_error(rustix::io::Errno::XDEV.raw_os_error())
+    }
+    fn enospc() -> io::Error {
+        io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
+    }
+
+    // Several helpers below are unused until tasks 3-10 (apply-engine tests) land;
+    // the brief mandates this exact API surface, so silence dead_code rather than trim it.
+    #[allow(dead_code)]
+    impl FakeFs {
+        pub(crate) fn new() -> Self {
+            FakeFs {
+                st: RefCell::new(State {
+                    files: BTreeMap::new(),
+                    dirs: BTreeSet::new(),
+                    free: u64::MAX,
+                    cross_fs: false,
+                    enospc_on_copy: false,
+                    deny_rename_from: None,
+                    deny_remove: None,
+                    fsynced_files: Vec::new(),
+                    fsynced_dirs: Vec::new(),
+                    events: Vec::new(),
+                }),
+            }
+        }
+
+        // ---- fixture builders / injectors ----
+        pub(crate) fn seed_file(&self, path: impl Into<PathBuf>, len: u64) {
+            self.st.borrow_mut().files.insert(path.into(), len);
+        }
+        pub(crate) fn set_free(&self, v: u64) {
+            self.st.borrow_mut().free = v;
+        }
+        pub(crate) fn set_cross_fs(&self, v: bool) {
+            self.st.borrow_mut().cross_fs = v;
+        }
+        pub(crate) fn set_enospc_on_copy(&self, v: bool) {
+            self.st.borrow_mut().enospc_on_copy = v;
+        }
+        pub(crate) fn deny_rename_from(&self, p: impl Into<PathBuf>) {
+            self.st.borrow_mut().deny_rename_from = Some(p.into());
+        }
+        pub(crate) fn deny_remove(&self, p: impl Into<PathBuf>) {
+            self.st.borrow_mut().deny_remove = Some(p.into());
+        }
+        pub(crate) fn clear_faults(&self) {
+            let mut s = self.st.borrow_mut();
+            s.cross_fs = false;
+            s.enospc_on_copy = false;
+            s.deny_rename_from = None;
+            s.deny_remove = None;
+        }
+
+        // ---- assertions ----
+        pub(crate) fn exists(&self, p: &Path) -> bool {
+            self.st.borrow().files.contains_key(p)
+        }
+        pub(crate) fn len_of(&self, p: &Path) -> Option<u64> {
+            self.st.borrow().files.get(p).copied()
+        }
+        pub(crate) fn dir_exists(&self, p: &Path) -> bool {
+            self.st.borrow().dirs.contains(p)
+        }
+        pub(crate) fn fsynced_files(&self) -> Vec<PathBuf> {
+            self.st.borrow().fsynced_files.clone()
+        }
+        pub(crate) fn fsynced_dirs(&self) -> Vec<PathBuf> {
+            self.st.borrow().fsynced_dirs.clone()
+        }
+        /// Ordered log of successful ops ("rename:a->b", "copy:a->b",
+        /// "fsync_file:p", "fsync_dir:p", "remove:p") for ordering assertions.
+        pub(crate) fn events(&self) -> Vec<String> {
+            self.st.borrow().events.clone()
+        }
+    }
+
+    impl FsOps for FakeFs {
+        fn mkdir_p(&self, path: &Path) -> io::Result<()> {
+            let mut s = self.st.borrow_mut();
+            let mut cur = PathBuf::new();
+            for comp in path.components() {
+                cur.push(comp);
+                s.dirs.insert(cur.clone());
+            }
+            Ok(())
+        }
+
+        fn same_filesystem(&self, _a: &Path, _b: &Path) -> io::Result<bool> {
+            Ok(!self.st.borrow().cross_fs)
+        }
+
+        fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let mut s = self.st.borrow_mut();
+            if s.cross_fs {
+                return Err(exdev());
+            }
+            if s.deny_rename_from.as_deref() == Some(from) {
+                return Err(eacces());
+            }
+            if !s.files.contains_key(from) {
+                return Err(enoent());
+            }
+            if s.files.contains_key(to) {
+                return Err(eexist()); // no-clobber
+            }
+            let len = s.files.remove(from).unwrap();
+            s.files.insert(to.to_path_buf(), len);
+            s.events
+                .push(format!("rename:{}->{}", from.display(), to.display()));
+            Ok(())
+        }
+
+        fn copy_create_new(&self, from: &Path, to: &Path) -> io::Result<u64> {
+            let mut s = self.st.borrow_mut();
+            if !s.files.contains_key(from) {
+                return Err(enoent());
+            }
+            if s.files.contains_key(to) {
+                return Err(eexist()); // O_EXCL
+            }
+            if s.enospc_on_copy {
+                return Err(enospc()); // source untouched, nothing created
+            }
+            let len = *s.files.get(from).unwrap();
+            if len > s.free {
+                return Err(enospc());
+            }
+            s.files.insert(to.to_path_buf(), len);
+            s.free -= len;
+            s.events
+                .push(format!("copy:{}->{}", from.display(), to.display()));
+            Ok(len)
+        }
+
+        fn fsync_file(&self, path: &Path) -> io::Result<()> {
+            let mut s = self.st.borrow_mut();
+            if !s.files.contains_key(path) {
+                return Err(enoent());
+            }
+            s.fsynced_files.push(path.to_path_buf());
+            s.events.push(format!("fsync_file:{}", path.display()));
+            Ok(())
+        }
+
+        fn fsync_dir(&self, path: &Path) -> io::Result<()> {
+            let mut s = self.st.borrow_mut();
+            s.fsynced_dirs.push(path.to_path_buf());
+            s.events.push(format!("fsync_dir:{}", path.display()));
+            Ok(())
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            let mut s = self.st.borrow_mut();
+            if s.deny_remove.as_deref() == Some(path) {
+                return Err(eacces());
+            }
+            if s.files.remove(path).is_none() {
+                return Err(enoent());
+            }
+            s.events.push(format!("remove:{}", path.display()));
+            Ok(())
+        }
+
+        fn file_len(&self, path: &Path) -> io::Result<u64> {
+            self.st.borrow().files.get(path).copied().ok_or_else(enoent)
+        }
+
+        fn free_space(&self, _path: &Path) -> io::Result<u64> {
+            Ok(self.st.borrow().free)
+        }
+    }
 }
