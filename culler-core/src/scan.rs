@@ -38,6 +38,9 @@ struct Group {
 /// `Shot` for every stem that has a JPEG display file, and returns the RAW paths
 /// of stems that have a RAW but **no JPEG** (not cullable shots in v1) so they
 /// are never silently dropped.
+///
+/// Entries whose file names are not valid UTF-8 are skipped (stems key
+/// decisions; such files surface via the Apply preview's leftover diff).
 pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
     if !dir.is_dir() {
         return Err(ScanError::NotADir(dir.to_path_buf()));
@@ -55,6 +58,14 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
         match std::fs::metadata(&path) {
             Ok(m) if m.is_file() => {}
             _ => continue,
+        }
+        // Grouping is keyed by UTF-8 stems (Decision keys in the session
+        // JSON); a file name that is not valid UTF-8 cannot carry a faithful
+        // stem key, so the entry is skipped here. Such files are not lost to
+        // the user: they surface as generic "stays behind" leftovers in the
+        // Apply preview's readdir diff.
+        if path.file_name().and_then(|n| n.to_str()).is_none() {
+            continue;
         }
         entries.push(path);
     }
@@ -308,6 +319,31 @@ mod tests {
         // Must return promptly: opening the FIFO for read would block forever.
         let shots = scan(&dir).unwrap();
         assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_names_are_skipped_without_contaminating_shots() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = unique_temp_dir("nonutf8");
+        touch(&dir.join("IMG_0001.JPG")); // a normal shot
+        // Files whose stems are NOT valid UTF-8 (0xFF byte).
+        for name in [
+            b"IMG_\xffA.jpg".to_vec(),
+            b"IMG_\xffB.jpg".to_vec(),
+            b"IMG_\xffC.cr3".to_vec(),
+        ] {
+            touch(&dir.join(OsString::from_vec(name)));
+        }
+
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        // No shot may be produced from the non-UTF-8 names — in particular no
+        // empty-stem Shot swallowing them all; the valid shot is untouched.
+        assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
+        assert!(raw_only.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 
