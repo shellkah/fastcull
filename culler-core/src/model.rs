@@ -14,8 +14,9 @@ pub const SESSION_BAD_FILE: &str = ".fastcull.json.bad"; // corrupt-session rena
 pub const JOURNAL_FILE: &str = ".fastcull-apply.json"; // in dest dir (used in phase 4)
 
 // ---- Recognized extensions (compared case-insensitively, no leading dot) ----
-pub const RAW_EXTS: &[&str] =
-    &["cr3", "cr2", "nef", "arw", "raf", "rw2", "orf", "dng", "pef", "srw"];
+pub const RAW_EXTS: &[&str] = &[
+    "cr3", "cr2", "nef", "arw", "raf", "rw2", "orf", "dng", "pef", "srw",
+];
 pub const JPEG_EXTS: &[&str] = &["jpg", "jpeg"];
 
 // ---- Bounded undo stack limit ----
@@ -324,7 +325,11 @@ mod tests {
         assert!(RAW_EXTS.contains(&"dng"));
         assert!(JPEG_EXTS.contains(&"jpg"));
         assert!(JPEG_EXTS.contains(&"jpeg"));
-        assert!(RAW_EXTS.iter().all(|e| e == &e.to_lowercase() && !e.starts_with('.')));
+        assert!(
+            RAW_EXTS
+                .iter()
+                .all(|e| e == &e.to_lowercase() && !e.starts_with('.'))
+        );
     }
 
     #[test]
@@ -595,10 +600,7 @@ mod tests {
     #[test]
     fn set_tags_replaces_and_dedupes_preserving_order() {
         let mut session = fixture_session(&["A"]);
-        session.set_tags(
-            0,
-            vec!["a".to_string(), "b".to_string(), "a".to_string()],
-        );
+        session.set_tags(0, vec!["a".to_string(), "b".to_string(), "a".to_string()]);
         assert_eq!(
             session.decision(0).tags,
             vec!["a".to_string(), "b".to_string()]

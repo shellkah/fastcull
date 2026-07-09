@@ -1,6 +1,6 @@
 //! Session persistence: atomic JSON sidecar read/write for `.fastcull.json`.
 
-use crate::model::{Session, SESSION_BAD_FILE, SESSION_FILE};
+use crate::model::{SESSION_BAD_FILE, SESSION_FILE, Session};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -95,7 +95,9 @@ fn tmp_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CaptureTime, Decision, Session, Shot, Tier, SESSION_BAD_FILE, SESSION_FILE};
+    use crate::model::{
+        CaptureTime, Decision, SESSION_BAD_FILE, SESSION_FILE, Session, Shot, Tier,
+    };
     use std::path::PathBuf;
 
     /// A fresh, unique temp directory for a single test.
@@ -107,10 +109,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "fastcull-{tag}-{}-{nanos}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("fastcull-{tag}-{}-{nanos}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
