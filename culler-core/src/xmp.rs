@@ -6,6 +6,10 @@ use std::path::Path;
 /// Build an XMP sidecar document string: `xmp:Rating` from `rating` (when Some)
 /// and a `dc:subject` `rdf:Bag` of keywords (one `rdf:li` per tag). Wrapped in
 /// the conventional `xpacket` envelope so Lightroom / darktable / Bridge import it.
+///
+/// Tag text has XML-1.0-illegal control characters (C0 controls other than
+/// tab/LF/CR, plus DEL) removed before being written; everything else is
+/// escaped by quick-xml as usual (`< > & " '`).
 pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 1);
 
@@ -39,9 +43,10 @@ pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String {
         w.write_event(Event::Start(BytesStart::new("rdf:Bag")))
             .expect("write");
         for tag in tags {
+            let clean = strip_illegal_xml_chars(tag);
             w.write_event(Event::Start(BytesStart::new("rdf:li")))
                 .expect("write");
-            w.write_event(Event::Text(BytesText::new(tag)))
+            w.write_event(Event::Text(BytesText::new(&clean)))
                 .expect("write");
             w.write_event(Event::End(BytesEnd::new("rdf:li")))
                 .expect("write");
@@ -63,6 +68,16 @@ pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String {
     format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n{body}\n<?xpacket end=\"w\"?>\n"
     )
+}
+
+/// Remove characters that are illegal in XML 1.0 text content: the C0
+/// control range (`U+0000..=U+001F`) except tab/LF/CR, plus DEL (`U+007F`).
+/// Everything else (including `< > & " '`, which quick-xml escapes on write)
+/// passes through unchanged.
+fn strip_illegal_xml_chars(s: &str) -> String {
+    s.chars()
+        .filter(|&c| !matches!(c as u32, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
+        .collect()
 }
 
 /// Write `build_xmp(tags, rating)` to `path` atomically AND no-clobber: content
@@ -169,6 +184,42 @@ mod tests {
         p
     }
 
+    fn parse_xmp(xml: &str) -> (Vec<String>, Option<i32>) {
+        use quick_xml::Reader;
+        use quick_xml::events::Event;
+        let mut reader = Reader::from_str(xml);
+        let mut tags = Vec::new();
+        let mut rating = None;
+        let mut in_li = false;
+        let mut in_rating = false;
+        loop {
+            match reader.read_event() {
+                Ok(Event::Start(e)) => match e.name().as_ref() {
+                    b"rdf:li" => in_li = true,
+                    b"xmp:Rating" => in_rating = true,
+                    _ => {}
+                },
+                Ok(Event::End(e)) => match e.name().as_ref() {
+                    b"rdf:li" => in_li = false,
+                    b"xmp:Rating" => in_rating = false,
+                    _ => {}
+                },
+                Ok(Event::Text(t)) => {
+                    let txt = String::from_utf8_lossy(t.as_ref()).into_owned();
+                    if in_li {
+                        tags.push(txt);
+                    } else if in_rating {
+                        rating = txt.trim().parse::<i32>().ok();
+                    }
+                }
+                Ok(Event::Eof) => break,
+                Err(e) => panic!("parse error: {e}"),
+                _ => {}
+            }
+        }
+        (tags, rating)
+    }
+
     #[test]
     fn build_xmp_emits_dc_subject_bag() {
         let xml = build_xmp(&["red".to_string(), "sky".to_string()], None);
@@ -184,42 +235,6 @@ mod tests {
 
     #[test]
     fn build_xmp_round_trips_rating_and_tags() {
-        fn parse_xmp(xml: &str) -> (Vec<String>, Option<i32>) {
-            use quick_xml::Reader;
-            use quick_xml::events::Event;
-            let mut reader = Reader::from_str(xml);
-            let mut tags = Vec::new();
-            let mut rating = None;
-            let mut in_li = false;
-            let mut in_rating = false;
-            loop {
-                match reader.read_event() {
-                    Ok(Event::Start(e)) => match e.name().as_ref() {
-                        b"rdf:li" => in_li = true,
-                        b"xmp:Rating" => in_rating = true,
-                        _ => {}
-                    },
-                    Ok(Event::End(e)) => match e.name().as_ref() {
-                        b"rdf:li" => in_li = false,
-                        b"xmp:Rating" => in_rating = false,
-                        _ => {}
-                    },
-                    Ok(Event::Text(t)) => {
-                        let txt = String::from_utf8_lossy(t.as_ref()).into_owned();
-                        if in_li {
-                            tags.push(txt);
-                        } else if in_rating {
-                            rating = txt.trim().parse::<i32>().ok();
-                        }
-                    }
-                    Ok(Event::Eof) => break,
-                    Err(e) => panic!("parse error: {e}"),
-                    _ => {}
-                }
-            }
-            (tags, rating)
-        }
-
         let xml = build_xmp(&["red".to_string(), "sky".to_string()], Some(4));
         assert!(xml.contains("<xmp:Rating>4</xmp:Rating>"), "xml was: {xml}");
         let (tags, rating) = parse_xmp(&xml);
@@ -236,6 +251,29 @@ mod tests {
         let (t2, r2) = parse_xmp(&none);
         assert_eq!(t2, vec!["x".to_string()]);
         assert_eq!(r2, None);
+    }
+
+    #[test]
+    fn build_xmp_strips_illegal_control_chars_from_tags() {
+        let xml = build_xmp(
+            &["a\u{0007}b".to_string(), "\u{0000}x".to_string()],
+            Some(3),
+        );
+
+        for b in xml.bytes() {
+            let legal = b >= 0x20 && b != 0x7F;
+            let legal_control = matches!(b, b'\t' | b'\n' | b'\r');
+            assert!(
+                legal || legal_control,
+                "illegal control byte {b:#x} present in: {xml}"
+            );
+        }
+        assert!(xml.contains("<rdf:li>ab</rdf:li>"), "xml was: {xml}");
+        assert!(xml.contains("<rdf:li>x</rdf:li>"), "xml was: {xml}");
+
+        let (tags, rating) = parse_xmp(&xml);
+        assert_eq!(tags, vec!["ab".to_string(), "x".to_string()]);
+        assert_eq!(rating, Some(3));
     }
 
     #[test]
