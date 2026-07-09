@@ -1,7 +1,7 @@
 # FastCull — Design Spec
 
 **Date:** 2026-07-08
-**Status:** Draft — rev 2 (v1 review feedback folded in)
+**Status:** Draft — rev 3 (2026-07-09: §8 cross-FS durability ordering fixed, journal lifecycle + resume reconciliation specified, in-flight-apply breadcrumb added; rev 2 folded v1 review feedback)
 **Author:** Yoann (with Claude)
 
 ---
@@ -107,8 +107,11 @@ from previously-used tags. Written as XMP `dc:subject` keywords on Apply.
 Decision)`; `U` reverts the last tier/tag change. Cheap because state
 transitions are pure.
 
-**Session:** source dir + `Vec<Shot>` + decisions + current index. Held in
-memory, autosaved to **`.fastcull.json` in the source folder**. Saves are
+**Session:** source dir + `Vec<Shot>` + decisions + current index + the
+in-flight Apply destination (`pending_apply`, normally absent; set just before
+an apply starts and cleared on success — the crash-detection breadcrumb,
+rev 3). Held in memory, autosaved to **`.fastcull.json` in the source
+folder**. Saves are
 atomic (write temp + rename — same discipline as file moves). Decisions are
 keyed by filename stem so resume re-attaches them after a rescan. A corrupt
 session file is renamed to `.fastcull.json.bad` and reported; a fresh session
@@ -144,10 +147,15 @@ Nothing touches disk until here.
 3. On **confirm**, `apply` executes a **safe move**:
    - Creates `00_rejected / 01_rest / 02_keep / 03_picks / 04_bests` in the
      destination.
-   - **Journals first:** the plan is serialized to `dest/.fastcull-apply.json`
-     before the first move, and each operation is marked complete as it
-     executes. A crash mid-apply is detected on next launch and offered as
-     resume-or-report — never a forensic mystery.
+   - **Journals first:** the in-flight destination is recorded in the session
+     sidecar (breadcrumb), then the plan is serialized to
+     `dest/.fastcull-apply.json` before the first move, and each operation is
+     marked complete as it executes. Because the journal lives in the
+     *destination* while the next launch opens the *source*, the breadcrumb is
+     what makes "detected on next launch" actually work: a crash mid-apply is
+     detected via the session's pending destination and offered as
+     resume-or-report — never a forensic mystery. On success the journal is
+     removed and the breadcrumb cleared.
    - Moves each shot's fileset (JPEG + RAW + existing sidecar) into its bucket
      — **including rejects into `00_rejected`. Nothing is unlinked.**
    - Writes a fresh `.xmp` sidecar (tags + `xmp:Rating`) for each shot that
@@ -205,15 +213,38 @@ Each shot's fileset `{JPEG, RAW?, .xmp?}` is moved as a **group**.
   appears in the destination between plan and apply must **fail loudly**,
   never be silently overwritten.
 - **Cross-filesystem** (`EXDEV`) → copy to `dest/.name.partial` opened with
-  `create_new` → `fsync` file (and parent directory) → verify byte length
-  (BLAKE3 hash is a phase-2 paranoia setting) → `rename(.partial → final)`
-  with `NOREPLACE` → only then remove source. A mid-copy failure leaves the
-  source **untouched** and cleans up the partial.
+  `create_new` → `fsync` file → verify byte length (BLAKE3 hash is a phase-2
+  paranoia setting) → `rename(.partial → final)` with `NOREPLACE` → **`fsync`
+  the parent directory** → only then remove source. The directory fsync must
+  come *after* the publish rename, not before: the source unlink happens on a
+  *different filesystem*, so power loss could otherwise persist the unlink
+  while the rename is lost — leaving the data reachable only as a hidden
+  `.partial`. A mid-copy failure leaves the source **untouched** and cleans up
+  the partial. *(rev 3: rev 2 ordered the dir fsync before the rename, which
+  made the `.partial` entry durable instead of the final one.)*
 - **Preflight** → before the first cross-FS copy, check destination free space
   (`statvfs`) against the plan's total byte count; refuse rather than abort
   halfway.
 - **Journal** → the serialized plan in the destination records per-file status
-  as apply proceeds; a crashed or aborted run is resumable.
+  as apply proceeds; a crashed or aborted run is resumable. **Lifecycle
+  (rev 3):** before the first move, the session sidecar records the in-flight
+  destination (breadcrumb) so the next launch on the source folder can find
+  the journal; on full success the journal is **removed** and the breadcrumb
+  cleared (the journal is FastCull's own bookkeeping, not user data — the §2
+  no-deletion guarantee protects photos, not our metadata). A journal
+  containing any non-`Done` entry marks a crashed run; an all-`Done` journal
+  must never be mistaken for one.
+- **Resume reconciliation (rev 3)** → a crash can land between a completed
+  move and its journal update (or the reverse: journal fsynced, rename lost).
+  `resume` therefore reconciles the journal against the disk in both
+  directions before executing: a `Pending` move whose source is gone and
+  whose destination exists is treated as done; a `Done` move whose
+  destination is missing while the source still exists is re-executed. Resume
+  must never fail with a spurious error on work a crashed run already did.
+- **Sidecar writes are no-clobber too** → freshly written `.xmp` sidecars are
+  published exactly like moves (write temp → rename with `NOREPLACE`); no
+  destination write path may silently overwrite. Re-running a sidecar write on
+  resume skips an already-present target instead of failing.
 - **Collisions** → auto-suffix the whole stem consistently
   (`IMG_1234` → `IMG_1234-1`) so JPEG/RAW/xmp stay matched; surfaced in the preview.
 - **Group atomicity** → if a later file in a shot fails, already-moved files
@@ -279,9 +310,13 @@ gold = best, red = reject.
 - **Highest value — `plan` / `apply`:** temp-dir fixtures for same-FS rename,
   injected-`EXDEV` copy-verify path, collision auto-suffix, **collision
   appearing between plan and apply (NOREPLACE fails loudly)**, group
-  atomicity, **crash-mid-apply → journal recovery resumes correctly**, and
-  ENOSPC / permission failures injected via the `FsOps` trait. This is where
-  data loss would occur, so it gets the most coverage.
+  atomicity, **crash-mid-apply → journal recovery resumes correctly**,
+  **crash *between* a move and its journal update → resume reconciles instead
+  of erroring (both directions)**, **sidecar writes refuse to clobber and are
+  skip-idempotent on resume**, **journal removed on success (an all-`Done`
+  journal never triggers a recovery offer or hijacks a later apply into the
+  same dest)**, and ENOSPC / permission failures injected via the `FsOps`
+  trait. This is where data loss would occur, so it gets the most coverage.
 - `model` — state-transition unit tests: tier changes, `Option<Tier>` +
   `visited` semantics, undo stack, per-tier counts.
 - `scan` — fixture dirs → correct pairing / RAW detection / both sidecar
@@ -349,4 +384,5 @@ gold = best, red = reject.
 | Sidecar convention | Write `stem.xmp` (Adobe style); scan detects both `stem.xmp` and `file.ext.xmp` (darktable); pre-existing sidecars are carried untouched and tag-writes skipped + reported — verify one real import in the downstream editor *(rev 2)* |
 | Auto-advance | On by default; `--no-auto-advance` *(rev 2)* |
 | Crash safety | Apply journal in destination; `RENAME_NOREPLACE` everywhere; free-space preflight; atomic session saves *(rev 2)* |
+| Crash-safety hardening | Cross-FS dir fsync moved *after* the publish rename; resume reconciles journal↔disk in both directions; sidecar writes no-clobber + skip-idempotent; journal removed on success; `pending_apply` breadcrumb in the session makes next-launch crash detection real *(rev 3)* |
 | Configuration | Bucket names via CLI flags; no config file in v1 *(rev 2)* |
