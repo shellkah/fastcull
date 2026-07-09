@@ -140,20 +140,30 @@ fn execute(
     for op in &ops {
         for mv in &op.moves {
             if journal.statuses[gidx] == OpState::Done {
-                gidx += 1; // already moved by an earlier (crashed) run
+                gidx += 1;
                 continue;
             }
-            move_one(fs, &mv.from, &mv.to)?;
-            journal.statuses[gidx] = OpState::Done;
-            report.moved_files += 1;
+            match move_one(fs, &mv.from, &mv.to) {
+                Ok(()) => {
+                    journal.statuses[gidx] = OpState::Done;
+                    report.moved_files += 1;
+                    // Persist progress incrementally; fsync only every 64th move
+                    // (and at checkpoints) — reconciliation (Task 8) makes an
+                    // unsynced tail harmless, and this doubles as the progress
+                    // feed the Phase-6 UI polls from a worker thread.
+                    write_journal(journal, journal_path, report.moved_files % 64 == 0)?;
+                }
+                Err(e) => {
+                    journal.statuses[gidx] = OpState::Failed;
+                    let _ = write_journal(journal, journal_path, true); // durable stop record
+                    return Err(e);
+                }
+            }
             gidx += 1;
         }
 
         if let Some(sw) = &op.write_sidecar {
-            // Skip-idempotent (spec §8 rev 3): sidecars are not journaled, so a
-            // resume re-visits every op — an already-written target is skipped,
-            // and write_sidecar's NOREPLACE publish turns a lost race into
-            // AlreadyExists, which is also a skip. Never a clobber.
+            // Skip-idempotent; NOREPLACE inside write_sidecar — see Task 3.
             if !sw.path.exists() {
                 match crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating) {
                     Ok(()) => report.sidecars_written += 1,
@@ -170,11 +180,7 @@ fn execute(
         report.moved_shots += 1;
     }
 
-    // Full success: the journal has served its purpose — remove it so a later
-    // launch or apply into this dest never mistakes a finished run for a
-    // crashed one (spec §8 rev 3; the journal is FastCull metadata, not user
-    // data — the no-deletion guarantee protects photos, not our bookkeeping).
-    let _ = std::fs::remove_file(journal_path);
+    let _ = std::fs::remove_file(journal_path); // success: journal retired (spec §8 rev 3)
     Ok(report)
 }
 
@@ -339,5 +345,63 @@ mod tests {
         let bytes = serde_json::to_vec(&journal).unwrap();
         let round_tripped: Journal = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(round_tripped, journal);
+    }
+
+    #[test]
+    fn journal_persists_incrementally_and_before_first_move() {
+        let dest = PathBuf::from("/dst");
+        // One shot, three files; fail the SECOND move (index 1).
+        let (s1, b1) = shot(
+            "IMG_0007",
+            BUCKET_KEEP,
+            &[
+                ("IMG_0007.JPG", 100),
+                ("IMG_0007.CR3", 100),
+                ("IMG_0007.xmp", 100),
+            ],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_rename_from("/src/IMG_0007.CR3"); // second move fails with EACCES
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(matches!(err, ApplyError::Fs { .. }));
+
+        // Durable journal reflects incremental progress: [Done, Failed, Pending].
+        let j: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
+        assert_eq!(
+            j.statuses,
+            vec![OpState::Done, OpState::Failed, OpState::Pending]
+        );
+
+        // First file really moved; the failing file's source is untouched.
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0007.JPG")));
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0007.CR3")));
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0007.xmp")));
+    }
+
+    #[test]
+    fn journal_exists_even_when_the_very_first_move_fails() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0009", BUCKET_KEEP, &[("IMG_0009.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_rename_from("/src/IMG_0009.JPG"); // first move fails
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let _ = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(jpath.exists(), "journal was written before the first move");
+        let j: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
+        assert_eq!(j.statuses, vec![OpState::Failed]);
     }
 }
