@@ -1,5 +1,7 @@
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::writer::Writer;
+use std::io::{self, Write};
+use std::path::Path;
 
 /// Build an XMP sidecar document string: `xmp:Rating` from `rating` (when Some)
 /// and a `dc:subject` `rdf:Bag` of keywords (one `rdf:li` per tag). Wrapped in
@@ -61,6 +63,38 @@ pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String {
     format!(
         "<?xpacket begin=\"\u{feff}\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n{body}\n<?xpacket end=\"w\"?>\n"
     )
+}
+
+/// Write `build_xmp(tags, rating)` to `path` atomically AND no-clobber: content
+/// goes to a sibling temp file, is fsynced, then published with
+/// `renameat2(RENAME_NOREPLACE)`. An existing file at `path` yields
+/// `ErrorKind::AlreadyExists` and is never overwritten — the same guarantee
+/// every file move has (spec §8 rev 3); a plain `rename` here was the one
+/// destination write that could silently clobber. Caller chooses the path
+/// (`<stem>.xmp`, Adobe style).
+pub fn write_sidecar(path: &Path, tags: &[String], rating: Option<i32>) -> io::Result<()> {
+    let content = build_xmp(tags, rating);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "sidecar path has no file name")
+    })?;
+    let tmp = dir.join(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    if let Err(e) = renameat_with(CWD, &tmp, CWD, path, RenameFlags::NOREPLACE) {
+        let _ = std::fs::remove_file(&tmp); // refused publish leaves no litter
+        return Err(io::Error::from(e));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -134,5 +168,65 @@ mod tests {
         let (t2, r2) = parse_xmp(&none);
         assert_eq!(t2, vec!["x".to_string()]);
         assert_eq!(r2, None);
+    }
+
+    #[test]
+    fn write_sidecar_writes_atomically_and_parses_back() {
+        fn unique_tmp_dir(tag: &str) -> std::path::PathBuf {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let mut p = std::env::temp_dir();
+            p.push(format!(
+                "fastcull-xmp-{}-{}-{}",
+                tag,
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        let dir = unique_tmp_dir("sidecar");
+        let path = dir.join("IMG_1234.xmp");
+        write_sidecar(&path, &["red".to_string()], Some(5)).expect("write_sidecar");
+
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            content.contains("<rdf:li>red</rdf:li>"),
+            "content: {content}"
+        );
+        assert!(
+            content.contains("<xmp:Rating>5</xmp:Rating>"),
+            "content: {content}"
+        );
+
+        // atomic write leaves no temp file behind: only the final sidecar remains
+        let mut entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["IMG_1234.xmp".to_string()],
+            "leftover files: {entries:?}"
+        );
+
+        // NO-CLOBBER (spec §8 rev 3): a second write onto the same path must fail
+        // AlreadyExists, leave the original byte-for-byte intact, and clean its temp.
+        let before = std::fs::read(&path).unwrap();
+        let err = write_sidecar(&path, &["other".to_string()], Some(1)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "existing sidecar untouched"
+        );
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 1, "refused publish leaves no temp litter");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
