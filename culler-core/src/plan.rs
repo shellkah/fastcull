@@ -755,4 +755,63 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn plan_counts_accumulate_within_a_bucket() {
+        let buckets = default_buckets();
+        let shots = vec![
+            shot("K1", "JPG", None, None), // Keep
+            shot("K2", "JPG", None, None), // Keep
+            shot("P1", "JPG", None, None), // Pick
+        ];
+        let mut decisions = HashMap::new();
+        decisions.insert(
+            "K1".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "K2".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "P1".to_string(),
+            Decision {
+                tier: Some(Tier::Pick),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session {
+            shots,
+            decisions,
+            ..Default::default()
+        };
+
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &BTreeSet::new(),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            p.per_bucket_counts,
+            TierCountsPlan {
+                rejected: 0,
+                rest: 0,
+                keep: 2,
+                picks: 1,
+                bests: 0
+            }
+        );
+    }
 }
