@@ -83,7 +83,7 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
             Some(jpeg) => shots.push(Shot {
                 stem,
                 jpeg,
-                raw: None,
+                raw: group.raw,
                 sidecar: None,
                 capture: CaptureTime::default(),
             }),
@@ -246,6 +246,39 @@ mod tests {
         let (shots, raw_only) = scan_report(&dir).unwrap();
         assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
         assert!(raw_only.is_empty()); // the RAW is paired, not orphaned
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_sibling_is_attached_to_its_shot() {
+        let dir = unique_temp_dir("rawsibling");
+        touch(&dir.join("IMG_0001.JPG"));
+        touch(&dir.join("IMG_0001.CR3"));
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].raw, Some(dir.join("IMG_0001.CR3")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_sibling_matches_case_insensitively() {
+        let dir = unique_temp_dir("rawcase");
+        touch(&dir.join("IMG_0001.jpg"));
+        touch(&dir.join("IMG_0001.Nef")); // mixed-case RAW extension
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(shots[0].raw, Some(dir.join("IMG_0001.Nef")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jpeg_without_raw_has_no_sibling() {
+        let dir = unique_temp_dir("noraw");
+        touch(&dir.join("IMG_0001.JPG"));
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots[0].raw, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
