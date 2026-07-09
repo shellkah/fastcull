@@ -5,7 +5,7 @@
 //! cullable shots (they are surfaced by `scan_report`, added in a later task).
 //! Zero GUI dependencies.
 
-use crate::model::{CaptureTime, JPEG_EXTS, Shot};
+use crate::model::{CaptureTime, JPEG_EXTS, RAW_EXTS, Shot};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -30,17 +30,18 @@ impl std::error::Error for ScanError {}
 #[derive(Default)]
 struct Group {
     jpeg: Option<PathBuf>,
+    raw: Option<PathBuf>,
 }
 
-/// Flat (non-recursive) walk of `dir`. In this first cut only JPEG display files
-/// are recognized; each becomes a one-file `Shot`. RAW siblings, sidecars, EXIF
-/// capture time and stable sorting arrive in later tasks.
-pub fn scan(dir: &Path) -> Result<Vec<Shot>, ScanError> {
+/// Flat (non-recursive) walk of `dir`. Groups files by filename stem, emits a
+/// `Shot` for every stem that has a JPEG display file, and returns the RAW paths
+/// of stems that have a RAW but **no JPEG** (not cullable shots in v1) so they
+/// are never silently dropped.
+pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
     if !dir.is_dir() {
         return Err(ScanError::NotADir(dir.to_path_buf()));
     }
 
-    // Collect entries first and sort by path so grouping is deterministic.
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(ScanError::Io)? {
         let entry = entry.map_err(ScanError::Io)?;
@@ -64,22 +65,46 @@ pub fn scan(dir: &Path) -> Result<Vec<Shot>, ScanError> {
                 .or_default()
                 .jpeg
                 .get_or_insert_with(|| path.clone());
+        } else if RAW_EXTS.contains(&ext.as_str()) {
+            let stem = file_stem_string(path);
+            groups
+                .entry(stem)
+                .or_default()
+                .raw
+                .get_or_insert_with(|| path.clone());
         }
-        // Everything else is ignored for now.
+        // Everything else (videos, session sidecar, …) is unrecognized → ignored.
     }
 
     let mut shots: Vec<Shot> = Vec::new();
+    let mut raw_only: Vec<PathBuf> = Vec::new();
     for (stem, group) in groups {
-        if let Some(jpeg) = group.jpeg {
-            shots.push(Shot {
+        match group.jpeg {
+            Some(jpeg) => shots.push(Shot {
                 stem,
                 jpeg,
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
-            });
+            }),
+            None => {
+                // No JPEG → not a cullable shot in v1. Report the RAW so a
+                // RAW-only stem isn't silently dropped (embedded-preview
+                // extraction is a phase-2 item).
+                if let Some(raw) = group.raw {
+                    raw_only.push(raw);
+                }
+                // A stem with neither JPEG nor RAW (e.g. an orphan file) is dropped.
+            }
         }
     }
+    Ok((shots, raw_only))
+}
+
+/// Flat walk of `dir` returning only the cullable shots. Thin wrapper over
+/// `scan_report` that discards the RAW-only report.
+pub fn scan(dir: &Path) -> Result<Vec<Shot>, ScanError> {
+    let (shots, _raw_only) = scan_report(dir)?;
     Ok(shots)
 }
 
@@ -194,6 +219,33 @@ mod tests {
 
         let shots = scan(&dir).unwrap();
         assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_only_stem_is_reported_and_is_not_a_shot() {
+        let dir = unique_temp_dir("rawonly");
+        touch(&dir.join("IMG_0001.JPG")); // a normal shot
+        touch(&dir.join("IMG_0002.CR3")); // RAW with no JPEG sibling
+
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
+        assert_eq!(raw_only, vec![dir.join("IMG_0002.CR3")]);
+
+        // scan() hides the report and returns only the cullable shots.
+        assert_eq!(stems(&scan(&dir).unwrap()), vec!["IMG_0001".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jpeg_and_raw_sharing_a_stem_are_one_shot() {
+        let dir = unique_temp_dir("pair");
+        touch(&dir.join("IMG_0001.JPG"));
+        touch(&dir.join("IMG_0001.CR3"));
+
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
+        assert!(raw_only.is_empty()); // the RAW is paired, not orphaned
         std::fs::remove_dir_all(&dir).ok();
     }
 }
