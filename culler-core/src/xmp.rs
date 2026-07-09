@@ -8,8 +8,8 @@ use std::path::Path;
 /// the conventional `xpacket` envelope so Lightroom / darktable / Bridge import it.
 ///
 /// Tag text has XML-1.0-illegal control characters (C0 controls other than
-/// tab/LF/CR, plus DEL) removed before being written; everything else is
-/// escaped by quick-xml as usual (`< > & " '`).
+/// tab/LF/CR) plus the discouraged DEL (0x7F) removed before being written;
+/// everything else is escaped by quick-xml as usual (`< > & " '`).
 pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String {
     let mut w = Writer::new_with_indent(Vec::new(), b' ', 1);
 
@@ -70,10 +70,11 @@ pub fn build_xmp(tags: &[String], rating: Option<i32>) -> String {
     )
 }
 
-/// Remove characters that are illegal in XML 1.0 text content: the C0
-/// control range (`U+0000..=U+001F`) except tab/LF/CR, plus DEL (`U+007F`).
-/// Everything else (including `< > & " '`, which quick-xml escapes on write)
-/// passes through unchanged.
+/// Remove control characters from XML text content: the C0 range
+/// (`U+0000..=U+001F`) except tab/LF/CR — illegal in XML 1.0 — plus DEL
+/// (`U+007F`), which is formally legal but discouraged (XML 1.0 §2.2 lists
+/// `#x7F-#x84` among the discouraged characters). Everything else (including
+/// `< > & " '`, which quick-xml escapes on write) passes through unchanged.
 fn strip_illegal_xml_chars(s: &str) -> String {
     s.chars()
         .filter(|&c| !matches!(c as u32, 0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F | 0x7F))
@@ -104,7 +105,9 @@ pub fn write_sidecar(path: &Path, tags: &[String], rating: Option<i32>) -> io::R
         return Err(e);
     }
     use rustix::fs::{CWD, RenameFlags, renameat_with};
-    if let Err(e) = renameat_with(CWD, &tmp, CWD, path, RenameFlags::NOREPLACE) {
+    if let Err(e) = renameat_with(CWD, &tmp, CWD, path, RenameFlags::NOREPLACE)
+        .inspect(|_| record_step("rename"))
+    {
         let _ = std::fs::remove_file(&tmp); // refused publish leaves no litter
         return Err(io::Error::from(e));
     }
@@ -121,39 +124,67 @@ fn write_temp_and_sync(tmp: &Path, content: &[u8]) -> io::Result<()> {
     if test_hooks::should_fail_write() {
         return Err(io::Error::other("injected write failure (test)"));
     }
-    f.write_all(content)?;
+    f.write_all(content).inspect(|_| record_step("write_all"))?;
     // NOTE: this fsync-before-publish ordering is load-bearing: write_sidecar
     // only renames this temp file into place *after* sync_all() returns, so a
     // crash can never leave a published (renamed) sidecar whose bytes were
-    // not durably flushed first. That ordering is currently UNPINNED by any
-    // test — deleting this call leaves the whole suite green (mutation-
-    // verified). It stays unpinned until Phase 4's FsOps/FakeFs injection
-    // layer can record fsync calls and assert their order relative to
-    // rename; Phase 4 must pin sidecar fsync ordering once `apply` wires up
-    // sidecar writes. Note for the Phase 4 planner: the canonical FsOps
-    // trait has no sidecar-write method today, so it must decide how `apply`
-    // routes sidecar writes through the injection layer before this can be
-    // pinned.
-    f.sync_all()
+    // not durably flushed first. The ordering IS pinned by the test-hook step
+    // log (`write_sidecar_fsyncs_before_publish`): `record_step` is chained
+    // onto the same expression as each syscall, so deleting this sync_all
+    // also deletes its step record and that test fails. Phase 4 caveat
+    // remains: once `apply` wires sidecar writes through the FsOps/FakeFs
+    // injection layer, ordering should be re-pinned there — the canonical
+    // FsOps trait has no sidecar-write method today, so the Phase 4 planner
+    // must decide that routing.
+    f.sync_all().inspect(|_| record_step("sync_all"))
 }
 
-/// Test-only failure-injection seam for `write_sidecar`. Kept deliberately
-/// tiny and private: a thread-local flag lets a test force the write/sync
-/// step to fail deterministically right after the temp file is created,
-/// without resorting to OS-level `RLIMIT_FSIZE` + `SIGXFSZ` manipulation
-/// (which is process-wide state and would be racy/destructive in a
-/// multi-threaded `cargo test` binary where other tests run concurrently on
-/// other OS threads).
+// Step recorder for pinning syscall ordering in tests: call sites chain
+// `.inspect(|_| record_step("..."))` onto the SAME expression as the real
+// syscall, so a mutation that deletes the syscall also deletes its record —
+// a trailing standalone record call would survive such a deletion and
+// report a false green. Test builds record into `test_hooks`; release
+// builds get an empty `#[inline(always)]` no-op that compiles away, leaving
+// success-path behavior unchanged.
+#[cfg(test)]
+use test_hooks::record_step;
+#[cfg(not(test))]
+#[inline(always)]
+fn record_step(_step: &'static str) {}
+
+/// Test-only seams for `write_sidecar`, kept deliberately tiny and private.
+/// A thread-local flag lets a test force the write/sync step to fail
+/// deterministically right after the temp file is created, without resorting
+/// to OS-level `RLIMIT_FSIZE` + `SIGXFSZ` manipulation (which is
+/// process-wide state and would be racy/destructive in a multi-threaded
+/// `cargo test` binary where other tests run concurrently on other threads).
+/// A thread-local step log additionally records the order of the real
+/// syscalls (write_all, sync_all, rename) so a test can pin the load-bearing
+/// fsync-before-publish ordering. All state is thread-local; libtest runs
+/// each test on its own thread, so tests never observe each other's state.
 #[cfg(test)]
 mod test_hooks {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     thread_local! {
         static FAIL_WRITE: Cell<bool> = const { Cell::new(false) };
+        static STEPS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
     }
 
     pub fn should_fail_write() -> bool {
         FAIL_WRITE.with(Cell::get)
+    }
+
+    /// Record a named step. Call sites must chain this via `.inspect` onto
+    /// the same expression as the syscall it marks (mutation-safety: see the
+    /// comment on `record_step` in the parent module).
+    pub fn record_step(step: &'static str) {
+        STEPS.with(|s| s.borrow_mut().push(step));
+    }
+
+    /// Drain and return the steps recorded on the current thread.
+    pub fn take_steps() -> Vec<&'static str> {
+        STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
     }
 
     /// RAII guard: arms failure injection for the current thread while
@@ -268,7 +299,11 @@ mod tests {
     #[test]
     fn build_xmp_strips_illegal_control_chars_from_tags() {
         let xml = build_xmp(
-            &["a\u{0007}b".to_string(), "\u{0000}x".to_string()],
+            &[
+                "a\u{0007}b".to_string(),
+                "\u{0000}x".to_string(),
+                "tab\there\nline".to_string(),
+            ],
             Some(3),
         );
 
@@ -282,9 +317,21 @@ mod tests {
         }
         assert!(xml.contains("<rdf:li>ab</rdf:li>"), "xml was: {xml}");
         assert!(xml.contains("<rdf:li>x</rdf:li>"), "xml was: {xml}");
+        // legal whitespace controls (tab/LF) must survive stripping, per policy
+        assert!(
+            xml.contains("<rdf:li>tab\there\nline</rdf:li>"),
+            "xml was: {xml}"
+        );
 
         let (tags, rating) = parse_xmp(&xml);
-        assert_eq!(tags, vec!["ab".to_string(), "x".to_string()]);
+        assert_eq!(
+            tags,
+            vec![
+                "ab".to_string(),
+                "x".to_string(),
+                "tab\there\nline".to_string()
+            ]
+        );
         assert_eq!(rating, Some(3));
     }
 
@@ -328,6 +375,23 @@ mod tests {
         );
         let count = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(count, 1, "refused publish leaves no temp litter");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_sidecar_fsyncs_before_publish() {
+        let dir = unique_tmp_dir("fsync-order");
+        let path = dir.join("IMG_9012.xmp");
+
+        let _ = test_hooks::take_steps(); // drain any residue on this thread
+        write_sidecar(&path, &["red".to_string()], Some(2)).expect("write_sidecar");
+        assert_eq!(
+            test_hooks::take_steps(),
+            vec!["write_all", "sync_all", "rename"],
+            "sidecar must be fsynced before the publish rename \
+             (crash before publish must never leave a published-but-unsynced sidecar)"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
