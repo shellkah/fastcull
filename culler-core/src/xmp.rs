@@ -122,6 +122,18 @@ fn write_temp_and_sync(tmp: &Path, content: &[u8]) -> io::Result<()> {
         return Err(io::Error::other("injected write failure (test)"));
     }
     f.write_all(content)?;
+    // NOTE: this fsync-before-publish ordering is load-bearing: write_sidecar
+    // only renames this temp file into place *after* sync_all() returns, so a
+    // crash can never leave a published (renamed) sidecar whose bytes were
+    // not durably flushed first. That ordering is currently UNPINNED by any
+    // test — deleting this call leaves the whole suite green (mutation-
+    // verified). It stays unpinned until Phase 4's FsOps/FakeFs injection
+    // layer can record fsync calls and assert their order relative to
+    // rename; Phase 4 must pin sidecar fsync ordering once `apply` wires up
+    // sidecar writes. Note for the Phase 4 planner: the canonical FsOps
+    // trait has no sidecar-write method today, so it must decide how `apply`
+    // routes sidecar writes through the injection layer before this can be
+    // pinned.
     f.sync_all()
 }
 
