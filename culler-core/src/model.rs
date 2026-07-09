@@ -288,6 +288,8 @@ impl Session {
     }
 
     /// All tags used across the session, sorted and de-duplicated (autocomplete).
+    /// Intentionally includes tags from stale stems (decisions whose stem is no
+    /// longer in `shots`) so autocomplete keeps continuity across rescans.
     pub fn all_tags(&self) -> Vec<String> {
         let mut set = std::collections::BTreeSet::new();
         for decision in self.decisions.values() {
