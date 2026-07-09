@@ -630,7 +630,10 @@ mod tests {
             &HashMap::new(),
         );
 
-        assert_eq!(p.skipped_sidecar_writes, vec!["Skip1".to_string(), "Skip2".to_string()]);
+        assert_eq!(
+            p.skipped_sidecar_writes,
+            vec!["Skip1".to_string(), "Skip2".to_string()]
+        );
     }
 
     #[test]
@@ -640,8 +643,8 @@ mod tests {
         // Case (a): different bucket — no collision with intra-plan claim
         {
             let shots = vec![
-                shot("M", "JPG", None, None),     // Keep tier (02_keep), collides with existing
-                shot("M-1", "JPG", None, None),   // Pick tier (03_picks), should NOT collide
+                shot("M", "JPG", None, None), // Keep tier (02_keep), collides with existing
+                shot("M-1", "JPG", None, None), // Pick tier (03_picks), should NOT collide
             ];
             let mut decisions = HashMap::new();
             decisions.insert(
@@ -681,10 +684,7 @@ mod tests {
             assert_eq!(p.ops[0].stem, "M");
             assert_eq!(p.ops[0].bucket, "02_keep");
             assert_eq!(p.ops[0].suffix, Some(1));
-            assert_eq!(
-                p.ops[0].moves[0].to,
-                PathBuf::from("/dest/02_keep/M-1.JPG")
-            );
+            assert_eq!(p.ops[0].moves[0].to, PathBuf::from("/dest/02_keep/M-1.JPG"));
 
             // Shot M-1 in 03_picks does NOT collide with the claim in 02_keep (different bucket)
             assert_eq!(p.ops[1].stem, "M-1");
@@ -699,8 +699,8 @@ mod tests {
         // Case (b): same bucket — DOES collide with intra-plan claim
         {
             let shots = vec![
-                shot("M", "JPG", None, None),     // Keep tier (02_keep), collides with existing
-                shot("M-1", "JPG", None, None),   // Keep tier (02_keep), collides with M's claim
+                shot("M", "JPG", None, None), // Keep tier (02_keep), collides with existing
+                shot("M-1", "JPG", None, None), // Keep tier (02_keep), collides with M's claim
             ];
             let mut decisions = HashMap::new();
             decisions.insert(
@@ -740,10 +740,7 @@ mod tests {
             assert_eq!(p.ops[0].stem, "M");
             assert_eq!(p.ops[0].bucket, "02_keep");
             assert_eq!(p.ops[0].suffix, Some(1));
-            assert_eq!(
-                p.ops[0].moves[0].to,
-                PathBuf::from("/dest/02_keep/M-1.JPG")
-            );
+            assert_eq!(p.ops[0].moves[0].to, PathBuf::from("/dest/02_keep/M-1.JPG"));
 
             // Shot M-1 in 02_keep DOES collide with M's claim (same bucket), gets suffix
             assert_eq!(p.ops[1].stem, "M-1");
