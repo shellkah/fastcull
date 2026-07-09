@@ -617,6 +617,34 @@ mod tests {
     }
 
     #[test]
+    fn missing_subsec_sorts_before_present_subsec_at_same_datetime() {
+        let dir = unique_temp_dir("subsecnone");
+        // Same datetime; "z_nosub" has NO usable subsec (empty SubSecTimeOriginal
+        // → None), "a_sub" has one. Option<u32> orders None < Some, so z_nosub
+        // must come FIRST despite its later filename — proving the subsec field
+        // (not the filename) decides this tiebreak, deterministically.
+        std::fs::write(
+            dir.join("z_nosub.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:00", ""),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("a_sub.jpg"),
+            jpeg_with_exif("2026:07:08 09:00:00", "10"),
+        )
+        .unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots[0].capture.subsec, None);
+        assert_eq!(shots[1].capture.subsec, Some(100));
+        assert_eq!(
+            stems(&shots),
+            vec!["z_nosub".to_string(), "a_sub".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn undated_shots_alone_sort_by_filename() {
         let dir = unique_temp_dir("undated");
         touch(&dir.join("IMG_0003.JPG"));
