@@ -361,6 +361,21 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_stem_display_files_keep_first_in_path_order() {
+        let dir = unique_temp_dir("dupstem");
+        touch(&dir.join("IMG_0001.jpg"));
+        touch(&dir.join("IMG_0001.jpeg")); // sorts before IMG_0001.jpg
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        // Deterministic first-wins (plan's documented Known edge): the
+        // sorted-path-order winner claims the display slot regardless of
+        // readdir order.
+        assert_eq!(shots[0].jpeg, dir.join("IMG_0001.jpeg"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn jpeg_files_become_shots_case_insensitive() {
         let dir = unique_temp_dir("jpegs");
         touch(&dir.join("IMG_0001.JPG"));
