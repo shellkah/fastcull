@@ -120,8 +120,10 @@ pub fn plan(
         let mut suffix: Option<u32> = None;
         let names = loop {
             let new_stem = suffixed_stem(&shot.stem, suffix);
-            let mut candidate: Vec<String> =
-                rests.iter().map(|rest| format!("{bucket}/{new_stem}{rest}")).collect();
+            let mut candidate: Vec<String> = rests
+                .iter()
+                .map(|rest| format!("{bucket}/{new_stem}{rest}"))
+                .collect();
             if write_new_sidecar {
                 candidate.push(format!("{bucket}/{new_stem}.xmp"));
             }
@@ -375,28 +377,50 @@ mod tests {
     fn plan_writes_new_sidecar_and_skips_preexisting() {
         let buckets = default_buckets();
         let shots = vec![
-            shot("A", "JPG", None, None),                      // Keep tier => write new sidecar (rating 3)
-            shot("B", "JPG", None, None),                      // tags only => write new sidecar (rating None)
+            shot("A", "JPG", None, None), // Keep tier => write new sidecar (rating 3)
+            shot("B", "JPG", None, None), // tags only => write new sidecar (rating None)
             shot("C", "JPG", Some("CR3"), Some("/src/C.xmp")), // pre-existing sidecar => skip + carry
             shot("D", "JPG", None, None),                      // no tier, no tags => no sidecar
         ];
         let mut decisions = HashMap::new();
         decisions.insert(
             "A".to_string(),
-            Decision { tier: Some(Tier::Keep), tags: vec![], visited: true },
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
         );
         decisions.insert(
             "B".to_string(),
-            Decision { tier: None, tags: vec!["sky".to_string()], visited: true },
+            Decision {
+                tier: None,
+                tags: vec!["sky".to_string()],
+                visited: true,
+            },
         );
         decisions.insert(
             "C".to_string(),
-            Decision { tier: Some(Tier::Pick), tags: vec!["hero".to_string()], visited: true },
+            Decision {
+                tier: Some(Tier::Pick),
+                tags: vec!["hero".to_string()],
+                visited: true,
+            },
         );
         // D: no entry
-        let session = Session { shots, decisions, ..Default::default() };
+        let session = Session {
+            shots,
+            decisions,
+            ..Default::default()
+        };
 
-        let p = plan(&session, Path::new("/dest"), &buckets, &BTreeSet::new(), &HashMap::new());
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &BTreeSet::new(),
+            &HashMap::new(),
+        );
 
         // A: Keep => 02_keep, fresh sidecar with rating 3, no tags
         assert_eq!(
@@ -418,10 +442,12 @@ mod tests {
         );
         // C: pre-existing sidecar carried in moves, no new write, reported as skipped
         assert_eq!(p.ops[2].write_sidecar, None);
-        assert!(p.ops[2]
-            .moves
-            .iter()
-            .any(|m| m.to == PathBuf::from("/dest/03_picks/C.xmp")));
+        assert!(
+            p.ops[2]
+                .moves
+                .iter()
+                .any(|m| m.to == PathBuf::from("/dest/03_picks/C.xmp"))
+        );
         assert_eq!(p.skipped_sidecar_writes, vec!["C".to_string()]);
         // D: nothing to write
         assert_eq!(p.ops[3].write_sidecar, None);
@@ -447,22 +473,36 @@ mod tests {
                 visited: true,
             },
         );
-        let session = Session { shots, decisions, ..Default::default() };
+        let session = Session {
+            shots,
+            decisions,
+            ..Default::default()
+        };
 
-        let p = plan(&session, Path::new("/dest"), &buckets, &BTreeSet::new(), &HashMap::new());
+        let p = plan(
+            &session,
+            Path::new("/dest"),
+            &buckets,
+            &BTreeSet::new(),
+            &HashMap::new(),
+        );
 
         // The darktable-convention name is preserved via the after-stem rest.
-        assert!(p.ops[0]
-            .moves
-            .iter()
-            .any(|m| m.to == PathBuf::from("/dest/02_keep/E.CR3.xmp")));
+        assert!(
+            p.ops[0]
+                .moves
+                .iter()
+                .any(|m| m.to == Path::new("/dest/02_keep/E.CR3.xmp"))
+        );
         assert_eq!(p.ops[0].write_sidecar, None);
         assert_eq!(p.skipped_sidecar_writes, vec!["E".to_string()]);
         // Neither a move nor a fresh SidecarWrite ever targets the Adobe name —
         // plan only knows about the sidecar scan chose (`Shot.sidecar`).
-        assert!(!p.ops[0]
-            .moves
-            .iter()
-            .any(|m| m.to == PathBuf::from("/dest/02_keep/E.xmp")));
+        assert!(
+            !p.ops[0]
+                .moves
+                .iter()
+                .any(|m| m.to == Path::new("/dest/02_keep/E.xmp"))
+        );
     }
 }
