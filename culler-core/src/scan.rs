@@ -46,10 +46,17 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
     let mut entries: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(ScanError::Io)? {
         let entry = entry.map_err(ScanError::Io)?;
-        if entry.file_type().map_err(ScanError::Io)?.is_dir() {
-            continue; // flat walk: subdirectories are ignored entirely
+        let path = entry.path();
+        // Keep only regular files (metadata follows symlinks): directories
+        // (flat walk), FIFOs, sockets and device nodes must never reach the
+        // EXIF reader — opening a FIFO for read would block the scan forever.
+        // A per-entry stat error (e.g. a broken symlink) skips that entry
+        // rather than failing the whole scan.
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => {}
+            _ => continue,
         }
-        entries.push(entry.path());
+        entries.push(path);
     }
     entries.sort();
 
@@ -283,6 +290,24 @@ mod tests {
     fn empty_dir_yields_no_shots() {
         let dir = unique_temp_dir("empty");
         assert!(scan(&dir).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_named_like_a_jpeg_is_skipped_not_opened() {
+        let dir = unique_temp_dir("fifo");
+        touch(&dir.join("IMG_0001.JPG"));
+        let fifo = dir.join("IMG_0002.jpg");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must run");
+        assert!(status.success());
+
+        // Must return promptly: opening the FIFO for read would block forever.
+        let shots = scan(&dir).unwrap();
+        assert_eq!(stems(&shots), vec!["IMG_0001".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
