@@ -577,4 +577,29 @@ mod tests {
             "source unlink must follow the dir fsync: {ev:?}"
         );
     }
+
+    #[test]
+    fn apply_collision_between_plan_and_apply_fails_loudly() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0200", BUCKET_KEEP, &[("IMG_0200.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        // A file materialized at the destination AFTER planning.
+        let target = dest.join(BUCKET_KEEP).join("IMG_0200.JPG");
+        fs.seed_file(target.clone(), 999);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        match err {
+            ApplyError::Collision(p) => assert_eq!(p, target),
+            other => panic!("expected Collision, got {other:?}"),
+        }
+        // NEVER overwritten; source stays put.
+        assert_eq!(fs.len_of(&target), Some(999), "existing dest file untouched");
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0200.JPG")), "source not moved");
+    }
 }
