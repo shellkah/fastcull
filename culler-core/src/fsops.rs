@@ -309,9 +309,6 @@ pub(crate) mod fake {
         })
     }
 
-    // Several helpers below are unused until tasks 3-10 (apply-engine tests) land;
-    // the brief mandates this exact API surface, so silence dead_code rather than trim it.
-    #[allow(dead_code)]
     impl FakeFs {
         pub(crate) fn new() -> Self {
             FakeFs {

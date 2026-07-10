@@ -362,8 +362,10 @@ fn read_journal(path: &Path) -> Result<Journal, ApplyError> {
 ///  - `Done` move whose destination is MISSING while the source still exists →
 ///    the journal outran a lost rename: mark `Pending`, re-execute.
 ///
-/// Anything else (both present, both absent) is left alone and will surface
-/// loudly through the normal NOREPLACE/ENOENT paths.
+/// Anything else is left alone: a `Pending`/`Failed` cell surfaces loudly
+/// through the normal NOREPLACE/ENOENT paths; a `Done` entry whose source and
+/// destination are both absent stays skipped — nothing recoverable exists on
+/// disk.
 fn reconcile(journal: &mut Journal, fs: &dyn FsOps) {
     let mut gidx = 0usize;
     let ops = journal.plan.ops.clone();
