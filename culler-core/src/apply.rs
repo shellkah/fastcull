@@ -307,6 +307,60 @@ pub fn apply(
     execute(&mut journal, fs, journal_path)
 }
 
+/// Read `bytes` from disk and deserialize a journal.
+fn read_journal(path: &Path) -> Result<Journal, ApplyError> {
+    let bytes = std::fs::read(path).map_err(|e| ApplyError::Fs {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    serde_json::from_slice(&bytes).map_err(|e| ApplyError::Fs {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, e),
+    })
+}
+
+/// The crash window can strand the journal on either side of reality (spec §8
+/// rev 3). Reconcile it against the observable filesystem BEFORE executing:
+///  - `Pending`/`Failed` move whose source is GONE and destination EXISTS →
+///    the crashed run already did it: mark `Done` (a re-run would fail ENOENT
+///    or, worse, surface its own work as a Collision).
+///  - `Done` move whose destination is MISSING while the source still exists →
+///    the journal outran a lost rename: mark `Pending`, re-execute.
+///
+/// Anything else (both present, both absent) is left alone and will surface
+/// loudly through the normal NOREPLACE/ENOENT paths.
+fn reconcile(journal: &mut Journal, fs: &dyn FsOps) {
+    let mut gidx = 0usize;
+    let ops = journal.plan.ops.clone();
+    for op in &ops {
+        for mv in &op.moves {
+            let src = fs.file_len(&mv.from).is_ok();
+            let dst = fs.file_len(&mv.to).is_ok();
+            match journal.statuses[gidx] {
+                OpState::Pending | OpState::Failed if !src && dst => {
+                    journal.statuses[gidx] = OpState::Done;
+                }
+                OpState::Done if !dst && src => {
+                    journal.statuses[gidx] = OpState::Pending;
+                }
+                _ => {}
+            }
+            gidx += 1;
+        }
+    }
+}
+
+/// Resume a crashed/aborted run from its journal: reconcile against the disk
+/// (rev 3), skip `Done` moves, continue the rest; the journal is removed on
+/// success by `execute`. Detected + offered on next launch (the offer UX is
+/// Phase 6). Does not re-run the free-space preflight — the journal is trusted
+/// as the source of truth for WHAT to do; the disk for what already happened.
+pub fn resume(journal_path: &Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError> {
+    let mut journal = read_journal(journal_path)?;
+    reconcile(&mut journal, fs);
+    execute(&mut journal, fs, journal_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,5 +723,116 @@ mod tests {
             ]
         );
         assert_eq!(stopped_stem(&j), Some("IMG_0301".to_string())); // ApplyReport.stopped_at equivalent
+    }
+
+    #[test]
+    fn resume_continues_a_crashed_run_from_the_journal() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_0400",
+            BUCKET_KEEP,
+            &[
+                ("IMG_0400.JPG", 100),
+                ("IMG_0400.CR3", 100),
+                ("IMG_0400.xmp", 100),
+            ],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_rename_from("/src/IMG_0400.CR3"); // crash on the second file
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        // First run stops at the RAW; JPEG already moved.
+        let _ = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0400.JPG")));
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0400.CR3")));
+
+        // The fault clears (e.g. permissions fixed); resume from the same journal.
+        fs.clear_faults();
+        let report = resume(&jpath, &fs).unwrap();
+
+        // Only the not-yet-done files moved this run; JPEG skipped (already Done).
+        assert_eq!(report.moved_files, 2);
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0400.CR3")));
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0400.xmp")));
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0400.CR3")),
+            Some(100)
+        );
+
+        // Success retires the journal (spec §8 rev 3).
+        assert!(!jpath.exists(), "journal removed once the resume completes");
+    }
+
+    #[test]
+    fn resume_reconciles_crash_between_move_and_journal_update() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_0410",
+            BUCKET_KEEP,
+            &[("IMG_0410.JPG", 100), ("IMG_0410.CR3", 100)],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // The crashed run moved the JPG but died BEFORE journaling it:
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0410.JPG"), 100);
+        fs.seed_file("/src/IMG_0410.CR3", 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Pending, OpState::Pending],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        // rev 3: reconciliation sees from-gone + to-present ⇒ Done, so resume
+        // completes instead of dying on ENOENT / EEXIST-as-Collision.
+        let report = resume(&jpath, &fs).unwrap();
+        assert_eq!(
+            report.moved_files, 1,
+            "only the CR3 actually moved this run"
+        );
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0410.CR3")),
+            Some(100)
+        );
+        assert!(!jpath.exists(), "journal removed on success");
+    }
+
+    #[test]
+    fn resume_reexecutes_a_done_move_the_disk_never_saw() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0420", BUCKET_KEEP, &[("IMG_0420.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // Journal was fsynced Done, but the rename itself was lost to the crash:
+        fs.seed_file("/src/IMG_0420.JPG", 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Done],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        // rev 3: Done + dest-missing + source-present ⇒ re-execute, not skip —
+        // otherwise the shot is silently left behind while the run reports success.
+        let report = resume(&jpath, &fs).unwrap();
+        assert_eq!(report.moved_files, 1);
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0420.JPG")),
+            Some(100)
+        );
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0420.JPG")));
     }
 }
