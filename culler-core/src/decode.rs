@@ -204,6 +204,44 @@ pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeErr
     Ok(DecodedImage { w, h, rgba })
 }
 
+/// True if `data` starts with the JPEG SOI + marker magic (FF D8 FF).
+fn is_jpeg(data: &[u8]) -> bool {
+    data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
+}
+
+/// Extract the embedded EXIF thumbnail (fast filmstrip first paint), oriented like the
+/// primary image. Returns `None` if absent, unreadable, or the thumbnail won't decode.
+pub fn embedded_thumbnail(path: &Path) -> Option<DecodedImage> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+
+    let offset = exif
+        .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
+        .value
+        .get_uint(0)? as usize;
+    let length = exif
+        .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?
+        .value
+        .get_uint(0)? as usize;
+
+    // Thumbnail offsets are relative to the TIFF buffer returned by `Exif::buf()`.
+    let end = offset.checked_add(length)?;
+    let thumb = exif.buf().get(offset..end)?;
+    if !is_jpeg(thumb) {
+        return None;
+    }
+
+    let decoded = decompress_scaled(thumb, 1).ok()?;
+    let orientation = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .map(|v| v as u16)
+        .unwrap_or(1);
+    let (rgba, w, h) = apply_orientation(decoded.rgba, decoded.w, decoded.h, orientation);
+    Some(DecodedImage { w, h, rgba })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +445,35 @@ mod tests {
         assert_eq!((img.w, img.h), (raw.h, raw.w), "orientation-6 swaps w/h");
         assert!(img.h > img.w, "portrait must come back upright");
         assert_eq!(img.rgba.len(), img.w as usize * img.h as usize * 4);
+    }
+
+    #[test]
+    fn embedded_thumbnail_none_when_absent() {
+        // Synthetic JPEG has no EXIF and therefore no embedded thumbnail.
+        let jpeg = synth_jpeg(64, 48);
+        let (_dir, path) = write_temp_jpeg(&jpeg);
+        assert!(embedded_thumbnail(&path).is_none());
+        // Missing file -> None (never panics).
+        assert!(embedded_thumbnail(std::path::Path::new("/nope/missing.jpg")).is_none());
+    }
+
+    #[test]
+    fn embedded_thumbnail_extracts_from_fixture() {
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/orientation_6.jpg");
+        assert!(
+            fx.exists(),
+            "commit culler-core/tests/fixtures/orientation_6.jpg — phone/camera JPEGs \
+             carry an embedded EXIF thumbnail (see fixtures/README.md)"
+        );
+        let thumb = embedded_thumbnail(&fx).expect("fixture must carry an embedded EXIF thumbnail");
+        assert!(thumb.w > 0 && thumb.h > 0);
+        assert!(
+            thumb.w <= 1024 && thumb.h <= 1024,
+            "embedded thumbnails are small"
+        );
+        assert_eq!(thumb.rgba.len(), thumb.w as usize * thumb.h as usize * 4);
+        // Oriented like the main image: an orientation-6 portrait thumbnail is upright (h > w).
+        assert!(thumb.h > thumb.w, "thumbnail must be oriented upright");
     }
 }
