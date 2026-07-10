@@ -996,4 +996,113 @@ mod tests {
         );
         assert!(fs.exists(&PathBuf::from("/src/IMG_0601.JPG")));
     }
+
+    // Task 11: sidecar writes are real filesystem I/O (they do NOT route
+    // through `FsOps`), so this test uses `RealFs` + a temp dir — mixing
+    // `FakeFs` (in-memory) with a real `xmp` write is meaningless. All
+    // `FakeFs` apply tests keep `write_sidecar: None`; here is where the
+    // sidecar path is exercised end-to-end.
+    //
+    // NOTE: `SidecarWrite` is already imported at the top of this `mod
+    // tests` (see the `use crate::plan::{ .. SidecarWrite .. }` above);
+    // re-importing it here would be a duplicate `use` of the same name in
+    // the same scope (rustc E0252), so only `RealFs` is a new import.
+    use crate::fsops::RealFs;
+
+    #[test]
+    fn apply_writes_fresh_sidecar_into_bucket_realfs() {
+        let root = tempfile::tempdir().unwrap();
+        let src_dir = root.path().join("src");
+        let dest = root.path().join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let jpg = src_dir.join("IMG_0700.JPG");
+        std::fs::write(&jpg, vec![1u8; 128]).unwrap();
+
+        let bucket = crate::model::BUCKET_KEEP;
+        let sidecar_path = dest.join(bucket).join("IMG_0700.xmp");
+        let op = ShotOp {
+            stem: "IMG_0700".into(),
+            bucket: bucket.into(),
+            moves: vec![FileMove {
+                from: jpg.clone(),
+                to: dest.join(bucket).join("IMG_0700.JPG"),
+            }],
+            write_sidecar: Some(SidecarWrite {
+                path: sidecar_path.clone(),
+                tags: vec!["portrait".into(), "golden-hour".into()],
+                rating: Some(3), // Keep → 3
+            }),
+            suffix: None,
+        };
+        let plan = plan_of(&dest, vec![op], 128);
+
+        let jpath = dest.join(".fastcull-apply.json");
+        let report = apply(&plan, &RealFs, &jpath).unwrap();
+
+        // File moved; fresh sidecar written into the bucket and counted.
+        assert!(dest.join(bucket).join("IMG_0700.JPG").exists());
+        assert!(!jpg.exists());
+        assert_eq!(report.sidecars_written, 1);
+        assert!(sidecar_path.exists());
+        let xmp = std::fs::read_to_string(&sidecar_path).unwrap();
+        assert!(xmp.contains("portrait"), "dc:subject keyword present");
+        assert!(xmp.contains("golden-hour"));
+        assert!(xmp.contains("3"), "xmp:Rating present");
+    }
+
+    // Controller-added (checklist: T11 must cover "sidecar write +
+    // skip-idempotent re-run"). Pins spec §8 rev-3: "on resume an
+    // already-present sidecar target is skipped, not clobbered and not an
+    // error." The pre-seeded sentinel file here stands in for the disk state
+    // a resumed run would find (a sidecar already published by an earlier,
+    // interrupted apply) — `apply` must treat it as a no-op skip, not a
+    // clobber and not a failure.
+    #[test]
+    fn apply_skips_existing_sidecar_target_never_clobbers_realfs() {
+        let root = tempfile::tempdir().unwrap();
+        let src_dir = root.path().join("src");
+        let dest = root.path().join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let jpg = src_dir.join("IMG_0701.JPG");
+        std::fs::write(&jpg, vec![2u8; 128]).unwrap();
+
+        let bucket = crate::model::BUCKET_KEEP;
+        let bucket_dir = dest.join(bucket);
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+        let sidecar_path = bucket_dir.join("IMG_0701.xmp");
+        let sentinel = "SENTINEL - user's existing sidecar";
+        std::fs::write(&sidecar_path, sentinel).unwrap();
+
+        let op = ShotOp {
+            stem: "IMG_0701".into(),
+            bucket: bucket.into(),
+            moves: vec![FileMove {
+                from: jpg.clone(),
+                to: dest.join(bucket).join("IMG_0701.JPG"),
+            }],
+            write_sidecar: Some(SidecarWrite {
+                path: sidecar_path.clone(),
+                tags: vec!["portrait".into()],
+                rating: Some(3),
+            }),
+            suffix: None,
+        };
+        let plan = plan_of(&dest, vec![op], 128);
+
+        let jpath = dest.join(".fastcull-apply.json");
+        let report = apply(&plan, &RealFs, &jpath).unwrap();
+
+        // An existing sidecar target is a SKIP, not an error.
+        assert_eq!(report.sidecars_written, 0);
+        // Never clobbered: byte-for-byte the sentinel the "user" already had.
+        let content = std::fs::read_to_string(&sidecar_path).unwrap();
+        assert_eq!(content, sentinel, "existing sidecar content untouched");
+        // The jpeg move itself still completed.
+        assert!(dest.join(bucket).join("IMG_0701.JPG").exists());
+        assert!(!jpg.exists());
+    }
 }
