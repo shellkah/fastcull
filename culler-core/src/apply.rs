@@ -99,11 +99,12 @@ fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), Apply
     })
 }
 
-/// Move one file same-FS (rename), mapping no-clobber `EEXIST` to `Collision`.
-/// (Cross-FS `EXDEV` handling is added in Task 5.)
+/// Move one file same-FS (rename), mapping no-clobber `EEXIST` to `Collision`,
+/// falling back to `move_cross_fs` on `EXDEV`.
 fn move_one(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
     match fs.rename_noreplace(from, to) {
         Ok(()) => Ok(()),
+        Err(e) if is_exdev(&e) => move_cross_fs(fs, from, to),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             Err(ApplyError::Collision(to.to_path_buf()))
         }
@@ -112,6 +113,113 @@ fn move_one(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
             source: e,
         }),
     }
+}
+
+fn is_exdev(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(rustix::io::Errno::XDEV.raw_os_error())
+}
+
+/// Hidden sibling partial path: `dir/.<name>.partial`.
+fn partial_path(to: &Path) -> PathBuf {
+    let name = to
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    to.with_file_name(format!(".{name}.partial"))
+}
+
+/// Cross-filesystem move. Source is never touched until the destination copy is
+/// fully copied, fsynced, length-verified, and atomically published.
+fn move_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
+    let partial = partial_path(to);
+    let _ = fs.remove_file(&partial); // clear a stale partial from a prior crash
+
+    // Copy source → partial (O_EXCL). Any error here leaves the SOURCE untouched.
+    let copied = match fs.copy_create_new(from, &partial) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs.remove_file(&partial);
+            return Err(ApplyError::Fs {
+                path: partial,
+                source: e,
+            });
+        }
+    };
+    if let Err(e) = fs.fsync_file(&partial) {
+        let _ = fs.remove_file(&partial);
+        return Err(ApplyError::Fs {
+            path: partial,
+            source: e,
+        });
+    }
+    // Verify byte length: file_len(dest) == file_len(src) (BLAKE3 is phase-2).
+    let dest_len = match fs.file_len(&partial) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs.remove_file(&partial);
+            return Err(ApplyError::Fs {
+                path: partial,
+                source: e,
+            });
+        }
+    };
+    let src_len = match fs.file_len(from) {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = fs.remove_file(&partial);
+            return Err(ApplyError::Fs {
+                path: from.to_path_buf(),
+                source: e,
+            });
+        }
+    };
+    if dest_len != src_len || copied != src_len {
+        let _ = fs.remove_file(&partial);
+        return Err(ApplyError::Fs {
+            path: partial,
+            source: io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("short copy: {dest_len} of {src_len} bytes"),
+            ),
+        });
+    }
+    // Publish partial → final (no clobber), THEN make the rename durable.
+    // ORDER MATTERS (spec §8 rev 3): the source unlink below happens on a
+    // DIFFERENT filesystem, so the rename's directory entry must be durable
+    // before the source disappears — power loss could otherwise persist the
+    // unlink while the rename is lost, leaving the data reachable only as a
+    // hidden `.partial`. (rev 2 fsynced the dir BEFORE the rename, which made
+    // the `.partial` entry durable instead of the final one.)
+    match fs.rename_noreplace(&partial, to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs.remove_file(&partial);
+            return Err(ApplyError::Collision(to.to_path_buf()));
+        }
+        Err(e) => {
+            let _ = fs.remove_file(&partial);
+            return Err(ApplyError::Fs {
+                path: to.to_path_buf(),
+                source: e,
+            });
+        }
+    }
+    if let Some(dir) = to.parent()
+        && let Err(e) = fs.fsync_dir(dir)
+    {
+        // The final is already published — do NOT touch it or the source if
+        // durability can't be proven. Stop loudly; worst case a duplicate
+        // (source + dest both present), never a loss.
+        return Err(ApplyError::Fs {
+            path: dir.to_path_buf(),
+            source: e,
+        });
+    }
+    // ONLY NOW remove the verified, durably-published source (the sole unlink in v1).
+    fs.remove_file(from).map_err(|e| ApplyError::Fs {
+        path: from.to_path_buf(),
+        source: e,
+    })
 }
 
 /// Execute (or resume) a journal: mkdir buckets, move each not-yet-`Done` file,
@@ -403,5 +511,70 @@ mod tests {
         assert!(jpath.exists(), "journal was written before the first move");
         let j: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
         assert_eq!(j.statuses, vec![OpState::Failed]);
+    }
+
+    #[test]
+    fn apply_cross_fs_copies_verifies_then_removes_source() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_0100",
+            BUCKET_BESTS,
+            &[("IMG_0100.JPG", 100), ("IMG_0100.CR3", 100)],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.set_free(u64::MAX); // preflight (Task 9) will pass
+        fs.set_cross_fs(true); // rename returns EXDEV → copy path
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let report = apply(&plan, &fs, &jpath).unwrap();
+        assert_eq!(report.moved_files, 2);
+
+        let jpg_final = dest.join(BUCKET_BESTS).join("IMG_0100.JPG");
+        let jpg_partial = dest.join(BUCKET_BESTS).join(".IMG_0100.JPG.partial");
+
+        // Final present + correct length; source removed; partial cleaned up.
+        assert_eq!(fs.len_of(&jpg_final), Some(100));
+        assert!(
+            !fs.exists(&PathBuf::from("/src/IMG_0100.JPG")),
+            "verified source removed"
+        );
+        assert!(
+            !fs.exists(&jpg_partial),
+            "partial published, not left behind"
+        );
+
+        // Durability ordering was exercised: partial fsynced, bucket dir fsynced.
+        assert!(fs.fsynced_files().contains(&jpg_partial));
+        assert!(fs.fsynced_dirs().contains(&dest.join(BUCKET_BESTS)));
+
+        // ORDER (spec §8 rev 3), asserted on the event log, not just membership:
+        // publish rename BEFORE the dir fsync, source unlink strictly last.
+        let ev = fs.events();
+        let pos = |needle: &str| {
+            ev.iter()
+                .position(|e| e == needle)
+                .unwrap_or_else(|| panic!("missing {needle} in {ev:?}"))
+        };
+        let publish = pos(&format!(
+            "rename:{}->{}",
+            jpg_partial.display(),
+            jpg_final.display()
+        ));
+        let dirsync = pos(&format!("fsync_dir:{}", dest.join(BUCKET_BESTS).display()));
+        let unlink = pos("remove:/src/IMG_0100.JPG");
+        assert!(
+            publish < dirsync,
+            "dir fsync must FOLLOW the publish rename: {ev:?}"
+        );
+        assert!(
+            dirsync < unlink,
+            "source unlink must follow the dir fsync: {ev:?}"
+        );
     }
 }
