@@ -115,11 +115,12 @@ fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), Apply
 /// journal is written via `std::fs`, not through `FsOps`), so nothing else in
 /// the test suite would catch a cadence regression.
 ///
-/// `moved_files` is always incremented immediately before this is called, so
-/// in practice the argument is always `>= 1`; `should_sync_journal(0)` is
-/// unreachable from `execute` today, but its value is pinned anyway
-/// (`is_multiple_of` treats 0 as a multiple of everything, so `true`) so a
-/// future caller can't silently inherit an unexamined edge case.
+/// Two call sites pass a post-increment count (`>= 1`); the fresh cross-FS
+/// `Published` checkpoint passes the PRE-increment count, so
+/// `should_sync_journal(0)` IS reachable there (first action of a run is a
+/// cross-FS publish) and returns `true` (`is_multiple_of` treats 0 as a
+/// multiple of everything) — one extra fsync, identical to the pre-extraction
+/// behavior. The unit test pins the 0 case so this edge stays examined.
 fn should_sync_journal(moved_files: usize) -> bool {
     moved_files.is_multiple_of(64)
 }
