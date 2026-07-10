@@ -101,6 +101,58 @@ fn decompress_scaled(jpeg: &[u8], denom: u8) -> Result<DecodedImage, DecodeError
     })
 }
 
+/// Aspect-preserving SIMD downscale of a straight-RGBA8 buffer. No-op if already the target size.
+fn resize_rgba(src: DecodedImage, tw: u32, th: u32) -> Result<DecodedImage, DecodeError> {
+    use fast_image_resize::images::Image;
+    use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+
+    if tw == src.w && th == src.h {
+        return Ok(src);
+    }
+    let src_img = Image::from_vec_u8(src.w, src.h, src.rgba, PixelType::U8x4)
+        .map_err(|e| DecodeError::Decode(e.to_string()))?;
+    let mut dst_img = Image::new(tw, th, PixelType::U8x4);
+    let mut resizer = Resizer::new();
+    resizer
+        .resize(
+            &src_img,
+            &mut dst_img,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)),
+        )
+        .map_err(|e| DecodeError::Decode(e.to_string()))?;
+    Ok(DecodedImage {
+        w: tw,
+        h: th,
+        rgba: dst_img.into_vec(),
+    })
+}
+
+/// Decode into a box: smallest turbojpeg scaled level >= box, then aspect-preserving
+/// SIMD downscale to fit. Never upscales. Orientation is applied by the caller.
+fn decode_fit(data: &[u8], fit_w: u32, fit_h: u32) -> Result<DecodedImage, DecodeError> {
+    let mut dec = turbojpeg::Decompressor::new().map_err(|e| DecodeError::Decode(e.to_string()))?;
+    let header = dec
+        .read_header(data)
+        .map_err(|e| DecodeError::Decode(e.to_string()))?;
+    let (bw, bh) = (fit_w as usize, fit_h as usize);
+
+    // Largest denom (smallest decoded image) whose scaled dims still cover the box; else full.
+    let mut denom = 1u8;
+    for &d in &[8u8, 4, 2, 1] {
+        if scaled_dim(header.width, d) >= bw && scaled_dim(header.height, d) >= bh {
+            denom = d;
+            break;
+        }
+    }
+
+    let decoded = decompress_scaled(data, denom)?;
+    let (sw, sh) = (decoded.w as f64, decoded.h as f64);
+    let scale = (bw as f64 / sw).min(bh as f64 / sh).min(1.0); // never upscale
+    let tw = ((sw * scale).round() as u32).max(1);
+    let th = ((sh * scale).round() as u32).max(1);
+    resize_rgba(decoded, tw, th)
+}
+
 /// Decode `path`'s JPEG at/around `target`, returning straight RGBA8.
 /// (Fit and EXIF orientation land in later tasks.)
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
@@ -111,7 +163,7 @@ pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeErr
             1 | 2 | 4 | 8 => decompress_scaled(&data, n),
             _ => Err(DecodeError::Decode(format!("unsupported scale 1/{n}"))),
         },
-        TargetSize::Fit(_, _) => Err(DecodeError::Decode("Fit not yet implemented".to_string())),
+        TargetSize::Fit(w, h) => decode_fit(&data, w, h),
     }
 }
 
@@ -233,5 +285,20 @@ mod tests {
             decode(&path, TargetSize::Scaled(3)),
             Err(DecodeError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn decode_fit_downscales_within_box() {
+        let jpeg = synth_jpeg(64, 48);
+        let (_dir, path) = write_temp_jpeg(&jpeg);
+        // 64x48 into a 32x32 box: aspect-preserving scale = 0.5 -> 32x24.
+        let img = decode(&path, TargetSize::Fit(32, 32)).expect("fit");
+        assert_eq!((img.w, img.h), (32, 24));
+        assert!(img.w <= 32 && img.h <= 32, "must fit inside the box");
+        assert_eq!(img.rgba.len(), 32 * 24 * 4);
+
+        // A box bigger than the image never upscales.
+        let big = decode(&path, TargetSize::Fit(200, 200)).expect("fit big");
+        assert_eq!((big.w, big.h), (64, 48));
     }
 }
