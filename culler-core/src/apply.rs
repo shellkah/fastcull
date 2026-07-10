@@ -9,11 +9,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::fsops::FsOps;
-use crate::plan::ApplyPlan;
+use crate::plan::{ApplyPlan, FileMove};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum OpState {
     Pending,
+    /// Cross-FS only (spec §8 rev 4): the publish rename succeeded — the
+    /// destination is definitively ours — but the source unlink is still
+    /// owed. Resume completes the unlink rather than re-copying into its own
+    /// finished copy; same-FS moves never enter this state. Additive variant:
+    /// older journals serialize only `Pending`/`Done`/`Failed` and still
+    /// parse (see `journal_with_only_pre_published_variant_names_parses`).
+    Published,
     Done,
     Failed,
 }
@@ -99,12 +106,24 @@ fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), Apply
     })
 }
 
+/// Outcome of `move_one`: whether the move finished immediately (same-FS
+/// rename) or only reached the cross-FS "published" checkpoint, where the
+/// destination copy is durably renamed into place but the source unlink is
+/// still owed (spec §8 rev 4 — see `OpState::Published`). Same-FS moves never
+/// produce `Published`; there is no window for it to close.
+enum MoveOutcome {
+    Moved,
+    Published,
+}
+
 /// Move one file same-FS (rename), mapping no-clobber `EEXIST` to `Collision`,
-/// falling back to `move_cross_fs` on `EXDEV`.
-fn move_one(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
+/// falling back to the cross-FS publish path (`publish_cross_fs`) on `EXDEV`.
+/// A cross-FS move stops at `Published` — the caller (`execute`) journals
+/// that checkpoint before finishing the source unlink via `finish_cross_fs`.
+fn move_one(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<MoveOutcome, ApplyError> {
     match fs.rename_noreplace(from, to) {
-        Ok(()) => Ok(()),
-        Err(e) if is_exdev(&e) => move_cross_fs(fs, from, to),
+        Ok(()) => Ok(MoveOutcome::Moved),
+        Err(e) if is_exdev(&e) => publish_cross_fs(fs, from, to).map(|()| MoveOutcome::Published),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             Err(ApplyError::Collision(to.to_path_buf()))
         }
@@ -128,9 +147,17 @@ fn partial_path(to: &Path) -> PathBuf {
     to.with_file_name(format!(".{name}.partial"))
 }
 
-/// Cross-filesystem move. Source is never touched until the destination copy is
-/// fully copied, fsynced, length-verified, and atomically published.
-fn move_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
+/// Cross-filesystem publish: copy source → partial, fsync, verify byte
+/// length, then publish `.partial` → final with NOREPLACE. Source is never
+/// touched until the destination copy is fully copied, fsynced,
+/// length-verified, and atomically published; a mid-copy failure leaves the
+/// source untouched and cleans up the partial. Stops as soon as the publish
+/// rename succeeds — the caller journals `Published` (dest is definitively
+/// ours) before calling `finish_cross_fs` to fsync the directory and remove
+/// the source. Splitting the checkpoint out here is what spec §8 rev 4 needs:
+/// a crash in the publish→unlink window resumes by finishing the unlink,
+/// never by re-copying into this function's own already-published copy.
+fn publish_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
     let partial = partial_path(to);
     let _ = fs.remove_file(&partial); // clear a stale partial from a prior crash
 
@@ -183,43 +210,86 @@ fn move_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyErro
             ),
         });
     }
-    // Publish partial → final (no clobber), THEN make the rename durable.
-    // ORDER MATTERS (spec §8 rev 3): the source unlink below happens on a
-    // DIFFERENT filesystem, so the rename's directory entry must be durable
-    // before the source disappears — power loss could otherwise persist the
-    // unlink while the rename is lost, leaving the data reachable only as a
-    // hidden `.partial`. (rev 2 fsynced the dir BEFORE the rename, which made
-    // the `.partial` entry durable instead of the final one.)
+    // Publish partial → final (no clobber). Once this succeeds the
+    // destination is DEFINITIVELY ours: the caller journals `Published`
+    // immediately, then `finish_cross_fs` fsyncs the directory and removes
+    // the source (spec §8 rev 3/4 — the dir fsync must not happen before
+    // this rename; rev 2 fsynced the dir first, which made the `.partial`
+    // entry durable instead of the final one).
     match fs.rename_noreplace(&partial, to) {
-        Ok(()) => {}
+        Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             let _ = fs.remove_file(&partial);
-            return Err(ApplyError::Collision(to.to_path_buf()));
+            Err(ApplyError::Collision(to.to_path_buf()))
         }
         Err(e) => {
             let _ = fs.remove_file(&partial);
-            return Err(ApplyError::Fs {
+            Err(ApplyError::Fs {
                 path: to.to_path_buf(),
                 source: e,
-            });
+            })
         }
     }
+}
+
+/// Finish a durably-`Published` cross-FS move: fsync the destination
+/// directory (durability of the publish rename — the source unlink below
+/// happens on a *different* filesystem, so this must come first, spec §8 rev
+/// 3), then remove the source. A dir-fsync failure stops loudly without
+/// touching the source or the destination — worst case a duplicate (source +
+/// dest both present), never a loss. A `NotFound` on the source removal is
+/// treated as already-completed rather than an error: `reconcile` only ever
+/// leaves a `Published` entry for `execute` to finish when the source is
+/// still present (source-gone reconciles straight to `Done`), so by the time
+/// this runs NotFound means the unlink already happened (e.g. a re-resumed
+/// run) — disclosed choice, spec rev 4.
+fn finish_cross_fs(fs: &dyn FsOps, from: &Path, to: &Path) -> Result<(), ApplyError> {
     if let Some(dir) = to.parent()
         && let Err(e) = fs.fsync_dir(dir)
     {
-        // The final is already published — do NOT touch it or the source if
-        // durability can't be proven. Stop loudly; worst case a duplicate
-        // (source + dest both present), never a loss.
         return Err(ApplyError::Fs {
             path: dir.to_path_buf(),
             source: e,
         });
     }
-    // ONLY NOW remove the verified, durably-published source (the sole unlink in v1).
-    fs.remove_file(from).map_err(|e| ApplyError::Fs {
-        path: from.to_path_buf(),
-        source: e,
-    })
+    match fs.remove_file(from) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ApplyError::Fs {
+            path: from.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+/// Finish an entry already sitting at `Published` (either just reached this
+/// run, or found that way on resume): fsync the dest dir + remove the source
+/// via `finish_cross_fs`, then mark `Done` and journal it (batched, same
+/// policy as every other Done write) — counted in `moved_files` (spec §8 rev
+/// 4: "a move brought to Done this run"). A finish-stage failure re-writes
+/// `Published` as the durable stop record (forced sync): `Published` is
+/// ALREADY the correct record here (the dest is definitively ours), so
+/// downgrading to `Failed` would erase that fact and strand a future resume
+/// in the duplicate-stop check.
+fn finish_published(
+    fs: &dyn FsOps,
+    mv: &FileMove,
+    journal: &mut Journal,
+    gidx: usize,
+    journal_path: &Path,
+    report: &mut ApplyReport,
+) -> Result<(), ApplyError> {
+    match finish_cross_fs(fs, &mv.from, &mv.to) {
+        Ok(()) => {
+            journal.statuses[gidx] = OpState::Done;
+            report.moved_files += 1;
+            write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))
+        }
+        Err(e) => {
+            let _ = write_journal(journal, journal_path, true); // durable Published stop record
+            Err(e)
+        }
+    }
 }
 
 /// Execute (or resume) a journal: mkdir buckets, move each not-yet-`Done` file,
@@ -247,19 +317,38 @@ fn execute(
 
     for op in &ops {
         for mv in &op.moves {
-            if journal.statuses[gidx] == OpState::Done {
-                gidx += 1;
-                continue;
+            match journal.statuses[gidx] {
+                OpState::Done => {
+                    gidx += 1;
+                    continue;
+                }
+                OpState::Published => {
+                    // Resumed mid publish→unlink window (spec §8 rev 4): the
+                    // destination is already durably ours — finish the source
+                    // unlink, do NOT re-copy.
+                    finish_published(fs, mv, journal, gidx, journal_path, &mut report)?;
+                    gidx += 1;
+                    continue;
+                }
+                OpState::Pending | OpState::Failed => {}
             }
             match move_one(fs, &mv.from, &mv.to) {
-                Ok(()) => {
+                Ok(MoveOutcome::Moved) => {
                     journal.statuses[gidx] = OpState::Done;
                     report.moved_files += 1;
                     // Persist progress incrementally; fsync only every 64th move
                     // (and at checkpoints) — reconciliation (Task 8) makes an
                     // unsynced tail harmless, and this doubles as the progress
                     // feed the Phase-6 UI polls from a worker thread.
-                    write_journal(journal, journal_path, report.moved_files % 64 == 0)?;
+                    write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))?;
+                }
+                Ok(MoveOutcome::Published) => {
+                    // Publish rename just succeeded: journal the checkpoint
+                    // (existing batched-fsync policy, unchanged) BEFORE
+                    // finishing the unlink — spec §8 rev 4.
+                    journal.statuses[gidx] = OpState::Published;
+                    write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))?;
+                    finish_published(fs, mv, journal, gidx, journal_path, &mut report)?;
                 }
                 Err(e) => {
                     journal.statuses[gidx] = OpState::Failed;
@@ -326,8 +415,10 @@ fn preflight(plan: &ApplyPlan, fs: &dyn FsOps) -> Result<(), ApplyError> {
     Ok(())
 }
 
-/// Journals the plan FIRST, then executes each `ShotOp` group. Same-FS only in
-/// Task 3; cross-FS + preflight land in Tasks 5 and 9.
+/// Journals the plan FIRST, then executes each `ShotOp` group group-atomically
+/// (same-FS rename, or cross-FS copy→publish→`Published`-checkpoint→unlink,
+/// spec §8 rev 4). On full success the journal file is removed (FastCull
+/// metadata, not user data). See `resume` for how a crashed run picks back up.
 pub fn apply(
     plan: &ApplyPlan,
     fs: &dyn FsOps,
@@ -376,17 +467,28 @@ fn read_journal(path: &Path) -> Result<Journal, ApplyError> {
 }
 
 /// The crash window can strand the journal on either side of reality (spec §8
-/// rev 3). Reconcile it against the observable filesystem BEFORE executing:
+/// rev 3/4). Reconcile it against the observable filesystem BEFORE executing:
 ///  - `Pending`/`Failed` move whose source is GONE and destination EXISTS →
 ///    the crashed run already did it: mark `Done` (a re-run would fail ENOENT
 ///    or, worse, surface its own work as a Collision).
 ///  - `Done` move whose destination is MISSING while the source still exists →
 ///    the journal outran a lost rename: mark `Pending`, re-execute.
+///  - `Published` move whose source is GONE (either destination state) →
+///    the crashed run finished the unlink too: mark `Done` (rev 4).
+///  - `Published` move whose source is present and destination MISSING →
+///    a `Published` record vouching for an observably-absent destination
+///    vouches for nothing: demote to `Pending` so it re-copies (the
+///    stale-partial pre-clean in `publish_cross_fs` handles any leftover);
+///    this is the controller-specified safety guard (rev 4).
+///  - `Published` move whose source AND destination are both present is left
+///    alone — `execute` finishes it (fsync dir, remove source) without
+///    re-copying.
 ///
 /// Anything else is left alone: a `Pending`/`Failed` cell surfaces loudly
-/// through the normal NOREPLACE/ENOENT paths; a `Done` entry whose source and
-/// destination are both absent stays skipped — nothing recoverable exists on
-/// disk.
+/// through the normal NOREPLACE/ENOENT paths (or, for `Pending`, through the
+/// duplicate-aware loud stop in `resume` when both source and dest are
+/// present); a `Done` entry whose source and destination are both absent
+/// stays skipped — nothing recoverable exists on disk.
 fn reconcile(journal: &mut Journal, fs: &dyn FsOps) {
     let mut gidx = 0usize;
     let ops = journal.plan.ops.clone();
@@ -401,6 +503,12 @@ fn reconcile(journal: &mut Journal, fs: &dyn FsOps) {
                 OpState::Done if !dst && src => {
                     journal.statuses[gidx] = OpState::Pending;
                 }
+                OpState::Published if !src => {
+                    journal.statuses[gidx] = OpState::Done;
+                }
+                OpState::Published if src && !dst => {
+                    journal.statuses[gidx] = OpState::Pending;
+                }
                 _ => {}
             }
             gidx += 1;
@@ -408,14 +516,49 @@ fn reconcile(journal: &mut Journal, fs: &dyn FsOps) {
     }
 }
 
+/// After reconciliation, refuse a resume that would unlink a source without a
+/// durable record vouching for its destination (spec §8 rev 4): any
+/// still-`Pending` move whose source AND destination BOTH exist is the one
+/// state reconciliation cannot disambiguate (a foreign file appeared, or a
+/// `Published` journal record was lost to the batched-fsync window) — it is a
+/// loud stop naming the destination as a possible prior-run completed copy,
+/// returned WITHOUT executing anything. `Failed` entries are not scanned
+/// here: only `Pending` (untried-this-run) carries this specific ambiguity.
+fn check_no_unvouched_duplicates(journal: &Journal, fs: &dyn FsOps) -> Result<(), ApplyError> {
+    let mut gidx = 0usize;
+    for op in &journal.plan.ops {
+        for mv in &op.moves {
+            if journal.statuses[gidx] == OpState::Pending
+                && fs.file_len(&mv.from).is_ok()
+                && fs.file_len(&mv.to).is_ok()
+            {
+                return Err(ApplyError::Preflight(format!(
+                    "resume refused: {} already exists and its source is still present — \
+                     this may be a completed copy from the prior run; verify and resolve \
+                     manually before retrying (resume never unlinks a source without a \
+                     durable record vouching for its destination)",
+                    mv.to.display()
+                )));
+            }
+            gidx += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Resume a crashed/aborted run from its journal: reconcile against the disk
-/// (rev 3), skip `Done` moves, continue the rest; the journal is removed on
-/// success by `execute`. Detected + offered on next launch (the offer UX is
-/// Phase 6). Does not re-run the free-space preflight — the journal is trusted
-/// as the source of truth for WHAT to do; the disk for what already happened.
+/// (rev 3/4 — see `reconcile`), refuse loudly on an unvouched duplicate (see
+/// `check_no_unvouched_duplicates`), then skip `Done` moves and continue the
+/// rest; the journal is removed on success by `execute`. Detected + offered
+/// on next launch (the offer UX is Phase 6). Does not re-run the free-space
+/// preflight — the journal is trusted as the source of truth for WHAT to do;
+/// the disk for what already happened. A fresh `apply()` never reaches this
+/// scan — a fresh-run collision still surfaces as `ApplyError::Collision` via
+/// NOREPLACE.
 pub fn resume(journal_path: &Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError> {
     let mut journal = read_journal(journal_path)?;
     reconcile(&mut journal, fs);
+    check_no_unvouched_duplicates(&journal, fs)?;
     execute(&mut journal, fs, journal_path)
 }
 
@@ -1195,6 +1338,251 @@ mod tests {
             Some(100)
         );
         assert!(fs.exists(&PathBuf::from("/src/IMG_0601.JPG")));
+    }
+
+    // ---- F3 (Phase 4 follow-up): OpState::Published closes the cross-FS
+    // publish→unlink resume window (spec rev 4). ----
+
+    // Extends the scenario in `cross_fs_permission_on_source_remove_surfaces_
+    // but_copy_is_published` (kept untouched above): now that the finish
+    // stage durably records `Published` (not `Failed`) as the stop record,
+    // resuming from it must heal by finishing the unlink WITHOUT re-copying —
+    // this is the exact healing the rev-4 finding motivated.
+    #[test]
+    fn cross_fs_permission_on_source_remove_leaves_published_stop_record_and_resume_heals() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0805", BUCKET_KEEP, &[("IMG_0805.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.set_cross_fs(true);
+        fs.set_free(u64::MAX);
+        fs.deny_remove("/src/IMG_0805.JPG"); // finish-stage unlink denied
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(matches!(err, ApplyError::Fs { .. }));
+
+        // The durable stop record is Published, NOT Failed: the dest is
+        // already ours, so downgrading to Failed here would erase that fact
+        // and strand resume in the duplicate-stop check.
+        let j: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
+        assert_eq!(j.statuses, vec![OpState::Published]);
+
+        // Clear the fault and resume: heals by finishing the unlink only —
+        // no re-copy, no re-rename. Snapshot the event count first — the
+        // initial (crashed) run already logged its own copy/rename, and this
+        // assertion is about what the RESUME does, not the whole history.
+        let events_before_resume = fs.events().len();
+        fs.clear_faults();
+        let report = resume(&jpath, &fs).unwrap();
+        assert_eq!(report.moved_files, 1);
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0805.JPG")));
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0805.JPG")),
+            Some(100)
+        );
+        assert!(!jpath.exists(), "journal retired once the resume completes");
+
+        let ev = fs.events();
+        let resume_ev = &ev[events_before_resume..];
+        assert!(
+            !resume_ev
+                .iter()
+                .any(|e| e.starts_with("copy:") || e.starts_with("rename:")),
+            "resume must not re-copy or re-rename a Published move: {resume_ev:?}"
+        );
+    }
+
+    #[test]
+    fn resume_completes_a_published_cross_fs_move_without_recopying() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0800", BUCKET_KEEP, &[("IMG_0800.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // Crashed exactly in the publish→unlink window: both source and
+        // destination are present, and the journal (written raw, as a crash
+        // would leave it) already recorded Published.
+        fs.seed_file("/src/IMG_0800.JPG", 100);
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0800.JPG"), 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Published],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let report = resume(&jpath, &fs).unwrap();
+
+        assert_eq!(report.moved_files, 1);
+        assert!(
+            !fs.exists(&PathBuf::from("/src/IMG_0800.JPG")),
+            "source removed to finish the publish"
+        );
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0800.JPG")),
+            Some(100),
+            "dest intact at its seeded length — never re-copied"
+        );
+        assert!(!jpath.exists(), "journal retired on success");
+
+        // No copy/rename happened this run — only the finish-stage ops.
+        let ev = fs.events();
+        assert!(
+            !ev.iter()
+                .any(|e| e.starts_with("copy:") || e.starts_with("rename:")),
+            "must not re-copy or re-rename: {ev:?}"
+        );
+        assert!(ev.iter().any(|e| e.starts_with("fsync_dir:")));
+        assert!(ev.iter().any(|e| e.starts_with("remove:")));
+    }
+
+    #[test]
+    fn published_with_source_already_gone_marks_done_without_touching_disk() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0801", BUCKET_KEEP, &[("IMG_0801.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // Source already gone (the crashed run's unlink DID land); dest present.
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0801.JPG"), 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Published],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let report = resume(&jpath, &fs).unwrap();
+
+        assert_eq!(
+            report.moved_files, 0,
+            "already-completed work is not recounted"
+        );
+        assert!(
+            fs.events().is_empty(),
+            "reconcile marks it Done directly — no disk operation needed"
+        );
+        assert!(!jpath.exists());
+    }
+
+    #[test]
+    fn published_with_dest_missing_reexecutes_the_copy_safety_guard() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0802", BUCKET_KEEP, &[("IMG_0802.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // Source present, dest MISSING: a Published record vouching for a
+        // destination that isn't observably there vouches for nothing.
+        fs.seed_file("/src/IMG_0802.JPG", 100);
+        fs.set_cross_fs(true); // a Published record only ever originates cross-FS
+        fs.set_free(u64::MAX);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Published],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let report = resume(&jpath, &fs).unwrap();
+
+        assert_eq!(report.moved_files, 1, "re-executed as a fresh copy");
+        assert!(
+            !fs.exists(&PathBuf::from("/src/IMG_0802.JPG")),
+            "source consumed by the re-executed copy"
+        );
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0802.JPG")),
+            Some(100),
+            "dest recreated"
+        );
+        assert!(!jpath.exists());
+    }
+
+    #[test]
+    fn resume_refuses_pending_move_with_both_source_and_dest_present() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0803", BUCKET_KEEP, &[("IMG_0803.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        fs.seed_file("/src/IMG_0803.JPG", 100);
+        let target = dest.join(BUCKET_KEEP).join("IMG_0803.JPG");
+        fs.seed_file(target.clone(), 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Pending],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let err = resume(&jpath, &fs).unwrap_err();
+        match err {
+            ApplyError::Preflight(msg) => {
+                assert!(
+                    msg.contains(&target.display().to_string()),
+                    "message names the dest path: {msg}"
+                );
+                assert!(
+                    msg.contains("prior run") && msg.contains("verify"),
+                    "message directs the user to verify/resolve a possible prior-run copy: {msg}"
+                );
+            }
+            other => panic!("expected ApplyError::Preflight, got {other:?}"),
+        }
+
+        assert!(
+            fs.events().is_empty(),
+            "nothing executed once the duplicate is detected"
+        );
+        let on_disk: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.statuses,
+            vec![OpState::Pending],
+            "journal left untouched on disk"
+        );
+    }
+
+    #[test]
+    fn journal_with_only_pre_published_variant_names_parses() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_0804",
+            BUCKET_KEEP,
+            &[
+                ("IMG_0804.JPG", 100),
+                ("IMG_0804.CR3", 100),
+                ("IMG_0804.xmp", 100),
+            ],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1); // 3 moves total
+
+        // The exact on-disk shape a pre-rev-4 journal would have: only the
+        // three old variant names, never "Published".
+        let plan_json = serde_json::to_value(&plan).unwrap();
+        let raw = serde_json::json!({
+            "plan": plan_json,
+            "statuses": ["Pending", "Done", "Failed"],
+        });
+        let parsed: Journal = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            parsed.statuses,
+            vec![OpState::Pending, OpState::Done, OpState::Failed]
+        );
     }
 
     // Task 11: sidecar writes are real filesystem I/O (they do NOT route
