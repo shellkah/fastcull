@@ -77,6 +77,12 @@ fn total_move_count(plan: &ApplyPlan) -> usize {
 /// `resume`'s reconciliation (Task 8) makes an unsynced tail harmless, so
 /// per-move fsync (brutal on multi-thousand-file shoots) is unnecessary.
 fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), ApplyError> {
+    // Test-only observation of the `sync` flag actually used on this call
+    // (no-op / inlined away outside `#[cfg(test)]` builds) — see
+    // `journal_write_log` below. The journal is real `std::fs` I/O, never
+    // routed through `FsOps`/`FakeFs`, so this is the only way a test can
+    // see which calls were synced.
+    record_journal_write(sync, &journal.statuses);
     let bytes = serde_json::to_vec(journal).map_err(|e| ApplyError::Fs {
         path: path.to_path_buf(),
         source: io::Error::other(e),
@@ -107,6 +113,42 @@ fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), Apply
     })
 }
 
+/// Test-only seam for `write_journal`, mirroring `xmp::test_hooks`: nothing
+/// else in the suite can observe the `sync` flag a real journal write used,
+/// because the journal is written via `std::fs`, never routed through
+/// `FsOps`/`FakeFs` (see `write_journal`'s doc comment above). A thread-local
+/// log records every call's `sync` flag alongside a snapshot of
+/// `journal.statuses` taken at call time — a plain reference would go stale,
+/// since later calls mutate the same `Journal` in place. All state is
+/// thread-local; libtest runs each test on its own thread, so tests never
+/// observe each other's log.
+#[cfg(test)]
+mod journal_write_log {
+    use super::OpState;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOG: RefCell<Vec<(bool, Vec<OpState>)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub fn record(sync: bool, statuses: &[OpState]) {
+        LOG.with(|l| l.borrow_mut().push((sync, statuses.to_vec())));
+    }
+
+    /// Drain and return every call recorded on this thread so far, in call
+    /// order. Reset-on-read, so a test that drains once before calling
+    /// `apply`/`resume` starts from an empty log regardless of what ran
+    /// earlier on this thread.
+    pub fn take() -> Vec<(bool, Vec<OpState>)> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+}
+#[cfg(test)]
+use journal_write_log::record as record_journal_write;
+#[cfg(not(test))]
+#[inline(always)]
+fn record_journal_write(_sync: bool, _statuses: &[OpState]) {}
+
 /// Batched-fsync cadence for the incremental (non-checkpoint) journal writes
 /// in `execute`/`finish_published`: sync every 64th move. Extracted to a pure
 /// predicate (F5/F6, Phase 4 follow-up) so a one-character typo here — `%46`,
@@ -115,12 +157,15 @@ fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), Apply
 /// journal is written via `std::fs`, not through `FsOps`), so nothing else in
 /// the test suite would catch a cadence regression.
 ///
-/// Two call sites pass a post-increment count (`>= 1`); the fresh cross-FS
-/// `Published` checkpoint passes the PRE-increment count, so
-/// `should_sync_journal(0)` IS reachable there (first action of a run is a
-/// cross-FS publish) and returns `true` (`is_multiple_of` treats 0 as a
-/// multiple of everything) — one extra fsync, identical to the pre-extraction
-/// behavior. The unit test pins the 0 case so this edge stays examined.
+/// Only two call sites remain: `execute`'s Moved arm and `finish_published`'s
+/// Done write, both post-increment (`>= 1`). The fresh cross-FS `Published`
+/// checkpoint (`execute`'s Published arm) no longer calls this predicate at
+/// all — it force-syncs unconditionally (Task 0b), so a crash in the
+/// publish→unlink window can heal on resume (finish the unlink) instead of
+/// hitting the loud duplicate-aware stop. So `should_sync_journal(0)` is NOT
+/// reachable from production today; the unit test below still pins the 0
+/// case as a pure-predicate edge, in case a future call site ever feeds it a
+/// pre-increment count again.
 fn should_sync_journal(moved_files: usize) -> bool {
     moved_files.is_multiple_of(64)
 }
@@ -394,15 +439,18 @@ fn execute(
                     )?;
                 }
                 Ok(MoveOutcome::Published) => {
-                    // Publish rename just succeeded: journal the checkpoint
-                    // (existing batched-fsync policy, unchanged) BEFORE
-                    // finishing the unlink — spec §8 rev 4.
+                    // Publish rename just succeeded: force-sync the journal
+                    // at this checkpoint (Task 0b — was the batched-fsync
+                    // policy) BEFORE finishing the unlink — spec §8 rev 4. A
+                    // durable `Published` record means a crash in the
+                    // publish→unlink window heals on resume (finishes the
+                    // unlink — see `reconcile`'s and this function's own
+                    // `Published` arms) instead of hitting the loud
+                    // duplicate-aware stop in `check_no_unvouched_duplicates`;
+                    // one extra fsync per cross-FS file is marginal next to
+                    // the full file copy that just preceded it.
                     journal.statuses[gidx] = OpState::Published;
-                    write_journal(
-                        journal,
-                        journal_path,
-                        should_sync_journal(report.moved_files),
-                    )?;
+                    write_journal(journal, journal_path, true)?;
                     finish_published(fs, mv, journal, gidx, journal_path, &mut report)?;
                     shot_did_work = true;
                 }
@@ -1239,6 +1287,78 @@ mod tests {
         // every call site), but pinned anyway: `is_multiple_of` treats 0 as a
         // multiple of everything, so `should_sync_journal(0)` is `true`.
         assert!(should_sync_journal(0));
+    }
+
+    // Task 0b (carry-forward from Phase 4's final review): the fresh cross-FS
+    // `Published` checkpoint in `execute` must force-sync the journal
+    // (`write_journal(.., true)`) instead of going through the batched
+    // `should_sync_journal` cadence — a durable `Published` record lets a
+    // crash in the publish→unlink window heal on resume (finish the unlink)
+    // instead of hitting the loud duplicate-aware stop.
+    //
+    // Mutation-kill argument: reverting the fix to
+    // `should_sync_journal(report.moved_files)` would only be caught if the
+    // checkpoint lands at a `moved_files` count the predicate says `false`
+    // for — i.e. anything NOT a multiple of 64 (0 included: `is_multiple_of`
+    // treats 0 as a multiple of everything, so `should_sync_journal(0)` is
+    // `true` and would silently mask the mutant). This plan puts a same-FS
+    // move BEFORE the cross-FS one, so `moved_files == 1` at the checkpoint —
+    // `should_sync_journal(1) == false`. The mutant then writes the
+    // `Published` record unsynced; the fix writes it synced. `FakeFs` can't
+    // observe the journal's sync flag directly (real `std::fs`, not routed
+    // through `FsOps`), so the test reads it back via the `journal_write_log`
+    // test-only recorder seam on `write_journal`.
+    #[test]
+    fn published_checkpoint_is_force_synced_off_the_64th_move_boundary() {
+        let dest = PathBuf::from("/dst");
+        let bucket = BUCKET_KEEP;
+
+        // Shot A: dest-internal move — `from` and `to` share dest's first
+        // path component ("dst"), so FakeFs's per-root device model treats
+        // it as same-FS even with `cross_fs` injection armed. This is what
+        // bumps `moved_files` to 1 BEFORE the checkpoint we're pinning.
+        let shot_a = ShotOp {
+            stem: "A".into(),
+            bucket: bucket.into(),
+            moves: vec![FileMove {
+                from: dest.join("A.JPG"),
+                to: dest.join(bucket).join("A.JPG"),
+            }],
+            write_sidecar: None,
+            suffix: None,
+        };
+        // Shot B: genuinely cross-FS (`/src` vs `/dst` — different first path
+        // component) — this is the move that reaches `Published`.
+        let (shot_b, bytes_b) = shot("B", bucket, &[("B.JPG", 100)], &dest);
+
+        let plan = plan_of(&dest, vec![shot_a, shot_b], 100 + bytes_b);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops); // seeds /dst/A.JPG and /src/B.JPG
+        fs.set_cross_fs(true);
+        fs.set_free(u64::MAX);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let _ = journal_write_log::take(); // reset: drop anything left on this thread
+        let report = apply(&plan, &fs, &jpath).unwrap();
+        let log = journal_write_log::take();
+
+        assert_eq!(report.moved_files, 2, "both shots' files moved this run");
+
+        // The one recorded write whose statuses snapshot shows the SECOND
+        // move (global index 1, shot B's only file) freshly `Published` —
+        // `Pending` before it, `Done` after `finish_published` runs — is
+        // exactly the checkpoint this test pins.
+        let checkpoint = log
+            .iter()
+            .find(|(_, statuses)| statuses.get(1) == Some(&OpState::Published))
+            .expect("a write_journal call recorded the fresh Published checkpoint");
+        assert!(
+            checkpoint.0,
+            "the fresh cross-FS Published checkpoint must be force-synced, got: {log:?}"
+        );
     }
 
     // Supervisor-verified finding (Phase 4 follow-up F1): a journal that parses
