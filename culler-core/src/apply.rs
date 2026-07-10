@@ -936,4 +936,64 @@ mod tests {
         assert!(!fs.exists(&dest.join(BUCKET_KEEP).join("IMG_0502.JPG")));
         assert!(!fs.exists(&dest.join(BUCKET_KEEP).join(".IMG_0502.JPG.partial")));
     }
+
+    #[test]
+    fn permission_error_is_surfaced_per_file() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0600", BUCKET_KEEP, &[("IMG_0600.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_rename_from("/src/IMG_0600.JPG");
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        match err {
+            ApplyError::Fs { path, source } => {
+                assert_eq!(path, PathBuf::from("/src/IMG_0600.JPG"));
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected Fs error, got {other:?}"),
+        }
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_0600.JPG")),
+            "no data lost"
+        );
+    }
+
+    #[test]
+    fn cross_fs_permission_on_source_remove_surfaces_but_copy_is_published() {
+        // The verified copy is already published to dest before source removal;
+        // a permission error on the final unlink surfaces the source path.
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0601", BUCKET_KEEP, &[("IMG_0601.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.set_cross_fs(true);
+        fs.set_free(u64::MAX);
+        fs.deny_remove("/src/IMG_0601.JPG"); // final unlink denied
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        match err {
+            ApplyError::Fs { path, source } => {
+                assert_eq!(path, PathBuf::from("/src/IMG_0601.JPG"));
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected Fs error, got {other:?}"),
+        }
+        // Copy is durably published; source lingers (a duplicate, never a loss).
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0601.JPG")),
+            Some(100)
+        );
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0601.JPG")));
+    }
 }
