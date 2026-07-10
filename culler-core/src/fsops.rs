@@ -205,6 +205,53 @@ mod tests {
         assert!(fs.exists(&PathBuf::from("/src/b.jpg")));
         assert!(!fs.exists(&PathBuf::from("/dst/b.partial")));
     }
+
+    /// Pins the device-aware cross-FS model (fix for the Task-2/Task-5 plan
+    /// defect): `cross_fs` injection models per-root "devices", not a single
+    /// global EXDEV switch, so a same-root publish rename (`.partial` -> final,
+    /// both inside one dest bucket dir) succeeds even while cross-FS faults
+    /// are armed for the initial source->dest hop.
+    #[test]
+    fn fake_cross_fs_models_per_root_devices() {
+        let fs = FakeFs::new();
+        fs.seed_file("/src/a.jpg", 5);
+        fs.seed_file("/dst/x.partial", 7);
+        fs.set_cross_fs(true);
+
+        // (a) Rename across roots still fails EXDEV, source untouched.
+        let e = fs
+            .rename_noreplace(&PathBuf::from("/src/a.jpg"), &PathBuf::from("/other/a.jpg"))
+            .unwrap_err();
+        assert_eq!(
+            e.raw_os_error(),
+            Some(rustix::io::Errno::XDEV.raw_os_error())
+        );
+        assert!(
+            fs.exists(&PathBuf::from("/src/a.jpg")),
+            "source untouched on EXDEV"
+        );
+
+        // (b) Rename WITHIN the same root (dest-internal publish rename) succeeds.
+        fs.rename_noreplace(
+            &PathBuf::from("/dst/x.partial"),
+            &PathBuf::from("/dst/y.jpg"),
+        )
+        .unwrap();
+        assert!(!fs.exists(&PathBuf::from("/dst/x.partial")));
+        assert_eq!(fs.len_of(&PathBuf::from("/dst/y.jpg")), Some(7));
+
+        // (c) same_filesystem follows the same per-root device model.
+        assert!(
+            fs.same_filesystem(&PathBuf::from("/dst/a"), &PathBuf::from("/dst/b"))
+                .unwrap(),
+            "same root => same device"
+        );
+        assert!(
+            !fs.same_filesystem(&PathBuf::from("/src/a"), &PathBuf::from("/dst/b"))
+                .unwrap(),
+            "different roots => different device"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +294,19 @@ pub(crate) mod fake {
     }
     fn enospc() -> io::Error {
         io::Error::from_raw_os_error(rustix::io::Errno::NOSPC.raw_os_error())
+    }
+
+    /// The "device" of a path in this fake's cross-FS model: its first
+    /// non-root path component (e.g. `/src/a.jpg` -> `src`, `/dst/04_bests/x`
+    /// -> `dst`). Two paths sharing a device are modeled as same-filesystem;
+    /// this lets a rename *within* a dest bucket dir succeed even while
+    /// `cross_fs` injection is active, matching real filesystems where the
+    /// EXDEV hazard is between distinct mounts, not within one.
+    fn device_of(p: &Path) -> Option<std::ffi::OsString> {
+        p.components().find_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_os_string()),
+            _ => None,
+        })
     }
 
     // Several helpers below are unused until tasks 3-10 (apply-engine tests) land;
@@ -331,13 +391,18 @@ pub(crate) mod fake {
             Ok(())
         }
 
-        fn same_filesystem(&self, _a: &Path, _b: &Path) -> io::Result<bool> {
-            Ok(!self.st.borrow().cross_fs)
+        fn same_filesystem(&self, a: &Path, b: &Path) -> io::Result<bool> {
+            let s = self.st.borrow();
+            if s.cross_fs {
+                Ok(device_of(a) == device_of(b))
+            } else {
+                Ok(true)
+            }
         }
 
         fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
             let mut s = self.st.borrow_mut();
-            if s.cross_fs {
+            if s.cross_fs && device_of(from) != device_of(to) {
                 return Err(exdev());
             }
             if s.deny_rename_from.as_deref() == Some(from) {
