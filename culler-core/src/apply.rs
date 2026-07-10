@@ -3,6 +3,7 @@
 //! first failure. No deletion step exists beyond the cross-FS path removing its
 //! own verified source (Task 5). Resumable via `resume` (Task 8).
 
+use std::collections::BTreeSet;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -314,6 +315,11 @@ fn execute(
 
     let mut report = ApplyReport::default();
     let mut gidx = 0usize; // global index into journal.statuses
+    // Dirs that RECEIVED a sidecar publish this run (spec §8 rev 4). A BTreeSet
+    // dedupes (many shots share a bucket dir) and keeps the durability pass
+    // below deterministic. A skipped (already-present) sidecar does NOT count
+    // — nothing new was published there this run.
+    let mut sidecar_dirs: BTreeSet<PathBuf> = BTreeSet::new();
 
     for op in &ops {
         for mv in &op.moves {
@@ -363,7 +369,12 @@ fn execute(
             // Skip-idempotent; NOREPLACE inside write_sidecar — see Task 3.
             if !sw.path.exists() {
                 match crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating) {
-                    Ok(()) => report.sidecars_written += 1,
+                    Ok(()) => {
+                        report.sidecars_written += 1;
+                        if let Some(dir) = sw.path.parent() {
+                            sidecar_dirs.insert(dir.to_path_buf());
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(e) => {
                         return Err(ApplyError::Fs {
@@ -375,6 +386,20 @@ fn execute(
             }
         }
         report.moved_shots += 1;
+    }
+
+    // End-of-success durability pass (spec §8 rev 4): sidecar renames are
+    // unjournaled, so on full success — before the journal is removed —
+    // every bucket dir that received a sidecar publish this run is fsynced.
+    // A failure here is a loud stop: return WITHOUT removing the journal, so
+    // a post-failure crash still reads as an incomplete run rather than a
+    // finished one — resume will re-visit the (no-clobber, skip-idempotent)
+    // sidecar writes and this pass runs again next time.
+    for dir in &sidecar_dirs {
+        fs.fsync_dir(dir).map_err(|e| ApplyError::Fs {
+            path: dir.clone(),
+            source: e,
+        })?;
     }
 
     let _ = std::fs::remove_file(journal_path); // success: journal retired (spec §8 rev 3)
@@ -1582,6 +1607,157 @@ mod tests {
         assert_eq!(
             parsed.statuses,
             vec![OpState::Pending, OpState::Done, OpState::Failed]
+        );
+    }
+
+    // ---- F4 (Phase 4 follow-up): end-of-success durability pass for
+    // sidecar publishes (spec §8 rev 4) — "on full success, before the
+    // journal is removed, every bucket directory that received a sidecar
+    // publish is fsynced". Sidecar writes are real filesystem I/O (never
+    // routed through `FsOps`), so — like Task 11 below — these mix `FakeFs`
+    // moves with a REAL tempdir for the sidecar target; only the `fsync_dir`
+    // call the durability pass makes goes through `FsOps` (and is therefore
+    // observable via `fs.fsynced_dirs()`), even though the write itself does not. ----
+
+    #[test]
+    fn full_success_fsyncs_sidecar_dirs_before_journal_retirement_deduped() {
+        let dest = PathBuf::from("/dst");
+        let sidecar_dir = tempfile::tempdir().unwrap(); // REAL tempdir: sidecar parent
+
+        let (mut s1, b1) = shot("IMG_2000", BUCKET_KEEP, &[("IMG_2000.JPG", 100)], &dest);
+        s1.write_sidecar = Some(SidecarWrite {
+            path: sidecar_dir.path().join("IMG_2000.xmp"),
+            tags: vec!["a".into()],
+            rating: Some(3),
+        });
+        // Second shot's sidecar lands in the SAME real dir — pins the dedupe.
+        let (mut s2, b2) = shot("IMG_2001", BUCKET_PICKS, &[("IMG_2001.JPG", 100)], &dest);
+        s2.write_sidecar = Some(SidecarWrite {
+            path: sidecar_dir.path().join("IMG_2001.xmp"),
+            tags: vec!["b".into()],
+            rating: Some(4),
+        });
+        let plan = plan_of(&dest, vec![s1, s2], b1 + b2);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops); // moves stay on the fake /src -> /dst paths
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let report = apply(&plan, &fs, &jpath).unwrap();
+        assert_eq!(report.sidecars_written, 2);
+
+        let fsynced = fs.fsynced_dirs();
+        let real_dir = sidecar_dir.path().to_path_buf();
+        assert_eq!(
+            fsynced.iter().filter(|d| **d == real_dir).count(),
+            1,
+            "sidecar dir fsynced exactly once despite two sidecar publishes in it: {fsynced:?}"
+        );
+    }
+
+    // Pins the loud-stop half of the contract: a durability-pass fsync
+    // failure must propagate as `ApplyError::Fs { path: dir, .. }` and leave
+    // the journal ON DISK (not retired) — the run must never read as
+    // complete when the sidecar publish it made durable a promise about
+    // isn't actually durable yet. Everything up to the fsync itself (the
+    // move, the sidecar write) already succeeded; only the trailing
+    // dir-fsync fails.
+    #[test]
+    fn durability_pass_failure_leaves_journal_on_disk_and_stops_loudly() {
+        let dest = PathBuf::from("/dst");
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let sidecar_path = sidecar_dir.path().join("IMG_2300.xmp");
+
+        let (mut s1, b1) = shot("IMG_2300", BUCKET_KEEP, &[("IMG_2300.JPG", 100)], &dest);
+        s1.write_sidecar = Some(SidecarWrite {
+            path: sidecar_path.clone(),
+            tags: vec!["x".into()],
+            rating: Some(3),
+        });
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_fsync_dir(sidecar_dir.path()); // the durability pass itself fails
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        match err {
+            ApplyError::Fs { path, source } => {
+                assert_eq!(path, sidecar_dir.path());
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected ApplyError::Fs, got {other:?}"),
+        }
+
+        assert!(
+            jpath.exists(),
+            "journal must REMAIN after a durability-pass failure — the run \
+             is not allowed to read as complete"
+        );
+        // The move and the sidecar write themselves already landed; only the
+        // trailing fsync failed.
+        assert!(sidecar_path.exists());
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_2300.JPG")),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn full_success_with_no_sidecar_writes_fsyncs_no_dirs() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_2100", BUCKET_KEEP, &[("IMG_2100.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1); // write_sidecar: None (see `shot`)
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        apply(&plan, &fs, &jpath).unwrap();
+        assert!(
+            fs.fsynced_dirs().is_empty(),
+            "a same-FS-only plan with no sidecar writes must not fsync any dir"
+        );
+    }
+
+    #[test]
+    fn full_success_skips_fsync_for_a_preexisting_sidecar_targets_dir() {
+        let dest = PathBuf::from("/dst");
+        let sidecar_dir = tempfile::tempdir().unwrap();
+        let sidecar_path = sidecar_dir.path().join("IMG_2200.xmp");
+        std::fs::write(&sidecar_path, "SENTINEL").unwrap(); // pre-seeded: write is a skip
+
+        let (mut s1, b1) = shot("IMG_2200", BUCKET_KEEP, &[("IMG_2200.JPG", 100)], &dest);
+        s1.write_sidecar = Some(SidecarWrite {
+            path: sidecar_path.clone(),
+            tags: vec!["x".into()],
+            rating: Some(3),
+        });
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let report = apply(&plan, &fs, &jpath).unwrap();
+        assert_eq!(report.sidecars_written, 0, "pre-existing sidecar is a skip");
+        assert!(
+            fs.fsynced_dirs().is_empty(),
+            "a skipped sidecar's dir must not be fsynced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sidecar_path).unwrap(),
+            "SENTINEL",
+            "skip must not clobber"
         );
     }
 

@@ -275,6 +275,7 @@ pub(crate) mod fake {
         enospc_on_copy: bool, // copy_create_new -> ENOSPC (source untouched)
         deny_rename_from: Option<PathBuf>, // rename_noreplace(from, _) -> EACCES
         deny_remove: Option<PathBuf>, // remove_file(path) -> EACCES
+        deny_fsync_dir: Option<PathBuf>, // fsync_dir(path) -> EACCES
         fsynced_files: Vec<PathBuf>,
         fsynced_dirs: Vec<PathBuf>,
         events: Vec<String>, // ordered op log — durability ORDERING assertions
@@ -320,6 +321,7 @@ pub(crate) mod fake {
                     enospc_on_copy: false,
                     deny_rename_from: None,
                     deny_remove: None,
+                    deny_fsync_dir: None,
                     fsynced_files: Vec::new(),
                     fsynced_dirs: Vec::new(),
                     events: Vec::new(),
@@ -346,12 +348,16 @@ pub(crate) mod fake {
         pub(crate) fn deny_remove(&self, p: impl Into<PathBuf>) {
             self.st.borrow_mut().deny_remove = Some(p.into());
         }
+        pub(crate) fn deny_fsync_dir(&self, p: impl Into<PathBuf>) {
+            self.st.borrow_mut().deny_fsync_dir = Some(p.into());
+        }
         pub(crate) fn clear_faults(&self) {
             let mut s = self.st.borrow_mut();
             s.cross_fs = false;
             s.enospc_on_copy = false;
             s.deny_rename_from = None;
             s.deny_remove = None;
+            s.deny_fsync_dir = None;
         }
 
         // ---- assertions ----
@@ -452,6 +458,9 @@ pub(crate) mod fake {
 
         fn fsync_dir(&self, path: &Path) -> io::Result<()> {
             let mut s = self.st.borrow_mut();
+            if s.deny_fsync_dir.as_deref() == Some(path) {
+                return Err(eacces());
+            }
             s.fsynced_dirs.push(path.to_path_buf());
             s.events.push(format!("fsync_dir:{}", path.display()));
             Ok(())
