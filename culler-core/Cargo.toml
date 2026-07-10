@@ -9,6 +9,18 @@ serde_json = "1"
 kamadak-exif = "0.6"
 quick-xml = "0.41"
 rustix = { version = "1", features = ["fs"] }
+# System-linked via pkg-config against the machine's libjpeg-turbo (2.1.5). Pinned to the
+# 0.5.x line deliberately: turbojpeg-sys >= 1.0 hardcodes `atleast_version("3.0")` in its
+# pkg-config probe and its bindings target the new tj3* API, whose symbols do not exist in
+# this system's libturbojpeg.so (verified via `nm -D`, TURBOJPEG_1.x symbols only). cmake and
+# nasm are absent, so a from-source vendor build (which would fetch libjpeg-turbo 3.x) is not
+# an option either. turbojpeg-sys 0.2.x's pkg-config probe requires only `>= 2.0`, which the
+# system library satisfies, and binds the legacy tj*/tjDecompress2 API that this crate uses.
+# default-features = false is required: the crate's `default` feature set includes `cmake`,
+# and turbojpeg-sys's build.rs picks the cmake vendor-build path whenever the `cmake` feature
+# is enabled, regardless of `pkg-config` also being on — so leaving cmake enabled would still
+# attempt (and fail) a from-source build.
+turbojpeg = { version = "0.5", default-features = false, features = ["pkg-config"] }
 
 [dev-dependencies]
 tempfile = "3"
