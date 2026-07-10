@@ -1,7 +1,7 @@
 # FastCull — Design Spec
 
 **Date:** 2026-07-08
-**Status:** Draft — rev 3 (2026-07-09: §8 cross-FS durability ordering fixed, journal lifecycle + resume reconciliation specified, in-flight-apply breadcrumb added; rev 2 folded v1 review feedback)
+**Status:** Draft — rev 4 (2026-07-10: §8 `Published` journal state closes the cross-FS publish→unlink resume ambiguity, malformed journals refused gracefully, bucket-dir fsyncs make sidecar publishes durable before journal removal; rev 3 2026-07-09: §8 cross-FS durability ordering fixed, journal lifecycle + resume reconciliation specified, in-flight-apply breadcrumb added; rev 2 folded v1 review feedback)
 **Author:** Yoann (with Claude)
 
 ---
@@ -221,7 +221,13 @@ Each shot's fileset `{JPEG, RAW?, .xmp?}` is moved as a **group**.
   while the rename is lost — leaving the data reachable only as a hidden
   `.partial`. A mid-copy failure leaves the source **untouched** and cleans up
   the partial. *(rev 3: rev 2 ordered the dir fsync before the rename, which
-  made the `.partial` entry durable instead of the final one.)*
+  made the `.partial` entry durable instead of the final one.)* **`Published`
+  state (rev 4):** immediately after the publish rename succeeds, the journal
+  records the op as `Published` — the destination is definitively ours and only
+  the source unlink remains — so a crash in the publish→unlink window resumes
+  by *completing the unlink*, never by re-copying into (and colliding with) its
+  own finished copy. Only the cross-FS path uses `Published`; a same-FS rename
+  has no such window.
 - **Preflight** → before the first cross-FS copy, check destination free space
   (`statvfs`) against the plan's total byte count; refuse rather than abort
   halfway.
@@ -241,10 +247,24 @@ Each shot's fileset `{JPEG, RAW?, .xmp?}` is moved as a **group**.
   whose destination exists is treated as done; a `Done` move whose
   destination is missing while the source still exists is re-executed. Resume
   must never fail with a spurious error on work a crashed run already did.
+  **(rev 4)** A `Published` move resumes by removing the still-present source
+  (or is simply marked done if the source is already gone). The one state that
+  cannot be disambiguated — `Pending` with *both* source and destination
+  present (a foreign file appeared, or the `Published` journal record was lost
+  to the batched-fsync window) — stays a **loud stop**, but its error message
+  must name the possible prior-run completed copy and direct the user to
+  verify and resolve manually; resume must never unlink a source without a
+  durable `Published`/`Done` record vouching for the destination. A journal
+  that parses but is structurally inconsistent (its status list disagrees with
+  the plan's move count — corruption or hand-editing) is **refused gracefully**
+  with a precise error; the recovery path itself must never panic.
 - **Sidecar writes are no-clobber too** → freshly written `.xmp` sidecars are
   published exactly like moves (write temp → rename with `NOREPLACE`); no
   destination write path may silently overwrite. Re-running a sidecar write on
-  resume skips an already-present target instead of failing.
+  resume skips an already-present target instead of failing. **(rev 4)** On
+  full success, before the journal is removed, every bucket directory that
+  received a sidecar publish is fsynced — sidecar renames are unjournaled, so
+  this is what makes them durable against a post-success power cut.
 - **Collisions** → auto-suffix the whole stem consistently
   (`IMG_1234` → `IMG_1234-1`) so JPEG/RAW/xmp stay matched; surfaced in the preview.
 - **Group atomicity** → if a later file in a shot fails, already-moved files
@@ -385,4 +405,5 @@ gold = best, red = reject.
 | Auto-advance | On by default; `--no-auto-advance` *(rev 2)* |
 | Crash safety | Apply journal in destination; `RENAME_NOREPLACE` everywhere; free-space preflight; atomic session saves *(rev 2)* |
 | Crash-safety hardening | Cross-FS dir fsync moved *after* the publish rename; resume reconciles journal↔disk in both directions; sidecar writes no-clobber + skip-idempotent; journal removed on success; `pending_apply` breadcrumb in the session makes next-launch crash detection real *(rev 3)* |
+| Cross-FS resume ambiguity | `OpState::Published` recorded right after the cross-FS publish rename — resume completes the source unlink instead of re-copying into its own finished copy. Residual rename↔journal window keeps the loud stop with duplicate-aware wording; a source is never unlinked without a durable `Published`/`Done` record. Malformed journals (status list ≠ plan move count) refused gracefully, never a panic. Bucket dirs fsynced before journal removal so unjournaled sidecar publishes are durable *(rev 4)* |
 | Configuration | Bucket names via CLI flags; no config file in v1 *(rev 2)* |

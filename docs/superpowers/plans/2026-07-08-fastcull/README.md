@@ -252,11 +252,15 @@ pub trait FsOps {
 pub struct RealFs; // impl FsOps via rustix
 
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub enum OpState { Pending, Done, Failed }
+pub enum OpState { Pending, Published, Done, Failed }
+// Published (rev 4): cross-FS only — the publish rename succeeded, the source unlink is still owed.
+// Resume completes the unlink (dest is definitively ours); same-FS moves never enter this state.
 #[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Journal { pub plan: ApplyPlan, pub statuses: Vec<OpState> } // statuses parallel to the flattened
 // file-move list (ops × moves, in order). Sidecar writes are NOT journaled: they are idempotent —
 // no-clobber NOREPLACE publish, and an already-present target is skipped on resume.
+// A journal whose statuses length disagrees with the plan's flattened move count is structurally
+// corrupt: apply/resume refuse it gracefully (ApplyError::Preflight), never index into it (rev 4).
 
 #[derive(Debug)]
 pub enum ApplyError { Preflight(String), Fs { path: std::path::PathBuf, source: std::io::Error }, Collision(std::path::PathBuf) }
@@ -264,12 +268,15 @@ pub enum ApplyError { Preflight(String), Fs { path: std::path::PathBuf, source: 
 pub struct ApplyReport { pub moved_shots: usize, pub moved_files: usize, pub sidecars_written: usize, pub stopped_at: Option<String> }
 
 /// Journals first, then executes each ShotOp group atomically. Resumable from an existing journal.
-/// On FULL SUCCESS the journal file is removed (FastCull metadata, not user data). `resume`
-/// RECONCILES the journal against the disk before executing (Pending + source-gone + dest-exists
-/// ⇒ done; Done + dest-missing + source-present ⇒ re-execute) so a crash between a move and its
-/// journal update never strands the run. Progress reporting: the journal is rewritten as moves
-/// complete, so a UI runs apply/resume on a worker thread and POLLS the journal for done/total —
-/// no progress callback in the signature (kept stable).
+/// On FULL SUCCESS every bucket dir that received a sidecar publish is fsynced, THEN the journal
+/// file is removed (FastCull metadata, not user data). `resume` RECONCILES the journal against
+/// the disk before executing (Pending + source-gone + dest-exists ⇒ done; Done + dest-missing +
+/// source-present ⇒ re-execute; Published ⇒ dest is ours, finish the source unlink — rev 4) so a
+/// crash between a move and its journal update never strands the run. Pending + BOTH source and
+/// dest present stays a loud stop whose message names the possible prior-run completed copy
+/// (rev 4); a source is never unlinked without a durable Published/Done record. Progress
+/// reporting: the journal is rewritten as moves complete, so a UI runs apply/resume on a worker
+/// thread and POLLS the journal for done/total — no progress callback in the signature (kept stable).
 pub fn apply(plan: &ApplyPlan, fs: &dyn FsOps, journal_path: &std::path::Path) -> Result<ApplyReport, ApplyError>;
 pub fn resume(journal_path: &std::path::Path, fs: &dyn FsOps) -> Result<ApplyReport, ApplyError>;
 
