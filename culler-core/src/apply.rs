@@ -1395,7 +1395,10 @@ mod tests {
                     msg.contains("expected 1") || msg.contains("expects 1"),
                     "message names the expected count: {msg}"
                 );
-                assert!(msg.contains('0'), "message names the actual count: {msg}");
+                assert!(
+                    msg.contains("found 0"),
+                    "message names the actual count: {msg}"
+                );
             }
             other => panic!("expected ApplyError::Preflight, got {other:?}"),
         }
@@ -1439,7 +1442,7 @@ mod tests {
             ApplyError::Preflight(msg) => {
                 assert!(msg.contains(&jpath.display().to_string()));
                 assert!(msg.contains("expected 2") || msg.contains("expects 2"));
-                assert!(msg.contains('1'));
+                assert!(msg.contains("found 1"));
             }
             other => panic!("expected ApplyError::Preflight, got {other:?}"),
         }
@@ -1479,7 +1482,7 @@ mod tests {
             ApplyError::Preflight(msg) => {
                 assert!(msg.contains(&jpath.display().to_string()));
                 assert!(msg.contains("expected 1") || msg.contains("expects 1"));
-                assert!(msg.contains('3'));
+                assert!(msg.contains("found 3"));
             }
             other => panic!("expected ApplyError::Preflight, got {other:?}"),
         }
@@ -1796,6 +1799,10 @@ mod tests {
         let report = resume(&jpath, &fs).unwrap();
 
         assert_eq!(report.moved_files, 1);
+        assert_eq!(
+            report.moved_shots, 1,
+            "finishing a Published move is work this run"
+        );
         assert!(
             !fs.exists(&PathBuf::from("/src/IMG_0800.JPG")),
             "source removed to finish the publish"
@@ -1841,6 +1848,10 @@ mod tests {
         assert_eq!(
             report.moved_files, 0,
             "already-completed work is not recounted"
+        );
+        assert_eq!(
+            report.moved_shots, 0,
+            "reconciled-to-Done shot did no work this run"
         );
         assert!(
             fs.events().is_empty(),
