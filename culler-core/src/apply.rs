@@ -315,10 +315,18 @@ fn execute(
 
     let mut report = ApplyReport::default();
     let mut gidx = 0usize; // global index into journal.statuses
-    // Dirs that RECEIVED a sidecar publish this run (spec §8 rev 4). A BTreeSet
-    // dedupes (many shots share a bucket dir) and keeps the durability pass
-    // below deterministic. A skipped (already-present) sidecar does NOT count
-    // — nothing new was published there this run.
+    // Dirs whose sidecar target is PRESENT on disk after this run handled it
+    // (spec §8 rev 4, session-scoped per the controller adjudication — the
+    // durability guarantee is "durable against a post-success power cut" for
+    // the *session*, not just the invocation that happened to write the
+    // byte). A BTreeSet dedupes (many shots share a bucket dir) and keeps the
+    // durability pass below deterministic. Tracked in ALL THREE outcomes
+    // below: a fresh write, a skip because the target already existed (our
+    // own unfsynced prior-run write, or a harmless foreign file), or a raced
+    // `AlreadyExists` from `write_sidecar` itself. The only op-with-a-sidecar
+    // arm that does NOT track is a genuine write failure, which returns
+    // before reaching the tracking code. A plan with no `SidecarWrite` at all
+    // never enters this block, so it tracks nothing.
     let mut sidecar_dirs: BTreeSet<PathBuf> = BTreeSet::new();
 
     for op in &ops {
@@ -367,15 +375,16 @@ fn execute(
 
         if let Some(sw) = &op.write_sidecar {
             // Skip-idempotent; NOREPLACE inside write_sidecar — see Task 3.
-            if !sw.path.exists() {
+            let mut target_present = sw.path.exists();
+            if !target_present {
                 match crate::xmp::write_sidecar(&sw.path, &sw.tags, sw.rating) {
                     Ok(()) => {
                         report.sidecars_written += 1;
-                        if let Some(dir) = sw.path.parent() {
-                            sidecar_dirs.insert(dir.to_path_buf());
-                        }
+                        target_present = true;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        target_present = true; // raced with someone else's write
+                    }
                     Err(e) => {
                         return Err(ApplyError::Fs {
                             path: sw.path.clone(),
@@ -384,17 +393,30 @@ fn execute(
                     }
                 }
             }
+            // Track for the durability pass whenever the target is present —
+            // see the `sidecar_dirs` doc comment above for why the skip and
+            // already-exists arms count too, not just a fresh write.
+            if target_present && let Some(dir) = sw.path.parent() {
+                sidecar_dirs.insert(dir.to_path_buf());
+            }
         }
         report.moved_shots += 1;
     }
 
-    // End-of-success durability pass (spec §8 rev 4): sidecar renames are
-    // unjournaled, so on full success — before the journal is removed —
-    // every bucket dir that received a sidecar publish this run is fsynced.
-    // A failure here is a loud stop: return WITHOUT removing the journal, so
-    // a post-failure crash still reads as an incomplete run rather than a
-    // finished one — resume will re-visit the (no-clobber, skip-idempotent)
-    // sidecar writes and this pass runs again next time.
+    // End-of-success durability pass (spec §8 rev 4, session-scoped per the
+    // controller adjudication): sidecar renames are unjournaled, so on full
+    // success — before the journal is removed — every dir holding a sidecar
+    // target that is PRESENT on disk this run (see `sidecar_dirs` above) is
+    // fsynced. A failure here is a loud stop: return WITHOUT removing the
+    // journal, so a post-failure crash still reads as an incomplete run
+    // rather than a finished one. This is what makes the retry REAL rather
+    // than a false promise: because the journal stays on disk, the next
+    // `resume` calls `execute` again from the top, which re-examines the
+    // same sidecar target — this time via the `sw.path.exists()` skip arm,
+    // since the file itself was already written before the fsync failed —
+    // re-inserts its dir into `sidecar_dirs`, and this pass runs again and
+    // fsyncs it. So a target left unfsynced by a failed run is retried on
+    // the very next successful resume, not silently dropped.
     for dir in &sidecar_dirs {
         fs.fsync_dir(dir).map_err(|e| ApplyError::Fs {
             path: dir.clone(),
@@ -1727,8 +1749,17 @@ mod tests {
         );
     }
 
+    // Controller-adjudicated semantic flip (Critical fix, F4 durability-pass
+    // follow-up): this test used to pin the OPPOSITE — that a pre-existing
+    // sidecar target's dir is NOT fsynced. That was the bug: a target already
+    // present on disk when `execute` runs is either a foreign file (fsyncing
+    // its dir is harmless) OR our own prior-run write that was never fsynced
+    // (the durability guarantee is session-scoped, not invocation-scoped — a
+    // subsequent `resume` must still make it durable). See
+    // `durability_pass_retries_on_resume_after_fsync_failure` below for the
+    // resume-retry case this flip exists to cover.
     #[test]
-    fn full_success_skips_fsync_for_a_preexisting_sidecar_targets_dir() {
+    fn full_success_fsyncs_dir_of_preexisting_sidecar_target_too() {
         let dest = PathBuf::from("/dst");
         let sidecar_dir = tempfile::tempdir().unwrap();
         let sidecar_path = sidecar_dir.path().join("IMG_2200.xmp");
@@ -1751,14 +1782,84 @@ mod tests {
         let report = apply(&plan, &fs, &jpath).unwrap();
         assert_eq!(report.sidecars_written, 0, "pre-existing sidecar is a skip");
         assert!(
-            fs.fsynced_dirs().is_empty(),
-            "a skipped sidecar's dir must not be fsynced"
+            fs.fsynced_dirs()
+                .contains(&sidecar_dir.path().to_path_buf()),
+            "a pre-existing sidecar target's dir must STILL be fsynced: either it's a \
+             foreign file (harmless, cheap) or our own prior-run write that still owes \
+             a durability fsync"
         );
         assert_eq!(
             std::fs::read_to_string(&sidecar_path).unwrap(),
             "SENTINEL",
             "skip must not clobber"
         );
+    }
+
+    // Critical finding (F4 durability-pass review): `execute` used to track a
+    // sidecar's parent dir ONLY when `write_sidecar` returned `Ok` THIS
+    // invocation. If the durability pass's trailing fsync failed (journal
+    // correctly left on disk, all moves + the sidecar write itself already
+    // Done/landed), a subsequent `resume` would see `sw.path.exists()` and
+    // take the skip branch — tracking nothing, fsyncing nothing, then
+    // retiring the journal and reporting success even though the sidecar
+    // dirent was never made durable. This pins the fix: the durability
+    // guarantee is session-scoped, so the skip branch on resume must ALSO
+    // track the dir, giving the fsync a real retry.
+    #[test]
+    fn durability_pass_retries_on_resume_after_fsync_failure() {
+        let dest = PathBuf::from("/dst");
+        let sidecar_dir = tempfile::tempdir().unwrap(); // REAL tempdir: sidecar parent
+        let sidecar_path = sidecar_dir.path().join("IMG_2400.xmp");
+
+        let (mut s1, b1) = shot("IMG_2400", BUCKET_KEEP, &[("IMG_2400.JPG", 100)], &dest);
+        s1.write_sidecar = Some(SidecarWrite {
+            path: sidecar_path.clone(),
+            tags: vec!["x".into()],
+            rating: Some(3),
+        });
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_fsync_dir(sidecar_dir.path()); // durability pass fails THIS run
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        // First run: move + sidecar write land, but the trailing fsync fails.
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(matches!(err, ApplyError::Fs { .. }));
+        assert!(
+            jpath.exists(),
+            "journal left on disk after the fsync failure"
+        );
+        assert!(sidecar_path.exists(), "sidecar was actually written");
+
+        // Snapshot fsynced-dirs BEFORE resume: the failed fsync above never
+        // actually recorded (FakeFs only records on success), so this is empty.
+        let before = fs.fsynced_dirs().len();
+
+        // Fault clears (e.g. the mount that held the sidecar dir is writable
+        // again); resume from the same journal.
+        fs.clear_faults();
+        let report = resume(&jpath, &fs).unwrap();
+
+        // The Critical-path assertion: resume must re-reach the durability
+        // pass and fsync the dir, even though the sidecar file itself was
+        // already present (and therefore skipped, not rewritten).
+        assert_eq!(
+            report.sidecars_written, 0,
+            "sidecar already present: a skip on resume"
+        );
+        let after = fs.fsynced_dirs();
+        assert_eq!(
+            after.len(),
+            before + 1,
+            "resume must fsync the sidecar dir exactly once more: {after:?}"
+        );
+        assert!(after.contains(&sidecar_dir.path().to_path_buf()));
+
+        assert!(!jpath.exists(), "journal retired once the resume succeeds");
     }
 
     // Task 11: sidecar writes are real filesystem I/O (they do NOT route
