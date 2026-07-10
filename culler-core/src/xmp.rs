@@ -303,6 +303,7 @@ mod tests {
                 "a\u{0007}b".to_string(),
                 "\u{0000}x".to_string(),
                 "tab\there\nline".to_string(),
+                "del\u{7F}here".to_string(), // F7: pins the 0x7F (DEL) filter arm
             ],
             Some(3),
         );
@@ -322,6 +323,8 @@ mod tests {
             xml.contains("<rdf:li>tab\there\nline</rdf:li>"),
             "xml was: {xml}"
         );
+        // DEL (0x7F) is formally legal XML but discouraged and stripped by policy.
+        assert!(xml.contains("<rdf:li>delhere</rdf:li>"), "xml was: {xml}");
 
         let (tags, rating) = parse_xmp(&xml);
         assert_eq!(
@@ -329,7 +332,8 @@ mod tests {
             vec![
                 "ab".to_string(),
                 "x".to_string(),
-                "tab\there\nline".to_string()
+                "tab\there\nline".to_string(),
+                "delhere".to_string(),
             ]
         );
         assert_eq!(rating, Some(3));
