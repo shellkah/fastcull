@@ -29,7 +29,6 @@ pub enum DecodeError {
 /// Reorient a straight-RGBA8 buffer per an EXIF Orientation code (1..=8).
 /// Pure: no I/O, no external deps. Codes 5/6/7/8 (90/270 rotations + diagonal
 /// flips) swap width and height. Unknown/absent orientation (0 or >8) = identity.
-#[allow(dead_code)]
 fn apply_orientation(rgba: Vec<u8>, w: u32, h: u32, orientation: u16) -> (Vec<u8>, u32, u32) {
     if orientation <= 1 || orientation > 8 {
         return (rgba, w, h);
@@ -140,14 +139,27 @@ fn fit_denom(w: usize, h: usize, bw: usize, bh: usize) -> u8 {
     1
 }
 
-/// Decode into a box: smallest turbojpeg scaled level >= box, then aspect-preserving
-/// SIMD downscale to fit. Never upscales. Orientation is applied by the caller.
-fn decode_fit(data: &[u8], fit_w: u32, fit_h: u32) -> Result<DecodedImage, DecodeError> {
+/// Decode into a display-space box: if orientation rotates the image (5/6/7/8),
+/// the box is swapped so that after `apply_orientation` the result fits `fit_w x fit_h`.
+/// Smallest turbojpeg scaled level >= box, then aspect-preserving SIMD downscale. Never upscales.
+fn decode_fit(
+    data: &[u8],
+    fit_w: u32,
+    fit_h: u32,
+    orientation: u16,
+) -> Result<DecodedImage, DecodeError> {
     let mut dec = turbojpeg::Decompressor::new().map_err(|e| DecodeError::Decode(e.to_string()))?;
     let header = dec
         .read_header(data)
         .map_err(|e| DecodeError::Decode(e.to_string()))?;
-    let (bw, bh) = (fit_w as usize, fit_h as usize);
+
+    // Box in stored orientation: swap when the final image will be rotated 90/270.
+    let rotates = matches!(orientation, 5..=8);
+    let (bw, bh) = if rotates {
+        (fit_h as usize, fit_w as usize)
+    } else {
+        (fit_w as usize, fit_h as usize)
+    };
 
     let denom = fit_denom(header.width, header.height, bw, bh);
 
@@ -159,18 +171,37 @@ fn decode_fit(data: &[u8], fit_w: u32, fit_h: u32) -> Result<DecodedImage, Decod
     resize_rgba(decoded, tw, th)
 }
 
-/// Decode `path`'s JPEG at/around `target`, returning straight RGBA8.
-/// (EXIF orientation lands in a later task.)
+/// Read the EXIF Orientation tag (1..=8) from the already-loaded JPEG bytes —
+/// `decode` has the whole file in memory, so no second file read / reopen
+/// (kamadak-exif reads from any BufRead+Seek; `Cursor<&[u8]>` qualifies,
+/// verified by probe build). Returns 1 (identity) when EXIF is absent or
+/// undecodable — orientation reading never fails a decode.
+fn read_orientation(data: &[u8]) -> u16 {
+    let mut cursor = std::io::Cursor::new(data);
+    match exif::Reader::new().read_from_container(&mut cursor) {
+        Ok(exif) => exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+            .map(|v| v as u16)
+            .unwrap_or(1),
+        Err(_) => 1,
+    }
+}
+
+/// Decode `path`'s JPEG at/around `target`, apply EXIF orientation, return straight RGBA8.
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
-    match target {
-        TargetSize::Full => decompress_scaled(&data, 1),
+    let orientation = read_orientation(&data);
+    let decoded = match target {
+        TargetSize::Full => decompress_scaled(&data, 1)?,
         TargetSize::Scaled(n) => match n {
-            1 | 2 | 4 | 8 => decompress_scaled(&data, n),
-            _ => Err(DecodeError::Decode(format!("unsupported scale 1/{n}"))),
+            1 | 2 | 4 | 8 => decompress_scaled(&data, n)?,
+            _ => return Err(DecodeError::Decode(format!("unsupported scale 1/{n}"))),
         },
-        TargetSize::Fit(w, h) => decode_fit(&data, w, h),
-    }
+        TargetSize::Fit(w, h) => decode_fit(&data, w, h, orientation)?,
+    };
+    let (rgba, w, h) = apply_orientation(decoded.rgba, decoded.w, decoded.h, orientation);
+    Ok(DecodedImage { w, h, rgba })
 }
 
 #[cfg(test)]
@@ -351,5 +382,30 @@ mod tests {
             img.rgba.chunks_exact(4).all(|p| p[3] == 255),
             "alpha must be opaque 255 across the full resized buffer"
         );
+    }
+
+    #[test]
+    fn decode_applies_exif_orientation() {
+        let rotated = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/orientation_6.jpg");
+        assert!(
+            rotated.exists(),
+            "commit a real orientation-6 portrait JPEG at \
+             culler-core/tests/fixtures/orientation_6.jpg (see fixtures/README.md)"
+        );
+
+        // Raw stored pixels (orientation NOT applied): a portrait shot tagged 6 is
+        // stored landscape, so raw w > h.
+        let raw = decompress_scaled(&std::fs::read(&rotated).unwrap(), 1).unwrap();
+        assert!(
+            raw.w > raw.h,
+            "orientation-6 fixture is stored landscape (w > h)"
+        );
+
+        // decode() applies EXIF orientation -> dims swapped, portrait upright (h > w).
+        let img = decode(&rotated, TargetSize::Full).expect("decode rotated");
+        assert_eq!((img.w, img.h), (raw.h, raw.w), "orientation-6 swaps w/h");
+        assert!(img.h > img.w, "portrait must come back upright");
+        assert_eq!(img.rgba.len(), img.w as usize * img.h as usize * 4);
     }
 }
