@@ -292,6 +292,40 @@ fn execute(
     Ok(report)
 }
 
+/// Refuse a cross-filesystem run that cannot fit. Same-FS runs move no bytes and
+/// are never gated. Uses the first source file to decide FS-crossing vs `dest`.
+fn preflight(plan: &ApplyPlan, fs: &dyn FsOps) -> Result<(), ApplyError> {
+    let first_from = plan
+        .ops
+        .iter()
+        .flat_map(|o| o.moves.iter())
+        .map(|m| &m.from)
+        .next();
+    if let Some(src) = first_from {
+        let same = fs
+            .same_filesystem(src, &plan.dest)
+            .map_err(|e| ApplyError::Fs {
+                path: plan.dest.clone(),
+                source: e,
+            })?;
+        if !same {
+            let avail = fs.free_space(&plan.dest).map_err(|e| ApplyError::Fs {
+                path: plan.dest.clone(),
+                source: e,
+            })?;
+            if avail < plan.total_bytes {
+                return Err(ApplyError::Preflight(format!(
+                    "insufficient free space at {}: need {} bytes, {} available",
+                    plan.dest.display(),
+                    plan.total_bytes,
+                    avail
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Journals the plan FIRST, then executes each `ShotOp` group. Same-FS only in
 /// Task 3; cross-FS + preflight land in Tasks 5 and 9.
 pub fn apply(
@@ -299,6 +333,7 @@ pub fn apply(
     fs: &dyn FsOps,
     journal_path: &Path,
 ) -> Result<ApplyReport, ApplyError> {
+    preflight(plan, fs)?; // refuse rather than abort halfway
     let mut journal = Journal {
         plan: plan.clone(),
         statuses: vec![OpState::Pending; total_move_count(plan)],
@@ -834,5 +869,71 @@ mod tests {
             Some(100)
         );
         assert!(!fs.exists(&PathBuf::from("/src/IMG_0420.JPG")));
+    }
+
+    #[test]
+    fn preflight_refuses_when_cross_fs_and_not_enough_space() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_0500",
+            BUCKET_KEEP,
+            &[("IMG_0500.JPG", 100), ("IMG_0500.CR3", 100)],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1); // total_bytes = 200
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.set_cross_fs(true);
+        fs.set_free(150); // < 200
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(matches!(err, ApplyError::Preflight(_)));
+        // Refused BEFORE any move — sources all intact, no journal, no buckets.
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0500.JPG")));
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0500.CR3")));
+        assert!(!jpath.exists(), "no journal written when preflight refuses");
+    }
+
+    #[test]
+    fn same_fs_never_free_space_gated() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0501", BUCKET_KEEP, &[("IMG_0501.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.set_free(0); // irrelevant: same-FS rename moves no bytes
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        apply(&plan, &fs, &jpath).unwrap(); // succeeds despite free==0
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0501.JPG")));
+    }
+
+    #[test]
+    fn mid_copy_enospc_leaves_source_untouched() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0502", BUCKET_KEEP, &[("IMG_0502.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.set_cross_fs(true);
+        fs.set_free(u64::MAX); // preflight passes
+        fs.set_enospc_on_copy(true); // but the copy itself fails ENOSPC
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(matches!(err, ApplyError::Fs { .. }));
+        // Source intact, no final, no leftover partial.
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0502.JPG")));
+        assert!(!fs.exists(&dest.join(BUCKET_KEEP).join("IMG_0502.JPG")));
+        assert!(!fs.exists(&dest.join(BUCKET_KEEP).join(".IMG_0502.JPG.partial")));
     }
 }
