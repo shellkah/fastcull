@@ -189,8 +189,13 @@ fn read_orientation(data: &[u8]) -> u16 {
 }
 
 /// Decode `path`'s JPEG at/around `target`, apply EXIF orientation, return straight RGBA8.
+/// Errors: unreadable file -> `Io`; non-JPEG bytes -> `Unsupported`; corrupt/undecodable
+/// JPEG -> `Decode(msg)`. Never panics on bad input.
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
+    if !is_jpeg(&data) {
+        return Err(DecodeError::Unsupported);
+    }
     let orientation = read_orientation(&data);
     let decoded = match target {
         TargetSize::Full => decompress_scaled(&data, 1)?,
@@ -475,5 +480,42 @@ mod tests {
         assert_eq!(thumb.rgba.len(), thumb.w as usize * thumb.h as usize * 4);
         // Oriented like the main image: an orientation-6 portrait thumbnail is upright (h > w).
         assert!(thumb.h > thumb.w, "thumbnail must be oriented upright");
+    }
+
+    fn write_temp_named(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn decode_errors_map_correctly() {
+        // Missing / unreadable file -> Io
+        let missing = std::path::Path::new("/nonexistent/does/not/exist.jpg");
+        assert!(matches!(
+            decode(missing, TargetSize::Full),
+            Err(DecodeError::Io(_))
+        ));
+
+        // Non-JPEG bytes (PNG magic) -> Unsupported
+        let (_d1, p1) = write_temp_named("not.jpg", b"\x89PNG\r\n\x1a\n definitely not a jpeg");
+        assert!(matches!(
+            decode(&p1, TargetSize::Full),
+            Err(DecodeError::Unsupported)
+        ));
+
+        // Corrupt JPEG (valid SOI magic, garbage body) -> Decode, and it must NOT panic.
+        let (_d2, p2) = write_temp_named(
+            "corrupt.jpg",
+            b"\xFF\xD8\xFF\xEE\x00\x10 garbage not decodable",
+        );
+        assert!(matches!(
+            decode(&p2, TargetSize::Full),
+            Err(DecodeError::Decode(_))
+        ));
+        // Corrupt input through every target arm still returns cleanly (no panic).
+        assert!(decode(&p2, TargetSize::Scaled(2)).is_err());
+        assert!(decode(&p2, TargetSize::Fit(64, 64)).is_err());
     }
 }
