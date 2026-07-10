@@ -102,14 +102,16 @@ fn decompress_scaled(jpeg: &[u8], denom: u8) -> Result<DecodedImage, DecodeError
 }
 
 /// Decode `path`'s JPEG at/around `target`, returning straight RGBA8.
-/// (Full only in this task; Scaled/Fit and EXIF orientation land in later tasks.)
+/// (Fit and EXIF orientation land in later tasks.)
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
     match target {
         TargetSize::Full => decompress_scaled(&data, 1),
-        TargetSize::Scaled(_) | TargetSize::Fit(_, _) => Err(DecodeError::Decode(
-            "target not yet implemented".to_string(),
-        )),
+        TargetSize::Scaled(n) => match n {
+            1 | 2 | 4 | 8 => decompress_scaled(&data, n),
+            _ => Err(DecodeError::Decode(format!("unsupported scale 1/{n}"))),
+        },
+        TargetSize::Fit(_, _) => Err(DecodeError::Decode("Fit not yet implemented".to_string())),
     }
 }
 
@@ -201,5 +203,35 @@ mod tests {
             img.rgba.chunks_exact(4).all(|p| p[3] == 255),
             "alpha must be opaque 255"
         );
+    }
+
+    #[test]
+    fn decode_scaled_halves_dimensions() {
+        let jpeg = synth_jpeg(64, 48);
+        let (_dir, path) = write_temp_jpeg(&jpeg);
+
+        let half = decode(&path, TargetSize::Scaled(2)).expect("scaled 1/2");
+        assert_eq!((half.w, half.h), (32, 24));
+        assert_eq!(half.rgba.len(), 32 * 24 * 4);
+        assert!(
+            half.rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "1/2 scaled decode must write every pixel (alpha 255 across the zero-initialized buffer)"
+        );
+
+        let quarter = decode(&path, TargetSize::Scaled(4)).expect("scaled 1/4");
+        assert_eq!((quarter.w, quarter.h), (16, 12));
+        assert!(
+            quarter.rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "1/4 scaled decode must write every pixel (alpha 255 across the zero-initialized buffer)"
+        );
+
+        let full = decode(&path, TargetSize::Scaled(1)).expect("scaled 1/1");
+        assert_eq!((full.w, full.h), (64, 48));
+
+        // Unsupported scaling factor -> Decode error, no panic.
+        assert!(matches!(
+            decode(&path, TargetSize::Scaled(3)),
+            Err(DecodeError::Decode(_))
+        ));
     }
 }
