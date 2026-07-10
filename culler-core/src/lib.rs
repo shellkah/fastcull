@@ -5,6 +5,7 @@
 //! Nothing in this crate depends on Slint or any GUI type.
 
 pub mod apply;
+pub mod decode;
 pub mod fsops;
 pub mod model;
 pub mod persist;
