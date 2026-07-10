@@ -342,16 +342,37 @@ pub fn apply(
     execute(&mut journal, fs, journal_path)
 }
 
-/// Read `bytes` from disk and deserialize a journal.
+/// Read `bytes` from disk, deserialize a journal, and validate it is
+/// structurally consistent before any caller can index into it.
+///
+/// A journal that parses as valid JSON but whose `statuses` length disagrees
+/// with the plan's flattened move count (hand-edited or corrupted on disk) is
+/// refused here with a precise `Preflight` error — spec rev 4 §8: "refused
+/// gracefully with a precise error; the recovery path itself must never
+/// panic." Both `reconcile` and `execute` index `journal.statuses[gidx]`
+/// without bounds checks (that indexing is the load-bearing invariant this
+/// function protects); `read_journal` is the single choke point every journal
+/// read passes through — `resume` is the only current caller, but any future
+/// reader inherits the guard for free by going through this function rather
+/// than by re-deriving the check at each call site.
 fn read_journal(path: &Path) -> Result<Journal, ApplyError> {
     let bytes = std::fs::read(path).map_err(|e| ApplyError::Fs {
         path: path.to_path_buf(),
         source: e,
     })?;
-    serde_json::from_slice(&bytes).map_err(|e| ApplyError::Fs {
+    let journal: Journal = serde_json::from_slice(&bytes).map_err(|e| ApplyError::Fs {
         path: path.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidData, e),
-    })
+    })?;
+    let expected = total_move_count(&journal.plan);
+    let actual = journal.statuses.len();
+    if actual != expected {
+        return Err(ApplyError::Preflight(format!(
+            "corrupt journal at {}: plan expects {expected} move status entries but found {actual}",
+            path.display()
+        )));
+    }
+    Ok(journal)
 }
 
 /// The crash window can strand the journal on either side of reality (spec §8
@@ -917,6 +938,137 @@ mod tests {
             Some(100)
         );
         assert!(!jpath.exists(), "journal retired even though nothing ran");
+    }
+
+    // Supervisor-verified finding (Phase 4 follow-up F1): a journal that parses
+    // as valid JSON but whose `statuses` length disagrees with the plan's move
+    // count (hand-edited or corrupted on disk) must be refused gracefully
+    // (spec rev 4 §8: "refused gracefully with a precise error; the recovery
+    // path itself must never panic"), not index out of bounds in `reconcile`/
+    // `execute`. These three pin empty, short, and over-long `statuses` vecs.
+    #[test]
+    fn resume_refuses_empty_statuses_against_one_move_plan() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_1000", BUCKET_KEEP, &[("IMG_1000.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1); // 1 move total
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let corrupt = Journal {
+            plan: plan.clone(),
+            statuses: vec![], // expected 1, found 0
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+
+        let err = resume(&jpath, &fs).unwrap_err();
+        match err {
+            ApplyError::Preflight(msg) => {
+                assert!(
+                    msg.contains(&jpath.display().to_string()),
+                    "message names the journal path: {msg}"
+                );
+                assert!(
+                    msg.contains("expected 1") || msg.contains("expects 1"),
+                    "message names the expected count: {msg}"
+                );
+                assert!(msg.contains('0'), "message names the actual count: {msg}");
+            }
+            other => panic!("expected ApplyError::Preflight, got {other:?}"),
+        }
+
+        // Disk untouched: no move executed, no reconcile, journal left in place.
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_1000.JPG")),
+            "source untouched"
+        );
+        assert!(
+            !fs.exists(&dest.join(BUCKET_KEEP).join("IMG_1000.JPG")),
+            "dest not created"
+        );
+        assert!(jpath.exists(), "corrupt journal left on disk as evidence");
+    }
+
+    #[test]
+    fn resume_refuses_short_statuses_against_two_move_plan() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_1001",
+            BUCKET_KEEP,
+            &[("IMG_1001.JPG", 100), ("IMG_1001.CR3", 100)],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1); // 2 moves total
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let corrupt = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Pending], // expected 2, found 1
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+
+        let err = resume(&jpath, &fs).unwrap_err();
+        match err {
+            ApplyError::Preflight(msg) => {
+                assert!(msg.contains(&jpath.display().to_string()));
+                assert!(msg.contains("expected 2") || msg.contains("expects 2"));
+                assert!(msg.contains('1'));
+            }
+            other => panic!("expected ApplyError::Preflight, got {other:?}"),
+        }
+
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_1001.JPG")),
+            "source untouched"
+        );
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_1001.CR3")),
+            "source untouched"
+        );
+        assert!(!fs.exists(&dest.join(BUCKET_KEEP).join("IMG_1001.JPG")));
+        assert!(!fs.exists(&dest.join(BUCKET_KEEP).join("IMG_1001.CR3")));
+        assert!(jpath.exists(), "corrupt journal left on disk as evidence");
+    }
+
+    #[test]
+    fn resume_refuses_overlong_statuses_against_one_move_plan() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_1002", BUCKET_KEEP, &[("IMG_1002.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1); // 1 move total
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let corrupt = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Done, OpState::Pending, OpState::Failed], // expected 1, found 3
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&corrupt).unwrap()).unwrap();
+
+        let err = resume(&jpath, &fs).unwrap_err();
+        match err {
+            ApplyError::Preflight(msg) => {
+                assert!(msg.contains(&jpath.display().to_string()));
+                assert!(msg.contains("expected 1") || msg.contains("expects 1"));
+                assert!(msg.contains('3'));
+            }
+            other => panic!("expected ApplyError::Preflight, got {other:?}"),
+        }
+
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_1002.JPG")),
+            "source untouched"
+        );
+        assert!(!fs.exists(&dest.join(BUCKET_KEEP).join("IMG_1002.JPG")));
+        assert!(jpath.exists(), "corrupt journal left on disk as evidence");
     }
 
     #[test]
