@@ -127,6 +127,19 @@ fn resize_rgba(src: DecodedImage, tw: u32, th: u32) -> Result<DecodedImage, Deco
     })
 }
 
+/// Largest denom in {8,4,2,1} whose 1/denom scaled dims still cover the
+/// `bw x bh` box (>= both sides); 1 if none does. Pure — extracted from
+/// `decode_fit` so the selection logic is unit-pinnable (the chosen denom
+/// is not observable from decode()'s output dims once the resize finishes).
+fn fit_denom(w: usize, h: usize, bw: usize, bh: usize) -> u8 {
+    for &d in &[8u8, 4, 2, 1] {
+        if scaled_dim(w, d) >= bw && scaled_dim(h, d) >= bh {
+            return d;
+        }
+    }
+    1
+}
+
 /// Decode into a box: smallest turbojpeg scaled level >= box, then aspect-preserving
 /// SIMD downscale to fit. Never upscales. Orientation is applied by the caller.
 fn decode_fit(data: &[u8], fit_w: u32, fit_h: u32) -> Result<DecodedImage, DecodeError> {
@@ -136,14 +149,7 @@ fn decode_fit(data: &[u8], fit_w: u32, fit_h: u32) -> Result<DecodedImage, Decod
         .map_err(|e| DecodeError::Decode(e.to_string()))?;
     let (bw, bh) = (fit_w as usize, fit_h as usize);
 
-    // Largest denom (smallest decoded image) whose scaled dims still cover the box; else full.
-    let mut denom = 1u8;
-    for &d in &[8u8, 4, 2, 1] {
-        if scaled_dim(header.width, d) >= bw && scaled_dim(header.height, d) >= bh {
-            denom = d;
-            break;
-        }
-    }
+    let denom = fit_denom(header.width, header.height, bw, bh);
 
     let decoded = decompress_scaled(data, denom)?;
     let (sw, sh) = (decoded.w as f64, decoded.h as f64);
@@ -154,7 +160,7 @@ fn decode_fit(data: &[u8], fit_w: u32, fit_h: u32) -> Result<DecodedImage, Decod
 }
 
 /// Decode `path`'s JPEG at/around `target`, returning straight RGBA8.
-/// (Fit and EXIF orientation land in later tasks.)
+/// (EXIF orientation lands in a later task.)
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
     match target {
@@ -288,6 +294,29 @@ mod tests {
     }
 
     #[test]
+    fn fit_denom_pins_every_branch() {
+        // d=2 scaled dims are (32,24): width 32>=32 covers, height 24>=32
+        // does not -> AND binds and rejects d=2; only d=1 (64,48) covers
+        // both -> denom=1. Pins the AND in the predicate.
+        assert_eq!(fit_denom(64, 48, 32, 32), 1);
+        // d=4 scaled dims (32,24) fail height like above; d=2 scaled dims
+        // (64,48) cover both -> denom=2. Pins the d=2 branch.
+        assert_eq!(fit_denom(128, 96, 32, 32), 2);
+        // d=8 scaled dims (32,24) fail height; d=4 scaled dims (64,48)
+        // cover both -> denom=4. Pins the d=4 branch.
+        assert_eq!(fit_denom(256, 192, 32, 32), 4);
+        // d=8 scaled dims (64,48) cover both on the first iteration ->
+        // denom=8. Pins the d=8 branch (first-match wins, largest denom).
+        assert_eq!(fit_denom(512, 384, 32, 32), 8);
+        // d=8 scaled dims are exactly (32,32) == the box -> covers via
+        // >=, not >. Pins the boundary condition at exact equality.
+        assert_eq!(fit_denom(256, 256, 32, 32), 8);
+        // Box (200,200) is larger than the image at every denom -> no
+        // branch matches -> falls through to the trailing default of 1.
+        assert_eq!(fit_denom(64, 48, 200, 200), 1);
+    }
+
+    #[test]
     fn decode_fit_downscales_within_box() {
         let jpeg = synth_jpeg(64, 48);
         let (_dir, path) = write_temp_jpeg(&jpeg);
@@ -300,5 +329,27 @@ mod tests {
         // A box bigger than the image never upscales.
         let big = decode(&path, TargetSize::Fit(200, 200)).expect("fit big");
         assert_eq!((big.w, big.h), (64, 48));
+    }
+
+    /// Belt-and-suspenders for `fit_denom_pins_every_branch`: that unit test is
+    /// the actual mutation-killer for the denom-selection loop (the chosen
+    /// denom is not observable from final dims once resize_rgba finishes —
+    /// both denom=1 and denom=4 land on the same 32x24 output here). This
+    /// test instead exercises the real FFI path (read_header + decompress_scaled
+    /// at denom=4 + resize_rgba) end to end, so a regression in the turbojpeg
+    /// wiring around the reduced-denom branches still shows up somewhere.
+    #[test]
+    fn decode_fit_reduced_denom_path() {
+        let jpeg = synth_jpeg(256, 192);
+        let (_dir, path) = write_temp_jpeg(&jpeg);
+        // 256x192 into a 32x32 box: fit_denom picks d=4 (scaled 64x48 covers
+        // the box; d=8's 32x24 fails height), then resize 64x48 -> 32x24.
+        let img = decode(&path, TargetSize::Fit(32, 32)).expect("fit reduced denom");
+        assert_eq!((img.w, img.h), (32, 24));
+        assert_eq!(img.rgba.len(), 32 * 24 * 4);
+        assert!(
+            img.rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "alpha must be opaque 255 across the full resized buffer"
+        );
     }
 }
