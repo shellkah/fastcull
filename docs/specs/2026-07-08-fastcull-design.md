@@ -237,9 +237,16 @@ Each shot's fileset `{JPEG, RAW?, .xmp?}` is moved as a **group**.
   destination (breadcrumb) so the next launch on the source folder can find
   the journal; on full success the journal is **removed** and the breadcrumb
   cleared (the journal is FastCull's own bookkeeping, not user data — the §2
-  no-deletion guarantee protects photos, not our metadata). A journal
-  containing any non-`Done` entry marks a crashed run; an all-`Done` journal
-  must never be mistaken for one.
+  no-deletion guarantee protects photos, not our metadata). **Journal
+  *presence* marks an incomplete run (rev 4).** Success removes the journal
+  only *after* the sidecar-dir durability pass, so even an all-`Done` journal
+  on disk still owes that pass: resuming it re-runs the fsyncs and retires the
+  journal — a cheap heal that never re-executes moves — after which a fresh
+  apply into the same dest proceeds normally (no stale-journal hijack: the
+  retired journal is gone). Crash detection must key on presence, never on
+  "has a non-`Done` entry"; the only *finished* state is a removed journal.
+  *(rev 3 keyed detection on non-`Done` entries, which after rev 4's
+  durability pass would silently drop the owed fsyncs.)*
 - **Resume reconciliation (rev 3)** → a crash can land between a completed
   move and its journal update (or the reverse: journal fsynced, rename lost).
   `resume` therefore reconciles the journal against the disk in both
@@ -333,9 +340,10 @@ gold = best, red = reject.
   atomicity, **crash-mid-apply → journal recovery resumes correctly**,
   **crash *between* a move and its journal update → resume reconciles instead
   of erroring (both directions)**, **sidecar writes refuse to clobber and are
-  skip-idempotent on resume**, **journal removed on success (an all-`Done`
-  journal never triggers a recovery offer or hijacks a later apply into the
-  same dest)**, and ENOSPC / permission failures injected via the `FsOps`
+  skip-idempotent on resume**, **journal retired only after the durability pass
+  (resuming an all-`Done` journal re-runs the owed fsyncs and retires it; a
+  fresh apply after a successful run never resumes a stale plan — the journal
+  is gone)**, and ENOSPC / permission failures injected via the `FsOps`
   trait. This is where data loss would occur, so it gets the most coverage.
 - `model` — state-transition unit tests: tier changes, `Option<Tier>` +
   `visited` semantics, undo stack, per-tier counts.

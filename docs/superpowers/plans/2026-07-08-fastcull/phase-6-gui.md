@@ -42,7 +42,7 @@ Copied verbatim from [README.md](README.md); every task's requirements implicitl
 - **A destination file appearing between plan and apply must fail loudly** (NOREPLACE returns `EEXIST`) — surfaced by `apply`, reported by the binary; never silently overwrite.
 - **Decisions are keyed by filename stem** so resume re-attaches them after a rescan. Corrupt session file → renamed to `.fastcull.json.bad`, reported, fresh session started (handled by `load_or_fresh`).
 - **Destination = source root itself is refused** (a source *subfolder* is allowed). Pure guard, unit-tested.
-- **Crash detection (spec §6/§8 rev 3):** the journal lives in the *destination* but launches open the *source* — the link between them is the **`Session.pending_apply` breadcrumb**, set + autosaved just before an apply's first move and cleared on success. On launch, probe the breadcrumb's dest (and the source dir itself, in case it was a prior run's destination); when a dest is chosen in the dialog, probe it directly. `find_crashed_apply` only reports a journal with ≥1 non-`Done` entry (success removes the journal, so this is defense in depth) — an all-`Done` leftover must never trigger a recovery offer or hijack a fresh apply. Offer resume-or-report (`resume()` or a formatted report).
+- **Crash detection (spec §6/§8 rev 4):** the journal lives in the *destination* but launches open the *source* — the link between them is the **`Session.pending_apply` breadcrumb**, set + autosaved just before an apply's first move and cleared on success. On launch, probe the breadcrumb's dest (and the source dir itself, in case it was a prior run's destination); when a dest is chosen in the dialog, probe it directly. **`find_crashed_apply` reports ANY journal present — journal PRESENCE = incomplete run (rev 4).** Success removes the journal only after the sidecar-dir durability pass, so an all-`Done` journal still owes that pass: `resume()` on it re-runs the fsyncs and retires it (cheap heal, no moves re-executed), after which a fresh apply proceeds — no stale-journal hijack, because the retired journal is gone. Never key detection on "has a non-`Done` entry" (the rev-3 rule; it would silently drop the owed fsyncs). Offer resume-or-report (`resume()` or a formatted report).
 - **Apply never runs on the UI thread.** `apply`/`resume` execute on a worker thread; the UI polls the journal (rewritten as moves complete) for the 2c progress screen and receives completion via `invoke_from_event_loop`. **Autosave is debounced** (dirty-flag + timer), never a synchronous fsync per keypress — spec §12's sub-frame navigation is a hard target.
 - **Platform:** Linux only. `rustix`/`renameat2`/`statvfs` live in core; the binary uses `culler_core::RealFs` for filesystem probes (`same_filesystem`, `free_space`).
 - **TDD, DRY, YAGNI, frequent commits.** Every logic task: failing test → run-it-fails → minimal impl → run-it-passes → commit. Conventional-commit messages (`feat:`, `test:`). Purely-visual tasks replace Steps 1–4 with a Manual verification checklist but still show complete code.
@@ -2468,9 +2468,11 @@ mod crash_tests {
         assert!(report.contains("pending: 1"));
         assert!(report.contains("failed: 0"));
 
-        // An all-Done journal is a FINISHED run, not a crash (spec §8 rev 3):
-        // no recovery offer, and a fresh apply into this dest must not be
-        // hijacked into resuming it.
+        // An all-Done journal is STILL an incomplete run (spec §8 rev 4): it
+        // owes its sidecar-dir durability pass — success removes the journal
+        // only after that pass. Detection keys on PRESENCE; resume() heals
+        // (re-fsyncs, retires the journal) without re-executing moves, and a
+        // fresh apply proceeds afterwards (no hijack: the journal is gone).
         let finished = culler_core::Journal {
             plan: journal.plan.clone(),
             statuses: vec![culler_core::OpState::Done, culler_core::OpState::Done],
@@ -2480,7 +2482,7 @@ mod crash_tests {
             serde_json::to_vec(&finished).unwrap(),
         )
         .unwrap();
-        assert!(find_crashed_apply(dest).is_none());
+        assert!(find_crashed_apply(dest).is_some());
     }
 }
 ```
@@ -2491,28 +2493,17 @@ mod crash_tests {
 
 Append to the non-test region of `culler/src/startup.rs`:
 ```rust
-/// Detect an interrupted apply: a journal left in `dir` by a prior crashed run.
-/// Only a journal with UNFINISHED work (≥1 non-`Done` status) counts — success
-/// removes the journal, so this is defense in depth: an all-`Done` leftover or
-/// copy must never trigger a recovery offer or hijack a fresh apply into this
-/// dest (spec §8 rev 3). An unreadable/corrupt journal IS surfaced (returned),
-/// not silently ignored — `journal_report` will show the parse failure.
+/// Detect an interrupted apply: any journal left in `dir` by a prior run.
+/// Journal PRESENCE = incomplete run (spec §8 rev 4): success removes the
+/// journal only after the sidecar-dir durability pass, so even an all-`Done`
+/// journal still owes that pass — `resume()` on it re-runs the fsyncs and
+/// retires it without re-executing moves; a fresh apply proceeds afterwards
+/// (no stale-journal hijack: the retired journal is gone). An unreadable or
+/// corrupt journal IS surfaced (returned), not silently ignored —
+/// `journal_report` will show the parse failure.
 pub fn find_crashed_apply(dir: &Path) -> Option<PathBuf> {
     let j = dir.join(culler_core::JOURNAL_FILE);
-    if !j.is_file() {
-        return None;
-    }
-    let Ok(bytes) = std::fs::read(&j) else {
-        return Some(j); // unreadable: surface it, don't ignore it
-    };
-    let Ok(journal) = serde_json::from_slice::<culler_core::Journal>(&bytes) else {
-        return Some(j); // corrupt: surface it, don't ignore it
-    };
-    if journal.statuses.iter().any(|s| *s != culler_core::OpState::Done) {
-        Some(j)
-    } else {
-        None // finished run — nothing to resume
-    }
+    if j.is_file() { Some(j) } else { None }
 }
 
 /// Human-readable per-op status summary for the resume-or-report prompt.
@@ -2807,10 +2798,12 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
         });
     }
 
-    // Confirm: resume a GENUINELY interrupted run (find_crashed_apply is
-    // non-Done-aware — an all-Done leftover never hijacks a fresh apply), else
-    // fresh apply. Always on a worker thread: a 2k-file move must not freeze
-    // the window. Progress = polling the journal the engine rewrites per move.
+    // Confirm: resume any run whose journal is still present (rev 4: presence
+    // = incomplete; resuming an all-Done journal just re-runs the owed
+    // durability fsyncs and retires it — no moves re-executed, no hijack of a
+    // fresh apply, which proceeds after the heal), else fresh apply. Always on
+    // a worker thread: a 2k-file move must not freeze the window. Progress =
+    // polling the journal the engine rewrites per move.
     {
         let session = session.clone();
         let buckets = buckets.clone();
@@ -2907,7 +2900,7 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
   - "Compute preview" shows per-bucket counts including `00_rejected`, collision auto-suffix count, skipped-sidecar count, stale count, unrecognized-files-left-behind count, and total MB.
   - Choosing a destination on another filesystem shows a free-space line; Confirm is disabled when space is insufficient.
   - Confirm executes the move **on a worker thread — the window stays responsive and the 2c progress line updates from the polled journal**: buckets appear in dest, rejects land in `00_rejected` (never deleted), the journal is **gone** afterwards, the session `.fastcull.json` is relocated into dest **with `pending_apply` cleared**, and the source is left with only the unrecognized files.
-  - Pointing the dialog at a dest that holds a genuinely interrupted `.fastcull-apply.json` (≥1 non-Done) shows the report and Confirm **resumes** it (verify against a deliberately half-written journal). Applying **again into the same dest after a successful run must perform a fresh apply** — no stale-journal hijack (the journal was removed; `find_crashed_apply` is non-Done-aware as defense in depth).
+  - Pointing the dialog at a dest that holds any `.fastcull-apply.json` shows the report and Confirm **resumes** it (verify against a deliberately half-written journal; also verify an all-`Done` journal — rev 4 — resumes as a quick durability heal that retires the journal without re-moving files). Applying **again into the same dest after a successful run must perform a fresh apply** — no stale-journal hijack (success retired the journal; presence-keyed detection finds nothing).
   - Crash breadcrumb: kill the app mid-apply (large fixture), relaunch on the **source** — the interrupted-apply report appears via `session.pending_apply` even though the journal lives in dest; after resuming successfully, relaunch shows nothing.
   - Launch-time: starting `culler` on a folder that contains a leftover *interrupted* journal prints the report to stderr (Task 11 `main`), confirming detection.
 
