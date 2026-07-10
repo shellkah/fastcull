@@ -1,6 +1,8 @@
 //! JPEG decode pipeline: (path, target) -> straight RGBA8, EXIF-oriented.
 //! GUI-free: emits plain `Vec<u8>` RGBA, never `slint::Image`.
 
+use std::path::Path;
+
 /// Target decode size. `Scaled(n)` = 1/n via turbojpeg native scaled decode (n in {1,2,4,8}).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetSize {
@@ -59,6 +61,58 @@ fn apply_orientation(rgba: Vec<u8>, w: u32, h: u32, orientation: u16) -> (Vec<u8
     (out, ow, oh)
 }
 
+/// TurboJPEG scaled dimension: ceil(dim / denom) — the same rounding as the C
+/// library's TJSCALED macro with numerator 1, so requesting exactly these
+/// dimensions makes tjDecompress2 decode at exactly 1/denom.
+fn scaled_dim(dim: usize, denom: u8) -> usize {
+    dim.div_ceil(denom as usize)
+}
+
+/// Decompress a JPEG at native scale 1/`denom` (denom in {1,2,4,8}) into straight RGBA8.
+/// No orientation applied here. Any turbojpeg failure maps to `DecodeError::Decode`.
+///
+/// turbojpeg 0.5 (legacy TurboJPEG API) has no explicit scaling-factor call:
+/// `tjDecompress2` decodes at the largest scaling factor that fits the CALLER-
+/// SUPPLIED output dimensions, and `Decompressor::decompress` passes our
+/// `Image` dims straight through — so allocating the buffer at the TJSCALED
+/// 1/denom dimensions selects exactly the native 1/denom DCT-scaled decode.
+fn decompress_scaled(jpeg: &[u8], denom: u8) -> Result<DecodedImage, DecodeError> {
+    let mut dec = turbojpeg::Decompressor::new().map_err(|e| DecodeError::Decode(e.to_string()))?;
+    let header = dec
+        .read_header(jpeg)
+        .map_err(|e| DecodeError::Decode(e.to_string()))?;
+    let (w, h) = (
+        scaled_dim(header.width, denom),
+        scaled_dim(header.height, denom),
+    );
+    let mut image = turbojpeg::Image {
+        pixels: vec![0u8; w * h * 4],
+        width: w,
+        pitch: w * 4,
+        height: h,
+        format: turbojpeg::PixelFormat::RGBA,
+    };
+    dec.decompress(jpeg, image.as_deref_mut())
+        .map_err(|e| DecodeError::Decode(e.to_string()))?;
+    Ok(DecodedImage {
+        w: w as u32,
+        h: h as u32,
+        rgba: image.pixels,
+    })
+}
+
+/// Decode `path`'s JPEG at/around `target`, returning straight RGBA8.
+/// (Full only in this task; Scaled/Fit and EXIF orientation land in later tasks.)
+pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
+    let data = std::fs::read(path).map_err(DecodeError::Io)?;
+    match target {
+        TargetSize::Full => decompress_scaled(&data, 1),
+        TargetSize::Scaled(_) | TargetSize::Fit(_, _) => Err(DecodeError::Decode(
+            "target not yet implemented".to_string(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +160,46 @@ mod tests {
         let (out9, w9, h9) = apply_orientation(src.clone(), 2, 3, 9);
         assert_eq!((w9, h9), (2, 3));
         assert_eq!(out9, src);
+    }
+
+    /// Compress a synthetic RGBA gradient to JPEG bytes (no EXIF, orientation absent).
+    fn synth_jpeg(w: usize, h: usize) -> Vec<u8> {
+        let mut px = vec![0u8; w * h * 4];
+        for i in 0..w * h {
+            px[i * 4] = (i % 256) as u8;
+            px[i * 4 + 1] = 128;
+            px[i * 4 + 2] = 64;
+            px[i * 4 + 3] = 255;
+        }
+        let image = turbojpeg::Image {
+            pixels: px.as_slice(),
+            width: w,
+            pitch: w * 4,
+            height: h,
+            format: turbojpeg::PixelFormat::RGBA,
+        };
+        let jpeg = turbojpeg::compress(image, 95, turbojpeg::Subsamp::Sub2x2).unwrap();
+        jpeg[..].to_vec()
+    }
+
+    /// Write bytes to a temp file; keep the returned TempDir alive for the test's lifetime.
+    fn write_temp_jpeg(bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic.jpg");
+        std::fs::write(&path, bytes).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn decode_full_roundtrip() {
+        let jpeg = synth_jpeg(64, 48);
+        let (_dir, path) = write_temp_jpeg(&jpeg);
+        let img = decode(&path, TargetSize::Full).expect("decode Full");
+        assert_eq!((img.w, img.h), (64, 48));
+        assert_eq!(img.rgba.len(), 64 * 48 * 4);
+        assert!(
+            img.rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "alpha must be opaque 255"
+        );
     }
 }
