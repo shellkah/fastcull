@@ -871,6 +871,52 @@ mod tests {
         assert!(!fs.exists(&PathBuf::from("/src/IMG_0420.JPG")));
     }
 
+    // Post-final-review addition: pins spec §8 rev 3's "an all-Done journal is
+    // never re-executed" property. Disk state models a crashed run that fully
+    // completed and journaled Done for every move but died before the journal
+    // could be retired — only the DEST files exist, sources are already gone.
+    // Phase 6's `find_crashed_apply` gate relies on `resume` treating this as
+    // a safe no-op rather than attempting (and failing) to re-move vanished
+    // sources.
+    #[test]
+    fn resume_on_all_done_journal_is_a_safe_noop() {
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot(
+            "IMG_0900",
+            BUCKET_KEEP,
+            &[("IMG_0900.JPG", 100), ("IMG_0900.CR3", 100)],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        // The moves already happened: dest files present, sources NOT seeded.
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0900.JPG"), 100);
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0900.CR3"), 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let done = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Done, OpState::Done],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&done).unwrap()).unwrap();
+
+        let report = resume(&jpath, &fs).unwrap();
+
+        // Nothing re-executed — a re-move would have failed ENOENT (no source).
+        assert_eq!(report.moved_files, 0, "an all-Done journal replays nothing");
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0900.JPG")),
+            Some(100)
+        );
+        assert_eq!(
+            fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0900.CR3")),
+            Some(100)
+        );
+        assert!(!jpath.exists(), "journal retired even though nothing ran");
+    }
+
     #[test]
     fn preflight_refuses_when_cross_fs_and_not_enough_space() {
         let dest = PathBuf::from("/dst");
