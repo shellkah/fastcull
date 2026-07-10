@@ -599,7 +599,14 @@ mod tests {
             other => panic!("expected Collision, got {other:?}"),
         }
         // NEVER overwritten; source stays put.
-        assert_eq!(fs.len_of(&target), Some(999), "existing dest file untouched");
-        assert!(fs.exists(&PathBuf::from("/src/IMG_0200.JPG")), "source not moved");
+        assert_eq!(
+            fs.len_of(&target),
+            Some(999),
+            "existing dest file untouched"
+        );
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_0200.JPG")),
+            "source not moved"
+        );
     }
 }
