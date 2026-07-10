@@ -609,4 +609,65 @@ mod tests {
             "source not moved"
         );
     }
+
+    /// Stem of the shot where the run stopped: the op owning the first non-`Done` move.
+    fn stopped_stem(j: &Journal) -> Option<String> {
+        let mut gidx = 0usize;
+        for op in &j.plan.ops {
+            for _ in &op.moves {
+                if j.statuses[gidx] != OpState::Done {
+                    return Some(op.stem.clone());
+                }
+                gidx += 1;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn apply_group_atomicity_stops_and_records_partial() {
+        let dest = PathBuf::from("/dst");
+        // shot A completes; shot B fails on its RAW (second file) → stop at B.
+        let (a, ba) = shot("IMG_0300", BUCKET_KEEP, &[("IMG_0300.JPG", 100)], &dest);
+        let (b, bb) = shot(
+            "IMG_0301",
+            BUCKET_PICKS,
+            &[
+                ("IMG_0301.JPG", 100),
+                ("IMG_0301.CR3", 100),
+                ("IMG_0301.xmp", 100),
+            ],
+            &dest,
+        );
+        let plan = plan_of(&dest, vec![a, b], ba + bb);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops);
+        fs.deny_rename_from("/src/IMG_0301.CR3"); // later file in shot B
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        assert!(matches!(err, ApplyError::Fs { .. }));
+
+        // Shot A fully moved; shot B's first file moved, its RAW + xmp still at source.
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0300.JPG")));
+        assert!(!fs.exists(&PathBuf::from("/src/IMG_0301.JPG")));
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0301.CR3")));
+        assert!(fs.exists(&PathBuf::from("/src/IMG_0301.xmp")));
+
+        // Durable journal is the stop-of-record.
+        let j: Journal = serde_json::from_slice(&std::fs::read(&jpath).unwrap()).unwrap();
+        assert_eq!(
+            j.statuses,
+            vec![
+                OpState::Done,
+                OpState::Done,
+                OpState::Failed,
+                OpState::Pending
+            ]
+        );
+        assert_eq!(stopped_stem(&j), Some("IMG_0301".to_string())); // ApplyReport.stopped_at equivalent
+    }
 }
