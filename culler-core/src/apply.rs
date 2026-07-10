@@ -107,6 +107,23 @@ fn write_journal(journal: &Journal, path: &Path, sync: bool) -> Result<(), Apply
     })
 }
 
+/// Batched-fsync cadence for the incremental (non-checkpoint) journal writes
+/// in `execute`/`finish_published`: sync every 64th move. Extracted to a pure
+/// predicate (F5/F6, Phase 4 follow-up) so a one-character typo here — `%46`,
+/// `!is_multiple_of`, an off-by-one — is unit-pinnable; the call sites feed it
+/// real `FsOps` journal I/O that a `FakeFs`-backed test can't observe (the
+/// journal is written via `std::fs`, not through `FsOps`), so nothing else in
+/// the test suite would catch a cadence regression.
+///
+/// `moved_files` is always incremented immediately before this is called, so
+/// in practice the argument is always `>= 1`; `should_sync_journal(0)` is
+/// unreachable from `execute` today, but its value is pinned anyway
+/// (`is_multiple_of` treats 0 as a multiple of everything, so `true`) so a
+/// future caller can't silently inherit an unexamined edge case.
+fn should_sync_journal(moved_files: usize) -> bool {
+    moved_files.is_multiple_of(64)
+}
+
 /// Outcome of `move_one`: whether the move finished immediately (same-FS
 /// rename) or only reached the cross-FS "published" checkpoint, where the
 /// destination copy is durably renamed into place but the source unlink is
@@ -284,7 +301,11 @@ fn finish_published(
         Ok(()) => {
             journal.statuses[gidx] = OpState::Done;
             report.moved_files += 1;
-            write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))
+            write_journal(
+                journal,
+                journal_path,
+                should_sync_journal(report.moved_files),
+            )
         }
         Err(e) => {
             let _ = write_journal(journal, journal_path, true); // durable Published stop record
@@ -365,14 +386,22 @@ fn execute(
                     // (and at checkpoints) — reconciliation (Task 8) makes an
                     // unsynced tail harmless, and this doubles as the progress
                     // feed the Phase-6 UI polls from a worker thread.
-                    write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))?;
+                    write_journal(
+                        journal,
+                        journal_path,
+                        should_sync_journal(report.moved_files),
+                    )?;
                 }
                 Ok(MoveOutcome::Published) => {
                     // Publish rename just succeeded: journal the checkpoint
                     // (existing batched-fsync policy, unchanged) BEFORE
                     // finishing the unlink — spec §8 rev 4.
                     journal.statuses[gidx] = OpState::Published;
-                    write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))?;
+                    write_journal(
+                        journal,
+                        journal_path,
+                        should_sync_journal(report.moved_files),
+                    )?;
                     finish_published(fs, mv, journal, gidx, journal_path, &mut report)?;
                     shot_did_work = true;
                 }
@@ -1188,6 +1217,27 @@ mod tests {
             report.moved_shots, 1,
             "shot A was a fully-skipped no-op; only shot B did work this run"
         );
+    }
+
+    // Phase 4 follow-up (F6): the batched-fsync cadence used at the
+    // incremental (non-checkpoint) journal writes was an inline
+    // `report.moved_files.is_multiple_of(64))` at three call sites — a
+    // one-character typo (`%46`, `!is_multiple_of`, an off-by-one) would
+    // silently change durability cadence, and nothing in the FakeFs-backed
+    // suite could catch it because journal I/O is real `std::fs`, never
+    // routed through `FsOps`. Extracting `should_sync_journal` makes the
+    // cadence itself unit-pinnable.
+    #[test]
+    fn should_sync_journal_fires_only_on_multiples_of_64() {
+        assert!(!should_sync_journal(1));
+        assert!(!should_sync_journal(63));
+        assert!(should_sync_journal(64));
+        assert!(!should_sync_journal(65));
+        assert!(should_sync_journal(128));
+        // Unreachable from `execute` today (moved_files is incremented before
+        // every call site), but pinned anyway: `is_multiple_of` treats 0 as a
+        // multiple of everything, so `should_sync_journal(0)` is `true`.
+        assert!(should_sync_journal(0));
     }
 
     // Supervisor-verified finding (Phase 4 follow-up F1): a journal that parses
