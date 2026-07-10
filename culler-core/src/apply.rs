@@ -330,6 +330,15 @@ fn execute(
     let mut sidecar_dirs: BTreeSet<PathBuf> = BTreeSet::new();
 
     for op in &ops {
+        // F5 (Phase 4 follow-up): `moved_shots` counts a shot only if THIS RUN
+        // performed at least one of (a) a same-FS rename, (b) a cross-FS
+        // publish, (c) a Published-finish (source unlink) completing a move
+        // begun in a prior run, or (d) an actual sidecar write. A shot whose
+        // every move was already `Done` on entry and whose sidecar target was
+        // already present did no work this run and must not be counted —
+        // otherwise `resume` over-counts shots a crashed-then-resumed run
+        // merely walked past.
+        let mut shot_did_work = false;
         for mv in &op.moves {
             match journal.statuses[gidx] {
                 OpState::Done => {
@@ -341,6 +350,7 @@ fn execute(
                     // destination is already durably ours — finish the source
                     // unlink, do NOT re-copy.
                     finish_published(fs, mv, journal, gidx, journal_path, &mut report)?;
+                    shot_did_work = true;
                     gidx += 1;
                     continue;
                 }
@@ -350,6 +360,7 @@ fn execute(
                 Ok(MoveOutcome::Moved) => {
                     journal.statuses[gidx] = OpState::Done;
                     report.moved_files += 1;
+                    shot_did_work = true;
                     // Persist progress incrementally; fsync only every 64th move
                     // (and at checkpoints) — reconciliation (Task 8) makes an
                     // unsynced tail harmless, and this doubles as the progress
@@ -363,6 +374,7 @@ fn execute(
                     journal.statuses[gidx] = OpState::Published;
                     write_journal(journal, journal_path, report.moved_files.is_multiple_of(64))?;
                     finish_published(fs, mv, journal, gidx, journal_path, &mut report)?;
+                    shot_did_work = true;
                 }
                 Err(e) => {
                     journal.statuses[gidx] = OpState::Failed;
@@ -381,6 +393,7 @@ fn execute(
                     Ok(()) => {
                         report.sidecars_written += 1;
                         target_present = true;
+                        shot_did_work = true; // F5: an actual write is work this run
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                         target_present = true; // raced with someone else's write
@@ -400,7 +413,9 @@ fn execute(
                 sidecar_dirs.insert(dir.to_path_buf());
             }
         }
-        report.moved_shots += 1;
+        if shot_did_work {
+            report.moved_shots += 1;
+        }
     }
 
     // End-of-success durability pass (spec §8 rev 4, session-scoped per the
@@ -1120,6 +1135,10 @@ mod tests {
         // Nothing re-executed — a re-move would have failed ENOENT (no source).
         assert_eq!(report.moved_files, 0, "an all-Done journal replays nothing");
         assert_eq!(
+            report.moved_shots, 0,
+            "the shot did no work this run (F5): fully-skipped shots must not count"
+        );
+        assert_eq!(
             fs.len_of(&dest.join(BUCKET_KEEP).join("IMG_0900.JPG")),
             Some(100)
         );
@@ -1128,6 +1147,47 @@ mod tests {
             Some(100)
         );
         assert!(!jpath.exists(), "journal retired even though nothing ran");
+    }
+
+    // Phase 4 follow-up (F5): `moved_shots` must count only shots that did
+    // ACTUAL work this run (a move executed, or a sidecar was written), not
+    // every `ShotOp` the loop merely iterated over. A resume where shot A is
+    // already fully `Done` (a true no-op — dest present, source gone, so
+    // `reconcile` leaves it `Done`) alongside shot B still `Pending` must
+    // report exactly ONE moved shot, not two.
+    #[test]
+    fn resume_moved_shots_counts_only_shots_that_did_work_this_run() {
+        let dest = PathBuf::from("/dst");
+        let (a, ba) = shot("IMG_0950", BUCKET_KEEP, &[("IMG_0950.JPG", 100)], &dest);
+        let (b, bb) = shot("IMG_0951", BUCKET_PICKS, &[("IMG_0951.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![a, b], ba + bb);
+
+        let fs = FakeFs::new();
+        // Shot A: the crashed run already fully applied it — dest present,
+        // source gone. reconcile() leaves its Done status alone (a true no-op).
+        fs.seed_file(dest.join(BUCKET_KEEP).join("IMG_0950.JPG"), 100);
+        // Shot B: still pending — source present, dest missing — so it
+        // actually moves this run.
+        fs.seed_file("/src/IMG_0951.JPG", 100);
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+        let stale = Journal {
+            plan: plan.clone(),
+            statuses: vec![OpState::Done, OpState::Pending],
+        };
+        std::fs::write(&jpath, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let report = resume(&jpath, &fs).unwrap();
+
+        assert_eq!(
+            report.moved_files, 1,
+            "only shot B's file actually moved this run"
+        );
+        assert_eq!(
+            report.moved_shots, 1,
+            "shot A was a fully-skipped no-op; only shot B did work this run"
+        );
     }
 
     // Supervisor-verified finding (Phase 4 follow-up F1): a journal that parses
