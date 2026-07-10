@@ -1387,6 +1387,103 @@ mod tests {
         assert!(fs.exists(&PathBuf::from("/src/IMG_0601.JPG")));
     }
 
+    // ---- F2 (Phase 4 follow-up): the cross-FS length-verify guard in
+    // `publish_cross_fs` (`dest_len != src_len || copied != src_len`) was a
+    // surviving mutant — `FakeFs::copy_create_new` always copied exactly the
+    // source length, so nothing ever exercised a real short copy. These pin
+    // both operands via `FakeFs::set_short_copy` / `set_lying_copy_return`. ----
+
+    #[test]
+    fn cross_fs_short_copy_is_rejected_and_source_kept_intact() {
+        // set_short_copy moves BOTH `dest_len` and `copied` together (a real
+        // short copy affects the bytes actually on disk AND what the copy
+        // call reports), so this test kills the guard's whole-check mutant
+        // and, jointly, both its operands.
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0700", BUCKET_KEEP, &[("IMG_0700.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops); // seeds a 100-byte source
+        fs.set_cross_fs(true); // force the copy path
+        fs.set_free(u64::MAX);
+        fs.set_short_copy("/src/IMG_0700.JPG", 60); // silently truncates to 60 of 100 bytes
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        let partial = dest.join(BUCKET_KEEP).join(".IMG_0700.JPG.partial");
+        match err {
+            ApplyError::Fs { path, source } => {
+                assert_eq!(path, partial);
+                assert!(
+                    source.to_string().contains("short copy: 60 of 100 bytes"),
+                    "error should name the short copy: {source}"
+                );
+            }
+            other => panic!("expected Fs error, got {other:?}"),
+        }
+
+        // Partial cleaned up; source untouched; nothing published to dest.
+        assert!(!fs.exists(&partial), "partial cleaned up, not left behind");
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_0700.JPG")),
+            "source intact — never touched until a verified publish"
+        );
+        assert!(
+            !fs.exists(&dest.join(BUCKET_KEEP).join("IMG_0700.JPG")),
+            "no final published"
+        );
+    }
+
+    #[test]
+    fn cross_fs_lying_copy_return_is_rejected_independently_of_dest_len() {
+        // The dest entry is recorded at its correct/full length here (unlike
+        // the sibling test above) — only the reported bytes-copied count
+        // lies short. This isolates the `copied != src_len` operand: if it
+        // were ever dropped from the guard while `dest_len != src_len`
+        // stayed, this exact fault shape would slip through unnoticed.
+        let dest = PathBuf::from("/dst");
+        let (s1, b1) = shot("IMG_0701", BUCKET_KEEP, &[("IMG_0701.JPG", 100)], &dest);
+        let plan = plan_of(&dest, vec![s1], b1);
+
+        let fs = FakeFs::new();
+        seed_sources(&fs, &plan.ops); // seeds a 100-byte source
+        fs.set_cross_fs(true);
+        fs.set_free(u64::MAX);
+        fs.set_lying_copy_return("/src/IMG_0701.JPG", 60); // dest recorded at 100; return lies at 60
+
+        let journal = tempfile::tempdir().unwrap();
+        let jpath = journal.path().join(".fastcull-apply.json");
+
+        let err = apply(&plan, &fs, &jpath).unwrap_err();
+        let partial = dest.join(BUCKET_KEEP).join(".IMG_0701.JPG.partial");
+        match err {
+            ApplyError::Fs { path, source } => {
+                assert_eq!(path, partial);
+                // dest_len reads back correct (100 of 100) — only `copied`
+                // (not rendered in the message) disagrees; the guard still
+                // must reject on that operand alone.
+                assert!(
+                    source.to_string().contains("short copy: 100 of 100 bytes"),
+                    "dest_len side of the message reads correct: {source}"
+                );
+            }
+            other => panic!("expected Fs error, got {other:?}"),
+        }
+
+        assert!(!fs.exists(&partial), "partial cleaned up, not left behind");
+        assert!(
+            fs.exists(&PathBuf::from("/src/IMG_0701.JPG")),
+            "source intact"
+        );
+        assert!(
+            !fs.exists(&dest.join(BUCKET_KEEP).join("IMG_0701.JPG")),
+            "no final published"
+        );
+    }
+
     // ---- F3 (Phase 4 follow-up): OpState::Published closes the cross-FS
     // publish→unlink resume window (spec rev 4). ----
 

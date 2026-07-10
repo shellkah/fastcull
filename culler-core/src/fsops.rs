@@ -252,6 +252,49 @@ mod tests {
             "different roots => different device"
         );
     }
+
+    /// Injector self-test (F2, Phase 4 follow-up): pins the two short-copy
+    /// fault shapes in isolation, before wiring them into an `apply` test.
+    #[test]
+    fn fake_short_copy_and_lying_return_injectors() {
+        let fs = FakeFs::new();
+        fs.set_free(u64::MAX);
+
+        // set_short_copy: BOTH the recorded dest length and the returned
+        // bytes-copied count are the truncated value.
+        fs.seed_file("/src/a.jpg", 100);
+        fs.set_short_copy("/src/a.jpg", 60);
+        let n = fs
+            .copy_create_new(
+                &PathBuf::from("/src/a.jpg"),
+                &PathBuf::from("/dst/a.partial"),
+            )
+            .unwrap();
+        assert_eq!(n, 60, "short_copy lies on the return value");
+        assert_eq!(
+            fs.len_of(&PathBuf::from("/dst/a.partial")),
+            Some(60),
+            "and on the recorded dest length"
+        );
+
+        // set_lying_copy_return: dest entry keeps the correct/full length;
+        // only the return value lies.
+        fs.clear_faults();
+        fs.seed_file("/src/b.jpg", 100);
+        fs.set_lying_copy_return("/src/b.jpg", 40);
+        let n = fs
+            .copy_create_new(
+                &PathBuf::from("/src/b.jpg"),
+                &PathBuf::from("/dst/b.partial"),
+            )
+            .unwrap();
+        assert_eq!(n, 40, "lying_copy_return lies on the return value only");
+        assert_eq!(
+            fs.len_of(&PathBuf::from("/dst/b.partial")),
+            Some(100),
+            "dest entry keeps the full/correct length"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +319,17 @@ pub(crate) mod fake {
         deny_rename_from: Option<PathBuf>, // rename_noreplace(from, _) -> EACCES
         deny_remove: Option<PathBuf>, // remove_file(path) -> EACCES
         deny_fsync_dir: Option<PathBuf>, // fsync_dir(path) -> EACCES
+        // copy_create_new(from, _) "succeeds" but silently truncates: BOTH the
+        // recorded dest length AND the returned bytes-copied count read back
+        // `actual_len` (short of the real source length) — models a short
+        // copy that the caller has no way to notice except by verifying.
+        short_copy: Option<(PathBuf, u64)>,
+        // copy_create_new(from, _) records the dest entry at its correct/full
+        // length, but the RETURN value lies short (`claimed`). Isolates the
+        // `copied != src_len` guard operand from `dest_len != src_len`: with
+        // this fault alone, `file_len(partial)` reads back correct while the
+        // reported bytes-copied count does not.
+        lying_copy_return: Option<(PathBuf, u64)>,
         fsynced_files: Vec<PathBuf>,
         fsynced_dirs: Vec<PathBuf>,
         events: Vec<String>, // ordered op log — durability ORDERING assertions
@@ -322,6 +376,8 @@ pub(crate) mod fake {
                     deny_rename_from: None,
                     deny_remove: None,
                     deny_fsync_dir: None,
+                    short_copy: None,
+                    lying_copy_return: None,
                     fsynced_files: Vec::new(),
                     fsynced_dirs: Vec::new(),
                     events: Vec::new(),
@@ -351,6 +407,21 @@ pub(crate) mod fake {
         pub(crate) fn deny_fsync_dir(&self, p: impl Into<PathBuf>) {
             self.st.borrow_mut().deny_fsync_dir = Some(p.into());
         }
+        /// `copy_create_new(path, _)` "succeeds" but truncates: the dest entry
+        /// AND the returned bytes-copied count both read back `actual_len`
+        /// instead of the real source length. Matches on the copy's `from`
+        /// (mirrors `deny_rename_from`'s `from`-side matching).
+        pub(crate) fn set_short_copy(&self, path: impl Into<PathBuf>, actual_len: u64) {
+            self.st.borrow_mut().short_copy = Some((path.into(), actual_len));
+        }
+        /// `copy_create_new(path, _)` records the dest entry at its correct
+        /// length, but LIES on the returned bytes-copied count (`claimed`).
+        /// Isolates the `copied != src_len` guard operand from `dest_len !=
+        /// src_len`, which `set_short_copy` cannot do alone since it moves
+        /// both together.
+        pub(crate) fn set_lying_copy_return(&self, path: impl Into<PathBuf>, claimed: u64) {
+            self.st.borrow_mut().lying_copy_return = Some((path.into(), claimed));
+        }
         pub(crate) fn clear_faults(&self) {
             let mut s = self.st.borrow_mut();
             s.cross_fs = false;
@@ -358,6 +429,8 @@ pub(crate) mod fake {
             s.deny_rename_from = None;
             s.deny_remove = None;
             s.deny_fsync_dir = None;
+            s.short_copy = None;
+            s.lying_copy_return = None;
         }
 
         // ---- assertions ----
@@ -435,15 +508,31 @@ pub(crate) mod fake {
             if s.enospc_on_copy {
                 return Err(enospc()); // source untouched, nothing created
             }
-            let len = *s.files.get(from).unwrap();
-            if len > s.free {
+            let src_len = *s.files.get(from).unwrap();
+
+            // short_copy: dest recorded length AND the returned byte count
+            // both reflect the truncated `actual_len`, not `src_len`.
+            let recorded_len = match &s.short_copy {
+                Some((p, actual_len)) if p == from => *actual_len,
+                _ => src_len,
+            };
+            if recorded_len > s.free {
                 return Err(enospc());
             }
-            s.files.insert(to.to_path_buf(), len);
-            s.free -= len;
+            s.files.insert(to.to_path_buf(), recorded_len);
+            s.free -= recorded_len; // free-space accounting follows the actual recorded length
             s.events
                 .push(format!("copy:{}->{}", from.display(), to.display()));
-            Ok(len)
+
+            // lying_copy_return: dest entry above is already recorded
+            // correctly (recorded_len == src_len when short_copy isn't also
+            // active) — only the RETURN value lies.
+            if let Some((p, claimed)) = &s.lying_copy_return
+                && p == from
+            {
+                return Ok(*claimed);
+            }
+            Ok(recorded_len)
         }
 
         fn fsync_file(&self, path: &Path) -> io::Result<()> {
