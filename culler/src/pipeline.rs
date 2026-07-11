@@ -75,7 +75,7 @@ mod scheduler_tests {
     }
 }
 
-use culler_core::decode::DecodedImage;
+use culler_core::decode::{DecodedImage, TargetSize, decode, embedded_thumbnail};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -230,5 +230,130 @@ mod cache_tests {
         assert_eq!(prefetch_set(0, 2, 100), vec![0, 1, 2]); // clamp at start
         assert_eq!(prefetch_set(99, 2, 100), vec![99, 98, 97]); // clamp at end
         assert_eq!(prefetch_set(0, 3, 0), Vec::<usize>::new()); // empty set
+    }
+}
+
+use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, channel};
+
+/// A job for a worker. `req` carries the generation for latest-wins dropping.
+pub struct DecodeRequest {
+    pub req: Request,
+    pub path: PathBuf,
+    pub target: TargetSize,
+    pub thumb_first: bool, // filmstrip: try embedded EXIF thumbnail for instant first paint
+}
+
+/// A decoded result handed back to the event loop.
+pub struct DecodeResult {
+    pub req: Request,
+    pub target: TargetSize,
+    pub image: Arc<DecodedImage>,
+}
+
+/// Marshal straight-RGBA8 into a `slint::Image` (the ONLY such conversion in the app).
+pub fn to_slint_image(img: &DecodedImage) -> Image {
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(img.w, img.h);
+    let bytes = buf.make_mut_bytes();
+    let n = bytes.len().min(img.rgba.len());
+    bytes[..n].copy_from_slice(&img.rgba[..n]);
+    Image::from_rgba8(buf)
+}
+
+/// Worker pool + shared generation counter. Requests stamp the current generation;
+/// stale ones are dropped at dequeue here and at delivery in `on_ready`.
+pub struct Pipeline {
+    tx: Sender<DecodeRequest>,
+    pub generation: Arc<AtomicU64>,
+}
+
+impl Pipeline {
+    /// Spawn `workers` decode threads. `on_ready` runs on a worker thread; it should
+    /// re-check staleness and marshal onto the event loop via `invoke_from_event_loop`.
+    pub fn spawn<F>(workers: usize, on_ready: F) -> Self
+    where
+        F: Fn(DecodeResult) + Send + Sync + 'static,
+    {
+        let (tx, rx) = channel::<DecodeRequest>();
+        let rx = Arc::new(Mutex::new(rx));
+        let generation = Arc::new(AtomicU64::new(0));
+        let on_ready = Arc::new(on_ready);
+        for _ in 0..workers.max(1) {
+            let rx = rx.clone();
+            let generation = generation.clone();
+            let on_ready = on_ready.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let job = {
+                        let guard = rx.lock().unwrap();
+                        guard.recv()
+                    };
+                    let Ok(job) = job else { break }; // channel closed -> exit
+                    // DROP AT DEQUEUE
+                    if Scheduler::is_stale(&job.req, generation.load(Ordering::SeqCst)) {
+                        continue;
+                    }
+                    // Filmstrip fast path: embedded EXIF thumbnail first, refined later.
+                    if job.thumb_first
+                        && let Some(t) = embedded_thumbnail(&job.path)
+                    {
+                        on_ready(DecodeResult {
+                            req: job.req,
+                            target: job.target,
+                            image: Arc::new(t),
+                        });
+                    }
+                    match decode(&job.path, job.target) {
+                        Ok(img) => on_ready(DecodeResult {
+                            req: job.req,
+                            target: job.target,
+                            image: Arc::new(img),
+                        }),
+                        Err(e) => eprintln!("decode {:?} failed: {:?}", job.path, e),
+                    }
+                }
+            });
+        }
+        Pipeline { tx, generation }
+    }
+
+    /// Bump the shared generation (call once per navigation) and return the new value.
+    pub fn bump(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Enqueue a request stamped with the current generation.
+    pub fn enqueue(&self, index: usize, path: PathBuf, target: TargetSize, thumb_first: bool) {
+        let r#gen = self.generation.load(Ordering::SeqCst);
+        let _ = self.tx.send(DecodeRequest {
+            req: Request {
+                index,
+                generation: r#gen,
+            },
+            path,
+            target,
+            thumb_first,
+        });
+    }
+}
+
+#[cfg(test)]
+mod marshal_tests {
+    use super::*;
+    use culler_core::decode::DecodedImage;
+
+    #[test]
+    fn to_slint_image_preserves_dimensions() {
+        let d = DecodedImage {
+            w: 4,
+            h: 3,
+            rgba: vec![0u8; 4 * 3 * 4],
+        };
+        let img = to_slint_image(&d);
+        assert_eq!(img.size().width, 4);
+        assert_eq!(img.size().height, 3);
     }
 }
