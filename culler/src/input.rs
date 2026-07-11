@@ -10,6 +10,7 @@ pub enum Key {
     Space,
     Backspace,
     Tab,
+    Escape,
     Char(char),
 }
 
@@ -26,6 +27,7 @@ pub enum InputContext {
     Loupe,
     TagEntry,
     ApplyDialog,
+    Help,
 }
 
 /// One user intent. Model-mutating variants are executed by `apply_action`;
@@ -43,6 +45,7 @@ pub enum Action {
     CycleFilter,
     OpenApply,
     ForceSave,
+    ToggleHelp,
 }
 
 /// Decode the FocusScope-forwarded text into a semantic `Key`.
@@ -53,6 +56,7 @@ pub fn to_key(text: &str) -> Option<Key> {
         "Right" => Some(Key::Right),
         "Tab" => Some(Key::Tab),
         "Backspace" => Some(Key::Backspace),
+        "Escape" => Some(Key::Escape),
         " " => Some(Key::Space),
         _ => text.chars().next().map(Key::Char),
     }
@@ -84,6 +88,7 @@ pub fn key_to_action(key: Key, mods: Modifiers, ctx: InputContext) -> Option<Act
         Key::Char('z') | Key::Char('Z') => Some(Action::ToggleZoom),
         Key::Char('f') | Key::Char('F') => Some(Action::CycleFilter),
         Key::Char('a') | Key::Char('A') => Some(Action::OpenApply),
+        Key::Char('?') => Some(Action::ToggleHelp),
         _ => None,
     }
 }
@@ -282,6 +287,24 @@ mod key_tests {
         assert_eq!(to_key("a"), Some(Key::Char('a')));
         assert_eq!(to_key(""), None);
     }
+
+    #[test]
+    fn to_key_normalizes_escape() {
+        assert_eq!(to_key("Escape"), Some(Key::Escape));
+    }
+
+    #[test]
+    fn question_mark_toggles_help_in_loupe() {
+        assert_eq!(
+            key_to_action(Key::Char('?'), m(), LOUPE),
+            Some(Action::ToggleHelp)
+        );
+    }
+
+    #[test]
+    fn help_context_is_inert() {
+        assert_eq!(key_to_action(Key::Char('1'), m(), InputContext::Help), None);
+    }
 }
 
 #[cfg(test)]
@@ -454,7 +477,8 @@ pub fn apply_action(action: Action, session: &mut Session, auto_advance: bool, f
         | Action::ToggleZoom
         | Action::CycleFilter
         | Action::OpenApply
-        | Action::ForceSave => {}
+        | Action::ForceSave
+        | Action::ToggleHelp => {}
     }
 }
 
@@ -577,6 +601,7 @@ mod action_tests {
             Action::CycleFilter,
             Action::OpenApply,
             Action::ForceSave,
+            Action::ToggleHelp,
         ] {
             apply_action(a, &mut s, true, Filter::All);
         }

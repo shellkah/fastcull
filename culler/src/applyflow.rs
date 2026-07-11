@@ -377,6 +377,12 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
                 // Mirror the on-disk clear in the live session.
                 session.borrow_mut().pending_apply = None;
                 app.set_apply_open(false);
+                // Toast (Task 9b, DESIGN §4 2g): shortened per the task brief
+                // rather than echoing the full "Applied: N shots, ..." message.
+                // tier-keep (code 1) is the closest available "confirm" dot —
+                // Toast only supports a leading dot, not 2g's per-message
+                // border tinting (kept out to stay a single reusable pill).
+                app.invoke_show_toast("✓ apply complete".into(), 1);
             }
         });
     }

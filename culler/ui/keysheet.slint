@@ -1,0 +1,140 @@
+import { Theme } from "theme.slint";
+
+// culler/ui/keysheet.slint — DESIGN.md §4 screen 2e: the keymap cheat-sheet,
+// bound to `?` (Task 9b, optional/cheap per DESIGN §6). Static content only —
+// the row text below mirrors the canonical §9 keymap table exactly; the four
+// groups (TIER / NAVIGATE / VIEW & TAGS / SESSION) and their row order follow
+// screens/2e-keymap.png. Gated in app.slint via `if root.help-open: KeySheet
+// {}` (same pattern as TagEntry/ApplyDialog) — this component has no
+// visibility property of its own.
+
+// One key-cap + description row (§2.6/§5: chip-bg pill, border-input 1px,
+// r-key radius, centered mono text; description in text-3). `cap-width`
+// defaults to the spec's ~52px floor and is only widened for the few rows
+// whose key-cap text doesn't fit (e.g. "← →", "ctrl S").
+component KeyRow inherits HorizontalLayout {
+    in property <string> keycap;
+    in property <string> desc;
+    in property <length> cap-width: 52px;
+    spacing: 10px;
+
+    Rectangle {
+        width: root.cap-width;
+        height: 26px;
+        background: Theme.chip-bg;
+        border-radius: Theme.r-key;
+        border-width: 1px;
+        border-color: Theme.border-input;
+        Text {
+            text: root.keycap;
+            font-family: Theme.font-mono;
+            font-weight: 600;
+            font-size: 12px;
+            color: Theme.text;
+            x: (parent.width - self.width) / 2;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+    Text {
+        text: root.desc;
+        font-family: Theme.font-mono;
+        font-size: 12px;
+        color: Theme.text-3;
+        vertical-alignment: center;
+    }
+}
+
+// An uppercase group label (§2.5: mono 600 9.5, label color, letter-spacing
+// ~.14em) followed by its rows.
+component KeyGroup inherits VerticalLayout {
+    in property <string> title;
+    spacing: 6px;
+    Text {
+        text: root.title;
+        font-family: Theme.font-mono;
+        font-weight: 600;
+        font-size: 9.5px;
+        letter-spacing: 1.3px;
+        color: Theme.label;
+    }
+    @children
+}
+
+export component KeySheet inherits Rectangle {
+    background: Theme.scrim;
+
+    panel := Rectangle {
+        width: 640px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.panel-dialog;
+        border-radius: Theme.r-xl;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        clip: true;
+
+        VerticalLayout {
+            padding: 22px;
+            spacing: 18px;
+
+            HorizontalLayout {
+                Text {
+                    text: "Keys";
+                    font-family: Theme.font-sans;
+                    font-weight: 600;
+                    font-size: 15px;
+                    color: Theme.text;
+                }
+                Rectangle { }
+                Text {
+                    text: "? or esc to close";
+                    font-family: Theme.font-mono;
+                    font-size: 10.5px;
+                    color: Theme.text-faint;
+                    vertical-alignment: center;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 40px;
+
+                VerticalLayout {
+                    spacing: 18px;
+                    KeyGroup {
+                        title: "TIER";
+                        KeyRow { keycap: "1"; desc: "Keep (auto-advance)"; }
+                        KeyRow { keycap: "2"; desc: "Pick (auto-advance)"; }
+                        KeyRow { keycap: "3"; desc: "Best (auto-advance)"; }
+                        KeyRow { keycap: "X"; desc: "Reject (auto-advance)"; }
+                        KeyRow { keycap: "` / 0"; cap-width: 62px; desc: "clear → undecided (Rest)"; }
+                        KeyRow { keycap: "U"; desc: "undo last tier/tag change"; }
+                    }
+                    KeyGroup {
+                        title: "VIEW & TAGS";
+                        KeyRow { keycap: "T"; desc: "tag entry (autocomplete; comma-separates)"; }
+                        KeyRow { keycap: "Z"; desc: "toggle 1:1 zoom (zoom + pan persist)"; }
+                        KeyRow { keycap: "?"; desc: "this help"; }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 18px;
+                    KeyGroup {
+                        title: "NAVIGATE";
+                        KeyRow { keycap: "← →"; desc: "prev / next"; }
+                        KeyRow { keycap: "space"; cap-width: 60px; desc: "next"; }
+                        KeyRow { keycap: "bksp"; cap-width: 60px; desc: "prev"; }
+                        KeyRow { keycap: "Tab"; desc: "jump to next unvisited shot"; }
+                        KeyRow { keycap: "F"; desc: "cycle filter: All → ≥Keep → ≥Pick → ≥Best → Rejects"; }
+                    }
+                    KeyGroup {
+                        title: "SESSION";
+                        KeyRow { keycap: "A"; desc: "open Apply dialog"; }
+                        KeyRow { keycap: "ctrl S"; cap-width: 66px; desc: "force-save session"; }
+                    }
+                }
+            }
+        }
+    }
+}

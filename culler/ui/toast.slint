@@ -1,0 +1,44 @@
+import { Theme } from "theme.slint";
+
+// culler/ui/toast.slint — DESIGN.md §4 screen 2g: a single transient toast
+// pill, bottom-center above the filmstrip (Task 9b, optional/cheap per
+// DESIGN §6). Non-modal — no scrim, no TouchArea; the photo underneath stays
+// fully interactive while a toast is showing. Only the leading tier-color dot
+// is implemented (not 2g's per-message border tinting) — one reusable pill
+// keeps this small; `code < 0` (the -1 sentinel main.rs uses for dot-less
+// messages like "session saved") omits the dot entirely.
+export component Toast inherits Rectangle {
+    in property <string> text;
+    in property <int> code: -1;
+    background: transparent;
+
+    pill := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 14px;
+        width: row.preferred-width;
+        height: row.preferred-height;
+        background: Theme.panel-toast;
+        border-radius: Theme.r-lg;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+
+        row := HorizontalLayout {
+            padding: 10px;
+            spacing: 8px;
+            alignment: center;
+            if root.code >= 0: Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: Theme.tier-color(root.code);
+            }
+            Text {
+                text: root.text;
+                font-family: Theme.font-mono;
+                font-size: 12px;
+                color: Theme.text;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

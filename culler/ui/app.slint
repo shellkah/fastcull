@@ -4,6 +4,8 @@ import { Filmstrip } from "filmstrip.slint";
 import { FilmstripItem, ApplyPreviewUi } from "globals.slint";
 import { HudTopLeft, HudTopRight, HudBottomLeft, TagEntry } from "hud.slint";
 import { ApplyDialog } from "applydialog.slint";
+import { KeySheet } from "keysheet.slint";
+import { Toast } from "toast.slint";
 
 // culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8) +
 // HUD overlays + tag entry (Task 9), wired to the pure input/pipeline glue in
@@ -47,6 +49,19 @@ export component AppWindow inherits Window {
     callback tag-committed(string);
     callback tag-cancelled();
 
+    // Keymap cheat-sheet overlay (Task 9b, DESIGN.md §4 2e), bound to `?`/Esc.
+    // Static content lives entirely in keysheet.slint; main.rs only flips this.
+    in-out property <bool> help-open: false;
+
+    // Transient toast pill (Task 9b, DESIGN.md §4 2g). Visible iff toast-text
+    // != ""; main.rs's `show_toast` helper sets both and restarts the
+    // auto-clear timer. `show-toast` lets applyflow (a different module)
+    // reach the same helper without threading an extra Rc closure through
+    // `wire_apply_dialog`'s signature.
+    in property <string> toast-text: "";
+    in property <int> toast-code: -1;
+    callback show-toast(string, int);
+
     callback key-pressed(string, bool) -> bool; // (text, ctrl)
     callback film-clicked(int);
     // Fired from the decode-pipeline event-loop hop (Task 11 finding 2) after a
@@ -89,6 +104,7 @@ export component AppWindow inherits Window {
             if (event.text == Key.RightArrow) { return root.key-pressed("Right", event.modifiers.control) ? accept : reject; }
             if (event.text == Key.Backspace) { return root.key-pressed("Backspace", event.modifiers.control) ? accept : reject; }
             if (event.text == Key.Tab) { return root.key-pressed("Tab", event.modifiers.control) ? accept : reject; }
+            if (event.text == Key.Escape) { return root.key-pressed("Escape", event.modifiers.control) ? accept : reject; }
             return root.key-pressed(event.text, event.modifiers.control) ? accept : reject;
         }
         VerticalLayout {
@@ -127,6 +143,10 @@ export component AppWindow inherits Window {
                     committed(t) => { root.tag-committed(t); }
                     cancelled => { root.tag-cancelled(); }
                 }
+                if root.toast-text != "": Toast {
+                    text: root.toast-text;
+                    code: root.toast-code;
+                }
             }
             Filmstrip {
                 height: 130px;
@@ -153,5 +173,9 @@ export component AppWindow inherits Window {
             confirmed() => { root.apply-confirmed(); }
             cancelled() => { root.apply-cancelled(); }
         }
+
+        // Keymap cheat-sheet (DESIGN §4 2e): another full-window scrim +
+        // centered modal sibling, same reasoning as ApplyDialog above.
+        if root.help-open: KeySheet { }
     }
 }

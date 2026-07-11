@@ -249,6 +249,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Toast (Task 9b, DESIGN §4 2g): a single transient pill, auto-cleared by
+    // a restartable SingleShot timer — repeated calls just push the clear
+    // time back (`Timer::start`'s doc: "If the timer has been started
+    // previously, then it will be restarted"). `Timer` itself isn't `Clone`,
+    // so it's wrapped in `Rc` — that lets this closure be `.clone()`d for the
+    // `show-toast` Slint callback below without a second timer/duplicated
+    // clear logic.
+    let show_toast = {
+        let app_w = app.as_weak();
+        let timer: Rc<slint::Timer> = Rc::new(slint::Timer::default());
+        move |text: String, code: i32| {
+            let Some(app) = app_w.upgrade() else { return };
+            app.set_toast_text(text.into());
+            app.set_toast_code(code);
+            let app_w2 = app_w.clone();
+            timer.start(
+                slint::TimerMode::SingleShot,
+                std::time::Duration::from_millis(2500),
+                move || {
+                    if let Some(app) = app_w2.upgrade() {
+                        app.set_toast_text("".into());
+                    }
+                },
+            );
+        }
+    };
+    // `show-toast` callback: lets applyflow (Task 12, a separate module) reach
+    // the same helper on apply completion without threading an extra Rc
+    // closure through `wire_apply_dialog`'s signature (Task 9b amendment —
+    // "expose as an AppWindow callback ... pick the simpler").
+    {
+        let show_toast = show_toast.clone();
+        app.on_show_toast(move |text, code| show_toast(text.to_string(), code));
+    }
+
     // Key dispatch: pure map -> action -> mutate model or UI state, then refresh.
     {
         let session = session.clone();
@@ -259,11 +294,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let app_w = app.as_weak();
         let source = source.clone();
         let dirty = dirty.clone();
+        let show_toast = show_toast.clone();
         app.on_key_pressed(move |text, ctrl| {
             let Some(app) = app_w.upgrade() else {
                 return false;
             };
-            let ctx = if app.get_tag_open() {
+            // Help overlay gating (Task 9b) FIRST and separate from the pure
+            // §9 keymap below: while it's open, only `?`/Escape do anything
+            // (close it) and every other key is swallowed outright, so none
+            // of the loupe/tag/apply keymaps can leak through underneath the
+            // sheet.
+            if app.get_help_open() {
+                if text == "?" || text == "Escape" {
+                    app.set_help_open(false);
+                }
+                return true;
+            }
+            let ctx = if app.get_help_open() {
+                // Unreachable given the early return above — kept so the pure
+                // layer stays inert here too if that gate is ever changed
+                // (belt and braces, key_to_action already treats Help like
+                // any other non-Loupe modal context).
+                InputContext::Help
+            } else if app.get_tag_open() {
                 InputContext::TagEntry
             } else if app.get_apply_open() {
                 InputContext::ApplyDialog
@@ -285,6 +338,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let nf = next_filter(*filter.borrow());
                     *filter.borrow_mut() = nf;
                     refresh_view();
+                    // Toast (DESIGN §4 2g): the new filter's label + a dot in
+                    // its tier color; `All` has no ladder floor, so no dot.
+                    let (label, code) = match nf {
+                        Filter::All => ("filter: All", -1),
+                        Filter::Keep => ("filter: >=Keep", 1),
+                        Filter::Pick => ("filter: >=Pick", 2),
+                        Filter::Best => ("filter: >=Best", 3),
+                        Filter::Rejects => ("filter: Rejects", 4),
+                    };
+                    show_toast(label.to_string(), code);
                 }
                 Action::ToggleZoom => {
                     zoom.borrow_mut().toggle();
@@ -303,6 +366,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Ctrl+S: immediate, and the debounce flag is satisfied.
                     dirty.set(false);
                     let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+                    show_toast("session saved".to_string(), -1);
+                }
+                Action::ToggleHelp => {
+                    app.set_help_open(true);
+                }
+                Action::Undo => {
+                    // Session::undo() (culler-core, untouched here) only
+                    // returns whether it reverted anything — not which stem
+                    // or tier. The toast approximates with the CURRENT shot
+                    // (the shot a tier/tag edit almost always targets) rather
+                    // than threading a richer return type back through core.
+                    let reverted = session.borrow_mut().undo();
+                    let (text, code) = if reverted {
+                        dirty.set(true);
+                        refresh_view();
+                        let s = session.borrow();
+                        let cur = s.current;
+                        let text = match s.shots.get(cur) {
+                            Some(shot) => format!("undo {}", shot.stem),
+                            None => "undo".to_string(),
+                        };
+                        (text, ui::tier_color_code(s.decision(cur)))
+                    } else {
+                        ("nothing to undo".to_string(), -1)
+                    };
+                    show_toast(text, code);
                 }
                 other => {
                     let before = session.borrow().current;
