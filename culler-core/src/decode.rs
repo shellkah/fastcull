@@ -3,6 +3,17 @@
 
 use std::path::Path;
 
+/// Hard cap on total pixels (width * height) a header may declare before we
+/// allocate a decode buffer. A crafted/corrupt JPEG can declare arbitrary SOF
+/// dimensions (up to 65535x65535) — allocating `w * h * 4` bytes for that BEFORE
+/// any scan data is validated is a decompression-bomb vector: under
+/// `vm.overcommit_memory=2` the allocator's `handle_alloc_error` aborts the
+/// whole process (SIGABRT), which is uncatchable and would crash the Phase 6
+/// GUI worker thread on a single corrupt file. 300 MP is comfortably above any
+/// real camera sensor (current high-end sensors top out well under 200 MP)
+/// and far below allocation-abort territory (300M * 4 bytes = 1.2 GB).
+const MAX_DECODE_PIXELS: usize = 300_000_000;
+
 /// Target decode size. `Scaled(n)` = 1/n via turbojpeg native scaled decode (n in {1,2,4,8}).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TargetSize {
@@ -76,10 +87,30 @@ fn scaled_dim(dim: usize, denom: u8) -> usize {
 /// `Image` dims straight through — so allocating the buffer at the TJSCALED
 /// 1/denom dimensions selects exactly the native 1/denom DCT-scaled decode.
 fn decompress_scaled(jpeg: &[u8], denom: u8) -> Result<DecodedImage, DecodeError> {
+    debug_assert!(
+        matches!(denom, 1 | 2 | 4 | 8),
+        "decompress_scaled denom must be one of {{1,2,4,8}} (0 would panic scaled_dim's div_ceil; \
+         other values aren't a real turbojpeg scaling factor), got {denom}"
+    );
     let mut dec = turbojpeg::Decompressor::new().map_err(|e| DecodeError::Decode(e.to_string()))?;
     let header = dec
         .read_header(jpeg)
         .map_err(|e| DecodeError::Decode(e.to_string()))?;
+
+    // Reject pathological header-declared dimensions BEFORE any allocation.
+    // Check the FULL (unscaled) dims: the scaled buffer we're about to
+    // allocate is always <= the full one, so guarding the full dims also
+    // caps every scaled request derived from this header.
+    match header.width.checked_mul(header.height) {
+        Some(pixels) if pixels <= MAX_DECODE_PIXELS => {}
+        _ => {
+            return Err(DecodeError::Decode(format!(
+                "image dimensions {}x{} exceed the decode limit ({MAX_DECODE_PIXELS} pixels)",
+                header.width, header.height
+            )));
+        }
+    }
+
     let (w, h) = (
         scaled_dim(header.width, denom),
         scaled_dim(header.height, denom),
@@ -487,6 +518,79 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         (dir, path)
+    }
+
+    /// Patch a synthetic JPEG's SOF0-declared dimensions to `w`x`h`, simulating a
+    /// crafted/corrupt header that lies about image size while leaving the real
+    /// (small) encoded scan data untouched. Scans only up to the first SOS marker
+    /// (0xFF 0xDA) so an incidental 0xFF 0xC0 byte pair inside entropy-coded scan
+    /// data can never be mistaken for the SOF0 marker — `synth_jpeg`'s deterministic
+    /// baseline encode always places SOF0 well before SOS, so this never false-positives.
+    fn patch_sof0_dims(mut jpeg: Vec<u8>, w: u16, h: u16) -> Vec<u8> {
+        let mut i = 2; // skip the SOI marker (FF D8)
+        loop {
+            assert!(i + 8 < jpeg.len(), "SOF0 marker not found before EOF");
+            assert!(
+                !(jpeg[i] == 0xFF && jpeg[i + 1] == 0xDA),
+                "hit SOS before finding SOF0 marker"
+            );
+            if jpeg[i] == 0xFF && jpeg[i + 1] == 0xC0 {
+                let (hb, wb) = (h.to_be_bytes(), w.to_be_bytes());
+                jpeg[i + 5] = hb[0];
+                jpeg[i + 6] = hb[1];
+                jpeg[i + 7] = wb[0];
+                jpeg[i + 8] = wb[1];
+                return jpeg;
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn decode_rejects_pathological_header_dimensions() {
+        // Take a real, valid synthetic JPEG and patch just its SOF0-declared
+        // dimensions to 65500x65500 — libjpeg-turbo's own per-axis ceiling
+        // (JPEG_MAX_DIMENSION), so `read_header` itself accepts these dims
+        // (a naive per-axis-only check would let this through). The PRODUCT
+        // is ~4.29 billion pixels (~17GB RGBA at full decode), simulating a
+        // crafted/corrupt header lying about image size. The actual scan data
+        // is untouched and tiny (encoded for 64x48), so without our total-
+        // pixel guard this would sail past `read_header` and attempt a ~17GB
+        // allocation before tjDecompress2 eventually fails on the scan/
+        // dimension mismatch.
+        let jpeg = patch_sof0_dims(synth_jpeg(64, 48), 65500, 65500);
+        let (_dir, path) = write_temp_named("bomb.jpg", &jpeg);
+
+        // The MESSAGE matters here, not just the Err: under default Linux
+        // overcommit, `vec![0u8; w*h*4]` for ~17GB succeeds as a virtual
+        // mapping (no physical pages touched), so without the guard decode
+        // still errors — but from tjDecompress2 AFTER the huge allocation,
+        // with an unrelated message. Asserting "decode limit" pins that our
+        // guard fired first, before any allocation was attempted.
+        let result = decode(&path, TargetSize::Full);
+        assert!(
+            matches!(result, Err(DecodeError::Decode(_))),
+            "expected DecodeError::Decode with a decode-limit message"
+        );
+        if let Err(DecodeError::Decode(msg)) = result {
+            assert!(
+                msg.contains("decode limit"),
+                "expected the dimension guard's message, got: {msg}"
+            );
+            assert!(
+                msg.contains("65500"),
+                "message should name the offending dims: {msg}"
+            );
+        }
+
+        assert!(
+            decode(&path, TargetSize::Scaled(8)).is_err(),
+            "must error, not crash"
+        );
+        assert!(
+            decode(&path, TargetSize::Fit(64, 64)).is_err(),
+            "must error, not crash"
+        );
     }
 
     #[test]
