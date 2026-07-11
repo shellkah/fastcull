@@ -1,3 +1,6 @@
+//! Pure input logic: keymap, filters, actions. Wired into the event loop by main (Task 11).
+#![allow(dead_code)] // TODO(Task 11): remove once main wires the module
+
 use culler_core::model::Tier;
 
 /// A semantic key, decoded from the string the Slint FocusScope forwards.
