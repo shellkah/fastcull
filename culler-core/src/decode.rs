@@ -407,6 +407,56 @@ mod tests {
         ));
     }
 
+    /// Direct unit pin on `scaled_dim`'s ceiling rounding with odd (non-power-of-2,
+    /// non-divisible) inputs, plus exact-division cases for contrast. `div_ceil` and
+    /// floor `/` only diverge when there's a remainder, so exact divisions alone
+    /// (as in `decode_scaled_halves_dimensions` with 64x48) can't distinguish them.
+    #[test]
+    fn scaled_dim_rounds_up_on_remainder() {
+        assert_eq!(scaled_dim(65, 2), 33); // 32.5 -> 33, not 32
+        assert_eq!(scaled_dim(47, 2), 24); // 23.5 -> 24
+        assert_eq!(scaled_dim(65, 4), 17); // 16.25 -> 17
+        assert_eq!(scaled_dim(47, 4), 12); // 11.75 -> 12
+        assert_eq!(scaled_dim(65, 8), 9); // 8.125 -> 9
+        assert_eq!(scaled_dim(47, 8), 6); // 5.875 -> 6
+        assert_eq!(scaled_dim(1, 8), 1); // 0.125 -> 1, never 0
+        // Exact divisions still land on the same value either way (sanity, not a
+        // discriminator between div_ceil and floor division).
+        assert_eq!(scaled_dim(64, 2), 32);
+        assert_eq!(scaled_dim(64, 8), 8);
+    }
+
+    /// End-to-end pin: a JPEG whose dimensions (65x47) are divisible by neither 2,
+    /// 4, nor 8, decoded at every scaling factor. This is the only way to observe
+    /// `scaled_dim`'s ceil rounding through the real FFI path: `decompress_scaled`
+    /// allocates the output buffer at exactly `scaled_dim(w, denom) x scaled_dim(h,
+    /// denom)`, and turbojpeg's `tjDecompress2` picks its native DCT scaling factor
+    /// from the CALLER-supplied buffer size — so a too-small (floor-rounded) buffer
+    /// would make it select a coarser factor than 1/denom, and the alpha-coverage
+    /// assertion (every pixel written, none left at the zero-initialized default)
+    /// proves the buffer was actually filled edge-to-edge at the ceil-rounded size.
+    #[test]
+    fn decode_scaled_non_divisible_dimensions_use_ceil() {
+        let jpeg = synth_jpeg(65, 47);
+        let (_dir, path) = write_temp_jpeg(&jpeg);
+
+        let cases: &[(u8, u32, u32)] = &[(2, 33, 24), (4, 17, 12), (8, 9, 6)];
+        for &(denom, ew, eh) in cases {
+            let img = decode(&path, TargetSize::Scaled(denom)).expect("scaled decode");
+            assert_eq!(
+                (img.w, img.h),
+                (ew, eh),
+                "1/{denom} scaled dims of 65x47 must be ceil-rounded"
+            );
+            assert_eq!(img.rgba.len(), ew as usize * eh as usize * 4);
+            assert!(
+                img.rgba.chunks_exact(4).all(|p| p[3] == 255),
+                "1/{denom} scaled decode must fill the whole ceil-sized buffer \
+                 (proves tjDecompress2 actually selected 1/{denom}, not a coarser factor)"
+            );
+        }
+    }
+
     #[test]
     fn fit_denom_pins_every_branch() {
         // d=2 scaled dims are (32,24): width 32>=32 covers, height 24>=32
