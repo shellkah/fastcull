@@ -72,7 +72,7 @@ export global Theme {
     out property <length> r-xl: 10px;
 
     // tier code -> color  (0 rest, 1 keep, 2 pick, 3 best, 4 reject — matches ui::tier_color_code)
-    pure function tier-color(code: int) -> brush {
+    public pure function tier-color(code: int) -> brush {
         return code == 1 ? self.tier-keep
              : code == 2 ? self.tier-pick
              : code == 3 ? self.tier-best

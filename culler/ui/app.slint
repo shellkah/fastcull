@@ -1,14 +1,49 @@
 import { Theme } from "theme.slint";
+import { Loupe } from "loupe.slint";
+import { Filmstrip } from "filmstrip.slint";
+import { FilmstripItem } from "globals.slint";
 
+// culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8),
+// wired to the pure input/pipeline glue in culler/src/ui.rs (Task 11 assembles the
+// event loop). DESIGN.md §4 screen 1b.
 export component AppWindow inherits Window {
     title: "FastCull";
     preferred-width: 1280px;
     preferred-height: 820px;
     background: Theme.bg;
-    Text {
-        text: "FastCull — point me at a folder of shots";
-        color: Theme.text;
-        font-family: Theme.font-mono;
-        font-size: 18px;
+
+    in property <image> current-image;
+    in-out property <bool> zoomed;
+    in-out property <length> pan-x;
+    in-out property <length> pan-y;
+    in property <[FilmstripItem]> film-items;
+    in property <int> film-current;
+
+    callback key-pressed(string, bool) -> bool; // (text, ctrl)
+    callback film-clicked(int);
+
+    forward-focus: keyscope;
+    keyscope := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow) { return root.key-pressed("Left", event.modifiers.control) ? accept : reject; }
+            if (event.text == Key.RightArrow) { return root.key-pressed("Right", event.modifiers.control) ? accept : reject; }
+            if (event.text == Key.Backspace) { return root.key-pressed("Backspace", event.modifiers.control) ? accept : reject; }
+            if (event.text == Key.Tab) { return root.key-pressed("Tab", event.modifiers.control) ? accept : reject; }
+            return root.key-pressed(event.text, event.modifiers.control) ? accept : reject;
+        }
+        VerticalLayout {
+            Loupe {
+                source: root.current-image;
+                zoomed: root.zoomed;
+                pan-x <=> root.pan-x;
+                pan-y <=> root.pan-y;
+            }
+            Filmstrip {
+                height: 130px;
+                items: root.film-items;
+                current: root.film-current;
+                clicked(i) => { root.film-clicked(i); }
+            }
+        }
     }
 }

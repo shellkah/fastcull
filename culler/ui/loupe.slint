@@ -1,0 +1,46 @@
+import { Theme } from "theme.slint";
+
+// culler/ui/loupe.slint — full-bleed photo viewer (DESIGN.md §4 screen 1b).
+// Fit mode shows the whole frame aspect-preserved; 1:1 mode shows native pixels,
+// panned by drag. Pan is bound to persistent AppWindow properties (Task 10) so
+// zoom position survives navigation.
+export component Loupe inherits Rectangle {
+    in property <image> source;
+    in property <bool> zoomed;
+    in-out property <length> pan-x;
+    in-out property <length> pan-y;
+    background: Theme.bg;
+    clip: true;
+
+    // Fit mode: whole frame, aspect-preserved.
+    Image {
+        visible: !root.zoomed;
+        source: root.source;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+    }
+    // 1:1 zoom mode: native pixels, panned; pan bound to persistent root props (Task 10).
+    Image {
+        visible: root.zoomed;
+        source: root.source;
+        image-fit: ImageFit.preserve;
+        x: root.pan-x;
+        y: root.pan-y;
+    }
+    drag := TouchArea {
+        enabled: root.zoomed;
+        property <length> anchor-x;
+        property <length> anchor-y;
+        pointer-event(ev) => {
+            if (ev.kind == PointerEventKind.down) {
+                self.anchor-x = root.pan-x;
+                self.anchor-y = root.pan-y;
+            }
+        }
+        moved => {
+            root.pan-x = self.anchor-x + (self.mouse-x - self.pressed-x);
+            root.pan-y = self.anchor-y + (self.mouse-y - self.pressed-y);
+        }
+    }
+}

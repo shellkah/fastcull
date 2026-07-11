@@ -1,0 +1,62 @@
+import { Theme } from "theme.slint";
+import { FilmstripItem } from "globals.slint";
+
+// culler/ui/filmstrip.slint — virtualized, color-coded strip (DESIGN.md §4 screen 1b,
+// §2.6 filmstrip tile recipe, §5 translation notes). `items` holds only the visible+
+// buffer window computed by `ui::build_filmstrip_window`; `current` is that window's
+// offset of the current shot (not an absolute session index).
+export component Filmstrip inherits Rectangle {
+    in property <[FilmstripItem]> items;
+    in property <int> current; // offset of the current shot within `items`
+    callback clicked(int);
+    background: Theme.panel-hud;
+    border-radius: Theme.r-lg;
+    clip: true;
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 5px;
+        padding: 7px;
+        for item[i] in root.items: Rectangle {
+            width: 84px;
+            height: 56px;
+            border-radius: Theme.r-sm;
+            clip: true;
+            opacity: item.dim ? 0.4 : 1.0;
+            // Current tile: 2px highlighted outline (§2.6). The tier signal itself
+            // is the dot badge below, not this border.
+            border-width: i == root.current ? 2px : 0px;
+            border-color: Theme.text;
+
+            Image {
+                source: item.thumb;
+                width: 84px;
+                height: 56px;
+                image-fit: contain;
+            }
+
+            // Tier dot badge: 7px circle, top:4 right:4, with a 2px dark backing
+            // ring so it stays legible over bright thumbnails (§2.6/§5 recipe).
+            Rectangle {
+                x: parent.width - self.width - 2px;
+                y: 2px;
+                width: 11px;
+                height: 11px;
+                border-radius: 5.5px;
+                background: Colors.black.with-alpha(0.55);
+            }
+            Rectangle {
+                x: parent.width - self.width - 4px;
+                y: 4px;
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: Theme.tier-color(item.color-code);
+            }
+
+            TouchArea {
+                clicked => { root.clicked(i); }
+            }
+        }
+    }
+}
