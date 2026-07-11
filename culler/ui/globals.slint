@@ -1,0 +1,21 @@
+export struct FilmstripItem {
+    thumb: image,
+    color-code: int,   // 0 rest/grey, 1 keep/green, 2 pick/blue, 3 best/gold, 4 reject/red
+    dim: bool,         // unvisited rest -> rendered dimmer
+    selected: bool,
+}
+
+export struct ApplyPreviewUi {
+    rejected: int,
+    rest: int,
+    keep: int,
+    picks: int,
+    bests: int,
+    collisions: int,
+    skipped-sidecars: int,
+    stale: int,
+    leftovers: int,
+    total-mb: int,
+    cross-fs: bool,
+    enough-space: bool,
+}

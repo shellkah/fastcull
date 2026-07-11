@@ -3,5 +3,18 @@ name = "culler"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "culler"
+path = "src/main.rs"
+
 [dependencies]
 culler-core = { path = "../culler-core" }
+slint = { version = "1.17", features = ["backend-winit", "renderer-skia"] }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+slint-build = "1.17"
+
+[dev-dependencies]
+tempfile = "3"

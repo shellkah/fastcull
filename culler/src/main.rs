@@ -1,5 +1,7 @@
-fn main() {
-    // Phase 6 replaces this stub with the Slint app (parse args, build/resume
-    // session, spawn decode workers, run the event loop).
-    println!("fastcull");
+slint::include_modules!();
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = AppWindow::new()?;
+    app.run()?;
+    Ok(())
 }
