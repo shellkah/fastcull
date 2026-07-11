@@ -202,7 +202,24 @@ fn decode_fit(
     resize_rgba(decoded, tw, th)
 }
 
-/// Read the EXIF Orientation tag (1..=8) from the already-loaded JPEG bytes —
+/// Read the EXIF Orientation tag (1..=8) from an already-parsed `exif::Exif`,
+/// range-checking the raw value BEFORE narrowing to `u16`. `get_uint` widens
+/// whatever integer type the tag was actually encoded as — kamadak-exif does
+/// not enforce the spec's SHORT type for Orientation, so a crafted/corrupt
+/// LONG-typed value like 65542 (0x00010006) must be rejected by range rather
+/// than truncated (a bare `as u16` narrow would silently yield 6 = rotate
+/// 90, defeating the identity fallback this function promises for invalid
+/// orientation). Out-of-range or absent -> 1 (identity); `apply_orientation`
+/// already treats 0 and >8 as identity too, so in-range-but-invalid values
+/// still fall back correctly downstream.
+fn orientation_from(exif: &exif::Exif) -> u16 {
+    exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        .and_then(|v| u16::try_from(v).ok())
+        .unwrap_or(1)
+}
+
+/// Read the EXIF Orientation tag from the already-loaded JPEG bytes —
 /// `decode` has the whole file in memory, so no second file read / reopen
 /// (kamadak-exif reads from any BufRead+Seek; `Cursor<&[u8]>` qualifies,
 /// verified by probe build). Returns 1 (identity) when EXIF is absent or
@@ -210,11 +227,7 @@ fn decode_fit(
 fn read_orientation(data: &[u8]) -> u16 {
     let mut cursor = std::io::Cursor::new(data);
     match exif::Reader::new().read_from_container(&mut cursor) {
-        Ok(exif) => exif
-            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-            .and_then(|f| f.value.get_uint(0))
-            .map(|v| v as u16)
-            .unwrap_or(1),
+        Ok(exif) => orientation_from(&exif),
         Err(_) => 1,
     }
 }
@@ -269,11 +282,7 @@ pub fn embedded_thumbnail(path: &Path) -> Option<DecodedImage> {
     }
 
     let decoded = decompress_scaled(thumb, 1).ok()?;
-    let orientation = exif
-        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        .map(|v| v as u16)
-        .unwrap_or(1);
+    let orientation = orientation_from(&exif);
     let (rgba, w, h) = apply_orientation(decoded.rgba, decoded.w, decoded.h, orientation);
     Some(DecodedImage { w, h, rgba })
 }
@@ -518,6 +527,129 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).unwrap();
         (dir, path)
+    }
+
+    /// Binary-patch a JPEG's EXIF IFD0 Orientation entry (tag 0x0112) in place:
+    /// rewrite its 12-byte IFD entry's field-type from SHORT(3) to LONG(4) and
+    /// its value to 65542 (0x00010006), simulating a corrupt/crafted EXIF blob
+    /// whose Orientation is nonconformingly LONG-typed. `kamadak-exif`'s
+    /// `get_uint` happily widens whatever integer type the tag was actually
+    /// encoded as, so a naive `as u16` narrow on this value truncates
+    /// 65542 -> 6 (rotate 90), instead of the identity fallback the module
+    /// contract promises for out-of-range orientation.
+    ///
+    /// Locates the TIFF header via the "Exif\0\0" marker inside APP1 and reads
+    /// ITS OWN declared byte order ("II" little-endian vs "MM" big-endian)
+    /// rather than assuming — mirrors what `kamadak-exif` itself does, so this
+    /// helper stays correct regardless of which byte order a given fixture
+    /// (or future replacement fixture) was encoded with.
+    ///
+    /// IFD entry layout (12 bytes): tag(2) type(2) count(4) value/offset(4).
+    /// For type=LONG(4) count=1, the 4-byte value fits directly in the
+    /// value/offset slot (no indirection) — so only the type and value fields
+    /// need rewriting; tag and count are untouched.
+    fn patch_orientation_to_overflowing_long(mut jpeg: Vec<u8>) -> Vec<u8> {
+        const NEEDLE: &[u8; 6] = b"Exif\0\0";
+        let exif_pos = jpeg
+            .windows(NEEDLE.len())
+            .position(|w| w == NEEDLE)
+            .expect("fixture must contain an Exif APP1 segment");
+        let tiff_start = exif_pos + NEEDLE.len();
+
+        let le = match &jpeg[tiff_start..tiff_start + 2] {
+            b"II" => true,
+            b"MM" => false,
+            other => panic!("unrecognized TIFF byte order marker: {other:?}"),
+        };
+        let ru16 = |b: &[u8]| -> u16 {
+            let a: [u8; 2] = b[..2].try_into().unwrap();
+            if le {
+                u16::from_le_bytes(a)
+            } else {
+                u16::from_be_bytes(a)
+            }
+        };
+        let ru32 = |b: &[u8]| -> u32 {
+            let a: [u8; 4] = b[..4].try_into().unwrap();
+            if le {
+                u32::from_le_bytes(a)
+            } else {
+                u32::from_be_bytes(a)
+            }
+        };
+
+        let ifd0_start = tiff_start + ru32(&jpeg[tiff_start + 4..]) as usize;
+        let num_entries = ru16(&jpeg[ifd0_start..]) as usize;
+
+        for i in 0..num_entries {
+            let entry = ifd0_start + 2 + i * 12;
+            if ru16(&jpeg[entry..]) == 0x0112 {
+                let type_off = entry + 2;
+                let value_off = entry + 8;
+                jpeg[type_off..type_off + 2].copy_from_slice(&if le {
+                    4u16.to_le_bytes()
+                } else {
+                    4u16.to_be_bytes()
+                });
+                jpeg[value_off..value_off + 4].copy_from_slice(&if le {
+                    65542u32.to_le_bytes()
+                } else {
+                    65542u32.to_be_bytes()
+                });
+                return jpeg;
+            }
+        }
+        panic!("Orientation tag (0x0112) not found in fixture's IFD0");
+    }
+
+    #[test]
+    fn decode_and_thumbnail_reject_overflowing_long_orientation() {
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/orientation_6.jpg");
+        let original = std::fs::read(&fx).expect("read fixture");
+        let patched = patch_orientation_to_overflowing_long(original);
+
+        // Sanity: confirm the patch actually landed — kamadak-exif must read
+        // back a raw (pre-narrowing) Orientation value of 65542, proving the
+        // IFD entry is genuinely LONG-typed now and not still SHORT-typed 6.
+        let mut cursor = std::io::Cursor::new(&patched);
+        let raw_exif = exif::Reader::new()
+            .read_from_container(&mut cursor)
+            .expect("patched bytes must still parse as a container with EXIF");
+        let raw_value = raw_exif
+            .get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0))
+            .expect("Orientation field must still be present after patching");
+        assert_eq!(
+            raw_value, 65542,
+            "patch must produce an overflowing LONG Orientation value (0x00010006)"
+        );
+
+        let (_dir, path) = write_temp_named("overflow_orientation.jpg", &patched);
+
+        // decode(): a LONG Orientation of 65542 must NOT truncate (65542 &
+        // 0xFFFF == 6) and rotate the image. It must fall back to identity,
+        // returning the fixture's RAW stored dims (120x80, landscape).
+        let img = decode(&path, TargetSize::Full).expect("decode patched fixture");
+        assert_eq!(
+            (img.w, img.h),
+            (120, 80),
+            "overflowing orientation must fall back to identity (raw stored dims), \
+             not truncate 65542 -> 6 and rotate to 80x120"
+        );
+        assert!(img.w > img.h, "identity fallback must stay landscape");
+
+        // embedded_thumbnail(): the duplicated inline lookup must reject the
+        // same overflowing value, returning the thumbnail's RAW stored dims
+        // (30x20, landscape), not rotate to 20x30.
+        let thumb = embedded_thumbnail(&path).expect("thumbnail must still decode");
+        assert_eq!(
+            (thumb.w, thumb.h),
+            (30, 20),
+            "overflowing orientation must fall back to identity for the thumbnail too, \
+             not truncate 65542 -> 6 and rotate to 20x30"
+        );
+        assert!(thumb.w > thumb.h, "identity fallback must stay landscape");
     }
 
     /// Patch a synthetic JPEG's SOF0-declared dimensions to `w`x`h`, simulating a
