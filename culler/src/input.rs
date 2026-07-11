@@ -1,7 +1,7 @@
 //! Pure input logic: keymap, filters, actions. Wired into the event loop by main (Task 11).
 #![allow(dead_code)] // TODO(Task 11): remove once main wires the module
 
-use culler_core::model::Tier;
+use culler_core::model::{Decision, Session, Tier};
 
 /// A semantic key, decoded from the string the Slint FocusScope forwards.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -87,6 +87,76 @@ pub fn key_to_action(key: Key, mods: Modifiers, ctx: InputContext) -> Option<Act
         Key::Char('a') | Key::Char('A') => Some(Action::OpenApply),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Filter {
+    All,
+    Keep,    // >= Keep
+    Pick,    // >= Pick
+    Best,    // >= Best (only Best)
+    Rejects, // only Reject
+}
+
+/// §9 filter cycle: All -> >=Keep -> >=Pick -> >=Best -> Rejects -> All.
+pub fn next_filter(f: Filter) -> Filter {
+    match f {
+        Filter::All => Filter::Keep,
+        Filter::Keep => Filter::Pick,
+        Filter::Pick => Filter::Best,
+        Filter::Best => Filter::Rejects,
+        Filter::Rejects => Filter::All,
+    }
+}
+
+/// Pure predicate: does this decision pass the active filter?
+/// Ladder is Reject(-1) < Rest/None(0) < Keep(1) < Pick(2) < Best(3).
+pub fn passes(filter: Filter, d: &Decision) -> bool {
+    match filter {
+        Filter::All => true,
+        Filter::Keep => d.tier.is_some_and(|t| t.rank() >= 1),
+        Filter::Pick => d.tier.is_some_and(|t| t.rank() >= 2),
+        Filter::Best => d.tier.is_some_and(|t| t.rank() >= 3),
+        Filter::Rejects => d.tier == Some(culler_core::model::Tier::Reject),
+    }
+}
+
+/// Next/previous index whose decision passes `filter`. With `Filter::All`
+/// this is a plain +/-1 (first candidate always passes). None at either end.
+pub fn step_filtered(session: &Session, filter: Filter, forward: bool) -> Option<usize> {
+    let n = session.shots.len();
+    if n == 0 {
+        return None;
+    }
+    let mut i = session.current;
+    loop {
+        if forward {
+            if i + 1 >= n {
+                return None;
+            }
+            i += 1;
+        } else {
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+        }
+        if passes(filter, session.decision(i)) {
+            return Some(i);
+        }
+    }
+}
+
+/// Turn comma-separated tag-entry text into clean, order-preserving, deduped tags.
+pub fn parse_tags(input: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in input.split(',') {
+        let t = raw.trim();
+        if !t.is_empty() && !out.iter().any(|e| e == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -212,5 +282,133 @@ mod key_tests {
         assert_eq!(to_key(" "), Some(Key::Space));
         assert_eq!(to_key("a"), Some(Key::Char('a')));
         assert_eq!(to_key(""), None);
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use culler_core::model::{CaptureTime, Decision, Session, Shot, Tier};
+
+    fn mk_session(tiers: &[Option<Tier>]) -> Session {
+        let mut shots = Vec::new();
+        let mut decisions = std::collections::HashMap::new();
+        for (i, t) in tiers.iter().enumerate() {
+            let stem = format!("IMG_{i:04}");
+            shots.push(Shot {
+                stem: stem.clone(),
+                jpeg: std::path::PathBuf::from(format!("/src/{stem}.JPG")),
+                raw: None,
+                sidecar: None,
+                capture: CaptureTime::default(),
+            });
+            decisions.insert(
+                stem,
+                Decision {
+                    tier: *t,
+                    tags: vec![],
+                    visited: false,
+                },
+            );
+        }
+        Session {
+            source_dir: "/src".into(),
+            shots,
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn filter_cycles_all_keep_pick_best_rejects() {
+        assert_eq!(next_filter(Filter::All), Filter::Keep);
+        assert_eq!(next_filter(Filter::Keep), Filter::Pick);
+        assert_eq!(next_filter(Filter::Pick), Filter::Best);
+        assert_eq!(next_filter(Filter::Best), Filter::Rejects);
+        assert_eq!(next_filter(Filter::Rejects), Filter::All);
+    }
+
+    #[test]
+    fn passes_respects_quality_ladder() {
+        let none = Decision::default();
+        let keep = Decision {
+            tier: Some(Tier::Keep),
+            ..Default::default()
+        };
+        let pick = Decision {
+            tier: Some(Tier::Pick),
+            ..Default::default()
+        };
+        let best = Decision {
+            tier: Some(Tier::Best),
+            ..Default::default()
+        };
+        let rej = Decision {
+            tier: Some(Tier::Reject),
+            ..Default::default()
+        };
+
+        for d in [&none, &keep, &pick, &best, &rej] {
+            assert!(passes(Filter::All, d));
+        }
+        // >= Keep : keep, pick, best (never rest/none or reject)
+        assert!(!passes(Filter::Keep, &none));
+        assert!(!passes(Filter::Keep, &rej));
+        assert!(passes(Filter::Keep, &keep));
+        assert!(passes(Filter::Keep, &pick));
+        assert!(passes(Filter::Keep, &best));
+        // >= Pick
+        assert!(!passes(Filter::Pick, &keep));
+        assert!(passes(Filter::Pick, &pick));
+        assert!(passes(Filter::Pick, &best));
+        // >= Best (only best)
+        assert!(!passes(Filter::Best, &pick));
+        assert!(passes(Filter::Best, &best));
+        // Rejects (only reject)
+        assert!(passes(Filter::Rejects, &rej));
+        assert!(!passes(Filter::Rejects, &keep));
+        assert!(!passes(Filter::Rejects, &none));
+    }
+
+    #[test]
+    fn step_filtered_skips_non_passing_forward_and_back() {
+        // Keep, None, Pick, None, Best
+        let mut s = mk_session(&[
+            Some(Tier::Keep),
+            None,
+            Some(Tier::Pick),
+            None,
+            Some(Tier::Best),
+        ]);
+        s.current = 0;
+        assert_eq!(step_filtered(&s, Filter::Pick, true), Some(2)); // next >=Pick after Keep@0
+        s.current = 2;
+        assert_eq!(step_filtered(&s, Filter::Pick, true), Some(4)); // Best@4
+        s.current = 4;
+        assert_eq!(step_filtered(&s, Filter::Pick, true), None); // nothing after
+        s.current = 4;
+        assert_eq!(step_filtered(&s, Filter::Pick, false), Some(2)); // back to Pick@2
+    }
+
+    #[test]
+    fn step_filtered_all_is_plain_pm1() {
+        let mut s = mk_session(&[None, None, None]);
+        s.current = 1;
+        assert_eq!(step_filtered(&s, Filter::All, true), Some(2));
+        assert_eq!(step_filtered(&s, Filter::All, false), Some(0));
+        s.current = 0;
+        assert_eq!(step_filtered(&s, Filter::All, false), None); // clamp at start
+    }
+
+    #[test]
+    fn parse_tags_splits_trims_dedupes() {
+        assert_eq!(
+            parse_tags("sky, tree ,  sky , , water"),
+            vec!["sky".to_string(), "tree".to_string(), "water".to_string()]
+        );
+        assert!(parse_tags("   ").is_empty());
+        assert!(parse_tags("").is_empty());
     }
 }
