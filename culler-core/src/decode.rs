@@ -572,6 +572,122 @@ mod tests {
         assert!(thumb.h > thumb.w, "thumbnail must be oriented upright");
     }
 
+    /// `embedded_thumbnail` must return `None` (never panic) when the EXIF-declared
+    /// thumbnail slice does not itself start with a JPEG SOI, e.g. a crafted/corrupt
+    /// file whose IFD1 offset/length pointers are intact but whose thumbnail bytes
+    /// were truncated, zeroed, or otherwise corrupted independently of the pointers.
+    ///
+    /// HONESTY NOTE on what this test does and does not prove: it pins the
+    /// None-on-non-JPEG-thumbnail CONTRACT (the public behavior), not the specific
+    /// `is_jpeg(thumb)` guard inside `embedded_thumbnail`. Deleting that guard
+    /// would NOT make this test fail: `decompress_scaled(thumb, 1)` would then be
+    /// called on the zeroed bytes, fail on the missing SOI marker, and the
+    /// trailing `.ok()?` would still produce `None`. The guard is defense-in-depth
+    /// at the FFI boundary (skip turbojpeg entirely on obviously-non-JPEG bytes
+    /// rather than relying on it to fail closed), and this test cannot distinguish
+    /// "guard fired" from "guard absent, downstream decode failed" — both paths
+    /// converge on the same observable `None`. A mutation run that deleted the
+    /// guard was confirmed to leave this test green (see commit body).
+    #[test]
+    fn embedded_thumbnail_none_on_non_jpeg_thumbnail_bytes() {
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/orientation_6.jpg");
+        let mut patched = std::fs::read(&fx).expect("read fixture");
+
+        // Locate the embedded thumbnail's JPEG SOI. It is the SECOND `FF D8 FF`
+        // occurrence in the file (the first, at offset 0, is the main image's
+        // own SOI) — confirmed against the EXIF-declared offset/length via
+        // kamadak-exif: JPEGInterchangeFormat is TIFF-relative (56 bytes past
+        // the "Exif\0\0" marker's TIFF header, which itself starts at file
+        // offset 30), landing at absolute file offset 86, which is exactly
+        // where the second `FF D8 FF` sits.
+        let soi_positions: Vec<usize> = patched
+            .windows(3)
+            .enumerate()
+            .filter(|(_, w)| *w == [0xFF, 0xD8, 0xFF])
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            soi_positions.len() >= 2,
+            "fixture must contain at least two JPEG SOI markers (main image + thumbnail), \
+             found {}",
+            soi_positions.len()
+        );
+        let thumb_soi = soi_positions[1];
+        assert_eq!(
+            soi_positions[0], 0,
+            "the first SOI must be the main image's, at file offset 0"
+        );
+        assert!(
+            thumb_soi > 30,
+            "the thumbnail SOI (offset {thumb_soi}) must land inside the EXIF APP1 \
+             segment (which starts after the main image's own markers), not coincide \
+             with the main image's SOI at offset 0"
+        );
+
+        // Cross-check against the EXIF-declared thumbnail pointers directly, so this
+        // test doesn't rely solely on "second SOI in the file" coinciding with the
+        // real EXIF-declared thumbnail by luck.
+        let mut cursor = std::io::Cursor::new(&patched);
+        let exif = exif::Reader::new()
+            .read_from_container(&mut cursor)
+            .expect("fixture must parse as a container with EXIF");
+        let tiff_relative_offset =
+            exif.get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)
+                .expect("fixture must declare a thumbnail offset")
+                .value
+                .get_uint(0)
+                .expect("thumbnail offset must be an unsigned int") as usize;
+        let needle = b"Exif\0\0";
+        let exif_pos = patched
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("fixture must contain an Exif APP1 segment");
+        let tiff_start = exif_pos + needle.len();
+        assert_eq!(
+            tiff_start + tiff_relative_offset,
+            thumb_soi,
+            "the second SOI in the file must be exactly where EXIF's own \
+             JPEGInterchangeFormat offset points"
+        );
+
+        // Surgical patch: stomp the thumbnail's SOI + first marker byte (the bytes
+        // is_jpeg() inspects) with zeros. Leaves the main image (bytes 0..86) and
+        // the EXIF IFD pointers themselves completely untouched.
+        patched[thumb_soi] = 0x00;
+        patched[thumb_soi + 1] = 0x00;
+        patched[thumb_soi + 2] = 0x00;
+
+        let (_dir, path) = write_temp_named("non_jpeg_thumbnail.jpg", &patched);
+
+        // The EXIF pointers must still be intact after patching (implicitly proven
+        // by embedded_thumbnail reaching its is_jpeg check rather than bailing out
+        // earlier on a missing/unparseable offset — a vacuous None from a broken
+        // pointer would make the next assertion meaningless).
+        let mut cursor2 = std::io::Cursor::new(&patched);
+        let exif2 = exif::Reader::new()
+            .read_from_container(&mut cursor2)
+            .expect("patched bytes must still parse as a container with EXIF");
+        assert!(
+            exif2
+                .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)
+                .is_some(),
+            "thumbnail offset pointer must survive the patch"
+        );
+
+        // The actual contract pin: non-JPEG thumbnail bytes -> None, no panic, no abort.
+        assert!(
+            embedded_thumbnail(&path).is_none(),
+            "a thumbnail slice that doesn't start with a JPEG SOI must yield None"
+        );
+
+        // Proves the patch was surgical: the main image is untouched and still decodes.
+        assert!(
+            decode(&path, TargetSize::Full).is_ok(),
+            "the main image must still decode after patching only the thumbnail bytes"
+        );
+    }
+
     fn write_temp_named(name: &str, bytes: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(name);
