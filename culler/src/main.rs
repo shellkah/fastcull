@@ -1,7 +1,9 @@
 slint::include_modules!();
 
+mod applyflow; // Task 12
 mod input;
 mod pipeline;
+mod startup;
 mod ui;
 
 // Bundled IBM Plex fonts (culler/ui/fonts/) need no registration call here: Slint
@@ -12,8 +14,377 @@ mod ui;
 // default `EmbedResourcesKind::EmbedAllResources` embeds the bytes and emits a
 // `RegisterCustomFontByMemory` call into the generated component's init code
 // automatically, before the window is constructed. See task-1b-report.md.
+
+use clap::Parser;
+use culler_core::decode::TargetSize;
+use culler_core::model::SESSION_FILE;
+use culler_core::persist::{load_or_fresh, save};
+use culler_core::scan::scan;
+use input::{
+    Action, Filter, InputContext, apply_action, key_to_action, next_filter, parse_tags, to_key,
+};
+use pipeline::{FullSlot, Pipeline, prefetch_set, to_slint_image};
+use startup::{
+    BreadcrumbProbe, Cli, find_crashed_apply, journal_report, probe_breadcrumb, reattach,
+    resolve_buckets, validate_buckets,
+};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
+const PREFETCH_N: usize = 4;
+const FILMSTRIP_BUFFER: usize = 8;
+const CACHE_BUDGET: usize = 512 * 1024 * 1024; // 512 MB of fit-size textures
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let source = cli.source.clone();
+    let auto_advance = !cli.no_auto_advance;
+    let buckets = resolve_buckets(&cli);
+    if let Err(msg) = validate_buckets(&buckets) {
+        eprintln!("{msg}");
+        return Err(msg.into());
+    }
+
+    // Startup: load-or-fresh, always rescan, reattach by stem.
+    let prev = load_or_fresh(&source)?; // corrupt -> .bad + Ok(None), reported by core
+    let scanned = scan(&source)?;
+    let mut session = reattach(&source, scanned, prev);
+
+    // Crash detection (spec §6 rev 3): the session breadcrumb points at the
+    // in-flight dest of a crashed apply — that is what makes "detected on next
+    // launch" work, since the journal lives in DEST while launches open SOURCE.
+    // A breadcrumb whose dest carries no journal is stale (crash before the
+    // first journal write, or a vanished dest) and is cleared rather than
+    // haunting every future launch. UI surfaces resume-or-report (Task 12
+    // dialog / Task 13 banner) — for now this is a launch-time eprintln.
+    match probe_breadcrumb(&mut session) {
+        BreadcrumbProbe::CrashedJournal(j) => {
+            eprintln!("{}", journal_report(&j).unwrap_or_default());
+        }
+        BreadcrumbProbe::StaleCleared(dest) => {
+            // Autosave the cleared breadcrumb immediately so a repeat crash
+            // right after launch can't resurrect it from the on-disk session.
+            let _ = save(&session, &source.join(SESSION_FILE));
+            eprintln!(
+                "stale pending_apply breadcrumb cleared (no journal at {}); proceeding",
+                dest.display()
+            );
+        }
+        BreadcrumbProbe::NoBreadcrumb => {}
+    }
+    // The source dir itself is also probed (it may have been a prior run's
+    // DESTINATION). Done before wrapping `session` in Rc/RefCell — this is a
+    // plain startup check, not part of the live event-loop state.
+    if let Some(j) = find_crashed_apply(&source) {
+        eprintln!("{}", journal_report(&j).unwrap_or_default());
+    }
+
     let app = AppWindow::new()?;
+    let session = Rc::new(RefCell::new(session));
+    let filter = Rc::new(RefCell::new(Filter::All));
+    let zoom = Rc::new(RefCell::new(ui::ZoomState::default()));
+    let cache = Arc::new(Mutex::new(pipeline::LruCache::new(CACHE_BUDGET)));
+    let full_slot = Arc::new(Mutex::new(FullSlot::default()));
+    // The shot the loupe is showing — the delivery-time freshness check reads
+    // this on the event loop before painting any decode result.
+    let current_shot = Arc::new(std::sync::atomic::AtomicUsize::new(
+        session.borrow().current,
+    ));
+    // Debounced-autosave dirty flag (spec §12: never a sync fsync per keypress).
+    let dirty = Rc::new(std::cell::Cell::new(false));
+
+    // Decode pipeline. on_ready DROPS STALE RESULTS AT DELIVERY (§12): results
+    // land in completion order, so a prefetched NEIGHBOR or a superseded decode
+    // must never repaint the loupe — cache everything, paint only the current
+    // shot's result. (This check is load-bearing: without it, holding → paints
+    // whichever of the ±N prefetches decodes last.)
+    let weak = app.as_weak();
+    let cache_w = cache.clone();
+    let full_w = full_slot.clone();
+    let cur_w = current_shot.clone();
+    let pipeline = Arc::new(Pipeline::spawn(3, move |res| {
+        let weak = weak.clone();
+        let cache_w = cache_w.clone();
+        let full_w = full_w.clone();
+        let cur_w = cur_w.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = weak.upgrade() {
+                let is_current = res.req.index == cur_w.load(Ordering::SeqCst);
+                match res.target {
+                    TargetSize::Full => {
+                        full_w.lock().unwrap().set(res.req.index, res.image.clone());
+                        if is_current {
+                            ui::set_loupe(&app, &res.image);
+                        }
+                    }
+                    _ => {
+                        cache_w
+                            .lock()
+                            .unwrap()
+                            .put(res.req.index, res.image.clone());
+                        if is_current {
+                            ui::set_loupe(&app, &res.image);
+                        }
+                    }
+                }
+            }
+        });
+    }));
+
+    // Helper: (re)request current + prefetch neighbors after any navigation.
+    let request_current = {
+        let session = session.clone();
+        let zoom = zoom.clone();
+        let cache = cache.clone();
+        let full_slot = full_slot.clone();
+        let pipeline = pipeline.clone();
+        let current_shot = current_shot.clone();
+        let app_w = app.as_weak();
+        move || {
+            let s = session.borrow();
+            if s.shots.is_empty() {
+                return;
+            }
+            let (fw, fh) = (1600u32, 1000u32);
+            pipeline.bump(); // latest-wins: supersede in-flight requests
+            let cur = s.current;
+            current_shot.store(cur, Ordering::SeqCst); // delivery freshness anchor
+            let z = *zoom.borrow();
+            // Show the best already-cached scale immediately.
+            if let Some(app) = app_w.upgrade() {
+                if z.zoomed {
+                    if let Some(img) = full_slot.lock().unwrap().get(cur) {
+                        ui::set_loupe(&app, &img);
+                    }
+                } else if let Some(img) = cache.lock().unwrap().get(cur) {
+                    ui::set_loupe(&app, &img);
+                }
+            }
+            // Request the exact target for current.
+            pipeline.enqueue(cur, s.shots[cur].jpeg.clone(), z.target(fw, fh), false);
+            // Prefetch neighbors (fit-size only). thumb_first: true — an
+            // embedded EXIF thumbnail paints the filmstrip tile instantly
+            // (spec §12), refined by the real decode moments later. The
+            // current-shot request above stays `false`: the loupe wants the
+            // real decode, not a low-res thumbnail flash.
+            for idx in prefetch_set(cur, PREFETCH_N, s.shots.len()) {
+                if idx != cur && !cache.lock().unwrap().contains(idx) {
+                    pipeline.enqueue(
+                        idx,
+                        s.shots[idx].jpeg.clone(),
+                        TargetSize::Fit(fw, fh),
+                        true,
+                    );
+                }
+            }
+        }
+    };
+
+    // Refresh HUD + filmstrip from current state.
+    let refresh_view = {
+        let session = session.clone();
+        let filter = filter.clone();
+        let cache = cache.clone();
+        let app_w = app.as_weak();
+        move || {
+            let Some(app) = app_w.upgrade() else { return };
+            let s = session.borrow();
+            let h = ui::hud_text(&s, *filter.borrow());
+            app.set_hud_tier(h.tier.into());
+            app.set_hud_tags(h.tags.into());
+            app.set_hud_counts(h.counts.into());
+            app.set_hud_progress(h.progress.into());
+            app.set_filter_label(h.filter_label.into());
+            app.set_hud_filename(h.filename.into());
+            app.set_hud_has_raw(h.has_raw);
+            app.set_hud_position(h.position.into());
+            let c = s.counts();
+            app.set_count_best(c.bests as i32);
+            app.set_count_pick(c.picks as i32);
+            app.set_count_keep(c.keep as i32);
+            app.set_count_rest(c.rest as i32);
+            app.set_count_reject(c.rejected as i32);
+            let mut cache = cache.lock().unwrap();
+            let grey = pipeline::grey_thumb();
+            let mut thumb_for = |i: usize| {
+                cache
+                    .get(i)
+                    .map(|im| to_slint_image(&im))
+                    .unwrap_or_else(|| grey.clone())
+            };
+            ui::refresh_filmstrip(&app, &s, *filter.borrow(), FILMSTRIP_BUFFER, &mut thumb_for);
+        }
+    };
+
+    // Key dispatch: pure map -> action -> mutate model or UI state, then refresh.
+    {
+        let session = session.clone();
+        let filter = filter.clone();
+        let zoom = zoom.clone();
+        let request_current = request_current.clone();
+        let refresh_view = refresh_view.clone();
+        let app_w = app.as_weak();
+        let source = source.clone();
+        let dirty = dirty.clone();
+        app.on_key_pressed(move |text, ctrl| {
+            let Some(app) = app_w.upgrade() else {
+                return false;
+            };
+            let ctx = if app.get_tag_open() {
+                InputContext::TagEntry
+            } else if app.get_apply_open() {
+                InputContext::ApplyDialog
+            } else {
+                InputContext::Loupe
+            };
+            let Some(key) = to_key(&text) else {
+                return false;
+            };
+            let mods = input::Modifiers {
+                control: ctrl,
+                ..Default::default()
+            };
+            let Some(action) = key_to_action(key, mods, ctx) else {
+                return false;
+            };
+            match action {
+                Action::CycleFilter => {
+                    let nf = next_filter(*filter.borrow());
+                    *filter.borrow_mut() = nf;
+                    refresh_view();
+                }
+                Action::ToggleZoom => {
+                    zoom.borrow_mut().toggle();
+                    app.set_zoomed(zoom.borrow().zoomed);
+                    request_current();
+                }
+                Action::OpenTagEntry => {
+                    let s = session.borrow();
+                    app.set_tag_text(s.decision(s.current).tags.join(", ").into());
+                    app.set_tag_open(true);
+                }
+                Action::OpenApply => {
+                    app.set_apply_open(true);
+                }
+                Action::ForceSave => {
+                    // Ctrl+S: immediate, and the debounce flag is satisfied.
+                    dirty.set(false);
+                    let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+                }
+                other => {
+                    let before = session.borrow().current;
+                    apply_action(
+                        other,
+                        &mut session.borrow_mut(),
+                        auto_advance,
+                        *filter.borrow(),
+                    );
+                    if session.borrow().current != before {
+                        zoom.borrow_mut().on_navigate();
+                        request_current();
+                    }
+                    // Autosave is DEBOUNCED (flag + timer below) — a synchronous
+                    // serialize+fsync per keypress fights §12 sub-frame navigation.
+                    dirty.set(true);
+                    refresh_view();
+                }
+            }
+            true
+        });
+    }
+
+    // Filmstrip click -> jump.
+    {
+        let session = session.clone();
+        let filter = filter.clone();
+        let request_current = request_current.clone();
+        let refresh_view = refresh_view.clone();
+        app.on_film_clicked(move |offset| {
+            let (indices, _) =
+                ui::build_filmstrip_window(&session.borrow(), *filter.borrow(), FILMSTRIP_BUFFER);
+            if let Some(&idx) = indices.get(offset as usize) {
+                session.borrow_mut().current = idx;
+                session.borrow_mut().mark_visited(idx);
+                request_current();
+                refresh_view();
+            }
+        });
+    }
+
+    // Tag entry commit / cancel.
+    {
+        let session = session.clone();
+        let refresh_view = refresh_view.clone();
+        let dirty = dirty.clone();
+        let app_w = app.as_weak();
+        app.on_tag_committed(move |text| {
+            let Some(app) = app_w.upgrade() else { return };
+            let idx = session.borrow().current;
+            session.borrow_mut().set_tags(idx, parse_tags(&text));
+            app.set_tag_open(false);
+            dirty.set(true); // picked up by the debounced autosave
+            refresh_view();
+        });
+    }
+    {
+        let app_w = app.as_weak();
+        app.on_tag_cancelled(move || {
+            if let Some(a) = app_w.upgrade() {
+                a.set_tag_open(false);
+            }
+        });
+    }
+    {
+        let session = session.clone();
+        let app_w = app.as_weak();
+        app.on_tag_changed(move |text| {
+            if let Some(app) = app_w.upgrade() {
+                let all = session.borrow().all_tags();
+                let last = text.rsplit(',').next().unwrap_or("").to_string();
+                let sugg: Vec<slint::SharedString> = ui::suggest_tags(&all, &last)
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
+                app.set_tag_suggestions(Rc::new(slint::VecModel::from(sugg)).into());
+            }
+        });
+    }
+
+    // Apply dialog callbacks are wired in Task 12 (applyflow).
+    applyflow::wire_apply_dialog(&app, session.clone(), buckets);
+
+    // Debounced autosave: flush the dirty flag at most every 2s, off the hot
+    // key path. The Timer binding must outlive run() or it is cancelled.
+    let autosave_timer = slint::Timer::default();
+    {
+        let session = session.clone();
+        let source = source.clone();
+        let dirty = dirty.clone();
+        autosave_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(2),
+            move || {
+                if dirty.replace(false) {
+                    let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+                }
+            },
+        );
+    }
+
+    // First paint.
+    {
+        let mut s = session.borrow_mut();
+        if !s.shots.is_empty() {
+            let cur = s.current;
+            s.mark_visited(cur);
+        }
+    }
+    request_current();
+    refresh_view();
     app.run()?;
+    // Flush any still-debounced state on the way out.
+    let _ = save(&session.borrow(), &source.join(SESSION_FILE));
     Ok(())
 }

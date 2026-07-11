@@ -1,5 +1,4 @@
 //! UI glue: pure view-model helpers + Slint model population. Wired by main (Task 11).
-#![allow(dead_code)] // TODO(Task 11): remove once main wires the event loop
 
 use crate::input::{Filter, passes};
 use crate::pipeline::to_slint_image;
@@ -170,7 +169,13 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ZoomState {
     pub zoomed: bool,
+    // Exercised by `zoom_tests` (pan persists across toggle/navigate); the
+    // live pan offset is actually owned by app.slint's own two-way-bound
+    // `pan-x`/`pan-y` properties (see Loupe's drag gesture), so these fields
+    // are unread by production Rust code.
+    #[allow(dead_code)]
     pub pan_x: f32,
+    #[allow(dead_code)]
     pub pan_y: f32,
 }
 

@@ -1,5 +1,4 @@
 //! Decode pipeline: scheduling, caching, worker threads. Wired into the event loop by main (Task 11).
-#![allow(dead_code)] // TODO(Task 11): remove once main wires the event loop
 
 /// A decode request tagged with the generation that was current when it was stamped.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -11,21 +10,32 @@ pub struct Request {
 /// Pure latest-wins scheduler. `generation` bumps once per navigation event.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Scheduler {
+    // Exercised by `scheduler_tests` below; production staleness checks route
+    // through `Pipeline`'s own `AtomicU64` generation counter instead (see
+    // `Pipeline::spawn`/`bump`/`enqueue`), so this field is unread outside tests.
+    #[allow(dead_code)]
     pub generation: u64,
 }
 
 impl Scheduler {
+    // Test-only convenience constructor for `scheduler_tests`; `Pipeline`
+    // tracks its own generation via `AtomicU64` rather than a `Scheduler`.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self { generation: 0 }
     }
 
     /// Advance to a new generation (call once per navigation) and return it.
+    // Test-only; see the `generation` field's doc comment above.
+    #[allow(dead_code)]
     pub fn advance(&mut self) -> u64 {
         self.generation += 1;
         self.generation
     }
 
     /// Stamp a request for `index` with generation `gen` (typically `self.generation`).
+    // Test-only; production stamps `Request` directly in `Pipeline::enqueue`.
+    #[allow(dead_code)]
     pub fn request(&self, index: usize, r#gen: u64) -> Request {
         Request {
             index,
@@ -146,14 +156,19 @@ impl LruCache {
         self.map.contains_key(&key)
     }
 
+    // Test-only convenience (cache_tests below): production code checks
+    // `contains`/`get` directly and never needs the aggregate counts.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 
+    #[allow(dead_code)]
     pub fn used_bytes(&self) -> usize {
         self.used
     }
@@ -381,4 +396,11 @@ mod marshal_tests {
         assert_eq!(img.size().width, 4);
         assert_eq!(img.size().height, 3);
     }
+}
+
+/// A 1x1 grey placeholder image for filmstrip tiles not yet decoded.
+pub fn grey_thumb() -> Image {
+    let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(1, 1);
+    buf.make_mut_bytes().copy_from_slice(&[128, 128, 128, 255]);
+    Image::from_rgba8(buf)
 }

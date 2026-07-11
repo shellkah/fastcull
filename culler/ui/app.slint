@@ -49,6 +49,10 @@ export component AppWindow inherits Window {
     callback key-pressed(string, bool) -> bool; // (text, ctrl)
     callback film-clicked(int);
 
+    // Apply dialog (Task 12 builds the dialog itself); Task 11 lands the
+    // property so `InputContext::ApplyDialog` can be selected on `A`.
+    in-out property <bool> apply-open: false;
+
     forward-focus: keyscope;
     keyscope := FocusScope {
         key-pressed(event) => {
