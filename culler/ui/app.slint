@@ -2,10 +2,11 @@ import { Theme } from "theme.slint";
 import { Loupe } from "loupe.slint";
 import { Filmstrip } from "filmstrip.slint";
 import { FilmstripItem } from "globals.slint";
+import { HudTopLeft, HudTopRight, HudBottomLeft, TagEntry } from "hud.slint";
 
-// culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8),
-// wired to the pure input/pipeline glue in culler/src/ui.rs (Task 11 assembles the
-// event loop). DESIGN.md §4 screen 1b.
+// culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8) +
+// HUD overlays + tag entry (Task 9), wired to the pure input/pipeline glue in
+// culler/src/ui.rs (Task 11 assembles the event loop). DESIGN.md §4 screens 1b/2f.
 export component AppWindow inherits Window {
     title: "FastCull";
     preferred-width: 1280px;
@@ -18,6 +19,32 @@ export component AppWindow inherits Window {
     in-out property <length> pan-y;
     in property <[FilmstripItem]> film-items;
     in property <int> film-current;
+
+    // HUD strings (Task 9's `ui::hud_text`; Task 11 wires these on navigation/edits).
+    in property <string> hud-tier: "Rest";
+    in property <string> hud-tags: "";
+    in property <string> hud-counts: "";
+    in property <string> hud-progress: "";
+    in property <string> filter-label: "";
+    in property <string> hud-filename: "";
+    in property <bool> hud-has-raw: false;
+    in property <string> hud-position: "0/0";
+    // Per-tier counts pill ints backing HudTopRight's dots (task-9 amendment 5); the
+    // formatted `hud-counts` string above stays for parity with the tested HudText
+    // interface. Defaults 0 here — Task 11 wires both from `session.counts()`.
+    in property <int> count-best: 0;
+    in property <int> count-pick: 0;
+    in property <int> count-keep: 0;
+    in property <int> count-rest: 0;
+    in property <int> count-reject: 0;
+
+    // Tag entry overlay (Task 9; Task 11 wires open/close + suggest_tags on `T`/Esc/Enter).
+    in property <bool> tag-open: false;
+    in-out property <string> tag-text;
+    in property <[string]> tag-suggestions;
+    callback tag-changed(string);
+    callback tag-committed(string);
+    callback tag-cancelled();
 
     callback key-pressed(string, bool) -> bool; // (text, ctrl)
     callback film-clicked(int);
@@ -32,11 +59,41 @@ export component AppWindow inherits Window {
             return root.key-pressed(event.text, event.modifiers.control) ? accept : reject;
         }
         VerticalLayout {
-            Loupe {
-                source: root.current-image;
-                zoomed: root.zoomed;
-                pan-x <=> root.pan-x;
-                pan-y <=> root.pan-y;
+            stage := Rectangle {
+                // The loupe fills the stage; HUD overlays + tag entry are later
+                // siblings so they paint OVER the photo (DESIGN §4 1b/2f) instead of
+                // living beside it in a side column.
+                Loupe {
+                    source: root.current-image;
+                    zoomed: root.zoomed;
+                    pan-x <=> root.pan-x;
+                    pan-y <=> root.pan-y;
+                }
+                HudTopLeft {
+                    filename: root.hud-filename;
+                    has-raw: root.hud-has-raw;
+                    position: root.hud-position;
+                }
+                HudTopRight {
+                    tier: root.hud-tier;
+                    count-best: root.count-best;
+                    count-pick: root.count-pick;
+                    count-keep: root.count-keep;
+                    count-rest: root.count-rest;
+                    count-reject: root.count-reject;
+                }
+                HudBottomLeft {
+                    tags: root.hud-tags;
+                    filter-label: root.filter-label;
+                    progress: root.hud-progress;
+                }
+                if root.tag-open: TagEntry {
+                    text <=> root.tag-text;
+                    suggestions: root.tag-suggestions;
+                    changed(t) => { root.tag-changed(t); }
+                    committed(t) => { root.tag-committed(t); }
+                    cancelled => { root.tag-cancelled(); }
+                }
             }
             Filmstrip {
                 height: 130px;

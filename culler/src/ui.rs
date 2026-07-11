@@ -86,6 +86,179 @@ pub fn set_loupe(app: &crate::AppWindow, img: &DecodedImage) {
     app.set_current_image(to_slint_image(img));
 }
 
+/// Autocomplete suggestions: entries of `all` whose text starts with `prefix`
+/// (case-insensitive), excluding an exact match. Capped for a tidy popup.
+pub fn suggest_tags(all: &[String], prefix: &str) -> Vec<String> {
+    let p = prefix.trim().to_lowercase();
+    if p.is_empty() {
+        return Vec::new();
+    }
+    all.iter()
+        .filter(|t| {
+            let lt = t.to_lowercase();
+            lt.starts_with(&p) && lt != p
+        })
+        .take(8)
+        .cloned()
+        .collect()
+}
+
+/// Pre-rendered HUD strings (DESIGN.md §4 screen 1b: top-left filename/RAW/position,
+/// top-right counts pill/tier badge, bottom-left tags/filter/progress).
+pub struct HudText {
+    pub tier: String,
+    pub tags: String,
+    pub counts: String,
+    pub progress: String,
+    pub filter_label: String,
+    /// Current shot's display (jpeg) file name, lossy-decoded. Empty for an empty session.
+    pub filename: String,
+    /// Whether the current shot has a RAW sibling (drives the top-left RAW badge).
+    pub has_raw: bool,
+    /// "{current+1}/{len}", 1-based for display; "0/0" when the session has no shots.
+    pub position: String,
+}
+
+pub fn hud_text(session: &Session, filter: Filter) -> HudText {
+    let d = session.decision(session.current);
+    let tier = match d.tier {
+        None => "Rest".to_string(),
+        Some(culler_core::model::Tier::Keep) => "Keep".to_string(),
+        Some(culler_core::model::Tier::Pick) => "Pick".to_string(),
+        Some(culler_core::model::Tier::Best) => "Best".to_string(),
+        Some(culler_core::model::Tier::Reject) => "Reject".to_string(),
+    };
+    let c = session.counts();
+    let counts = format!(
+        "reject {}  rest {}  keep {}  pick {}  best {}",
+        c.rejected, c.rest, c.keep, c.picks, c.bests
+    );
+    let progress = format!("seen {}/{}", session.visited_count(), session.shots.len());
+    let filter_label = match filter {
+        Filter::All => "filter: All",
+        Filter::Keep => "filter: >=Keep",
+        Filter::Pick => "filter: >=Pick",
+        Filter::Best => "filter: >=Best",
+        Filter::Rejects => "filter: Rejects",
+    }
+    .to_string();
+    let current_shot = session.shots.get(session.current);
+    let filename = current_shot
+        .and_then(|s| s.jpeg.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let has_raw = current_shot.is_some_and(|s| s.raw.is_some());
+    let position = if session.shots.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!("{}/{}", session.current + 1, session.shots.len())
+    };
+    HudText {
+        tier,
+        tags: d.tags.join(", "),
+        counts,
+        progress,
+        filter_label,
+        filename,
+        has_raw,
+        position,
+    }
+}
+
+#[cfg(test)]
+mod hud_tests {
+    use super::*;
+    use crate::input::Filter;
+    use culler_core::model::{CaptureTime, Decision, Session, Shot, Tier};
+
+    fn mk(tiers: &[Option<Tier>]) -> Session {
+        let mut shots = Vec::new();
+        let mut decisions = std::collections::HashMap::new();
+        for (i, t) in tiers.iter().enumerate() {
+            let stem = format!("IMG_{i:04}");
+            shots.push(Shot {
+                stem: stem.clone(),
+                jpeg: format!("/s/{stem}.JPG").into(),
+                raw: None,
+                sidecar: None,
+                capture: CaptureTime::default(),
+            });
+            decisions.insert(
+                stem,
+                Decision {
+                    tier: *t,
+                    tags: vec![],
+                    visited: t.is_some(),
+                },
+            );
+        }
+        Session {
+            source_dir: "/s".into(),
+            shots,
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn suggest_tags_prefix_filters_case_insensitively() {
+        let all = vec![
+            "sky".to_string(),
+            "skyline".to_string(),
+            "sea".to_string(),
+            "Sunset".to_string(),
+        ];
+        assert_eq!(
+            suggest_tags(&all, "sk"),
+            vec!["sky".to_string(), "skyline".to_string()]
+        );
+        assert_eq!(suggest_tags(&all, "SU"), vec!["Sunset".to_string()]);
+        assert!(suggest_tags(&all, "").is_empty()); // no prefix -> no noise
+        // an exact match is not re-suggested
+        assert!(suggest_tags(&all, "sky").iter().all(|s| s != "sky"));
+    }
+
+    #[test]
+    fn hud_text_reports_tier_counts_and_progress() {
+        let s = mk(&[Some(Tier::Keep), Some(Tier::Reject), None]);
+        let h = hud_text(&s, Filter::All);
+        assert_eq!(h.tier, "Keep"); // current @0
+        assert!(h.counts.contains("keep 1"));
+        assert!(h.counts.contains("reject 1"));
+        assert!(h.progress.contains("seen 2/3")); // two tiered => visited
+        assert_eq!(h.filter_label, "filter: All");
+        assert_eq!(h.filename, "IMG_0000.JPG");
+        assert!(!h.has_raw);
+        assert_eq!(h.position, "1/3");
+    }
+
+    #[test]
+    fn hud_text_shows_rest_for_undecided_current() {
+        let mut s = mk(&[None, None]);
+        s.current = 0;
+        let h = hud_text(&s, Filter::Keep);
+        assert_eq!(h.tier, "Rest");
+        assert_eq!(h.filter_label, "filter: >=Keep");
+    }
+
+    #[test]
+    fn hud_text_empty_session_is_safe() {
+        let s = Session {
+            source_dir: "/s".into(),
+            shots: Vec::new(),
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            pending_apply: None,
+            undo: Vec::new(),
+        };
+        let h = hud_text(&s, Filter::All);
+        assert_eq!(h.position, "0/0");
+        assert_eq!(h.tier, "Rest");
+    }
+}
+
 #[cfg(test)]
 mod color_tests {
     use super::*;

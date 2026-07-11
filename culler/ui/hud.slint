@@ -1,0 +1,306 @@
+import { LineEdit } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+
+// culler/ui/hud.slint — floating HUD overlays + tag entry (DESIGN.md §4 screens 1b/2f).
+// Per task-9 corrections: the HUD is NOT a side column — it is a set of small
+// `Theme.panel-hud` panels that float OVER the full-bleed photo, inset 14px from the
+// loupe edges. Each exported component's ROOT element is transparent and fills its
+// container (the loupe "stage" Rectangle in app.slint, via Slint's default "100% of
+// parent when not part of a layout" sizing — builtins.slint); a nested `panel`
+// Rectangle inside does the actual inset positioning.
+//
+// Syntax adaptation (disclosed): a component's root element cannot reference `parent`
+// (the compiler rejects it — "Cannot access id 'parent'" — because a reusable
+// component's root doesn't know its eventual container at definition time). Nesting
+// the real panel one level down makes `parent` resolve to the root element within the
+// *same* component, which is legal (same pattern filmstrip.slint already uses for its
+// tier-dot badges, just one level shallower there since it isn't anchoring to the
+// grandparent).
+//
+// Sizing note (also disclosed): panels use fixed pixel width/height rather than
+// binding to an inner layout's `preferred-width`/`preferred-height`. A Rectangle not
+// managed by an outer layout defaults its own size to 100% of ITS parent, so an inner
+// layout filling such a Rectangle would in turn default to 100% of that Rectangle too
+// — feeding the Rectangle's width from the inner layout's preferred size while the
+// inner layout's own width silently depends back on the Rectangle's width is exactly
+// the shape of the "binding loop" cases the Slint compiler rejects. Fixed pixel sizing
+// (as the task brief's own TagEntry sketch already used) avoids that risk entirely;
+// content here is short/bounded strings so this is safe. The one exception is the
+// tier badge's width, bound to a *leaf* Text's `preferred-width` (font-metric based,
+// not itself dependent on an ancestor's width) — a standard, non-circular Slint idiom.
+
+// Maps a HudText.tier display string ("Rest"/"Keep"/"Pick"/"Best"/"Reject") to the
+// palette code `Theme.tier-color` / `ui::tier_color_code` expect (0..4). Slint has no
+// top-level free functions (only component/global members), so this lives as a
+// `global` helper rather than a free `pure function` — a syntax adaptation. The pure
+// HudText/hud_text interface (task-9 amendment 3) intentionally stays a display
+// String, not a code; this is a presentation-only derivation local to the .slint
+// side, disclosed here rather than adding a second Rust-side property.
+export global TierCode {
+    public pure function for-name(name: string) -> int {
+        return name == "Keep" ? 1 : name == "Pick" ? 2 : name == "Best" ? 3 : name == "Reject" ? 4 : 0;
+    }
+}
+
+// ── top-left: filename + RAW badge + N/M position (DESIGN §4 1b) ──
+export component HudTopLeft inherits Rectangle {
+    in property <string> filename;
+    in property <bool> has-raw;
+    in property <string> position;
+    background: transparent;
+
+    panel := Rectangle {
+        x: 14px;
+        y: 14px;
+        width: 300px;
+        height: 26px;
+        background: Theme.panel-hud;
+        border-radius: Theme.r-md;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        HorizontalLayout {
+            padding: 7px;
+            spacing: 8px;
+            alignment: start;
+            Text {
+                text: root.filename;
+                font-family: Theme.font-mono;
+                font-weight: 500;
+                font-size: 12px;
+                color: Theme.text;
+                vertical-alignment: center;
+            }
+            if root.has-raw: Rectangle {
+                border-radius: Theme.r-sm;
+                border-width: 1px;
+                // DESIGN §2.3 RAW-badge border — not a Theme ramp value, literal by spec.
+                border-color: #45484e;
+                HorizontalLayout {
+                    padding: 3px;
+                    Text {
+                        text: "RAW";
+                        font-family: Theme.font-mono;
+                        font-weight: 600;
+                        font-size: 9px;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            Text {
+                text: root.position;
+                font-family: Theme.font-mono;
+                font-size: 10.5px;
+                color: Theme.text-dim;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// ── top-right: per-tier counts pill + current-tier badge (DESIGN §4 1b) ──
+export component HudTopRight inherits Rectangle {
+    in property <string> tier; // display text: "Rest"/"Keep"/"Pick"/"Best"/"Reject"
+    // Per-tier counts pill ints. Defaults 0; Task 11 wires these from `session.counts()`
+    // (task-9 amendment 5 — HudText.counts stays a formatted String for the tests, the
+    // pill renders from these five ints so each dot+number is independently colorable).
+    in property <int> count-best: 0;
+    in property <int> count-pick: 0;
+    in property <int> count-keep: 0;
+    in property <int> count-rest: 0;
+    in property <int> count-reject: 0;
+    background: transparent;
+
+    panel := Rectangle {
+        x: parent.width - self.width - 14px;
+        y: 14px;
+        width: 300px;
+        height: 30px;
+        background: Theme.panel-hud;
+        border-radius: Theme.r-md;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        HorizontalLayout {
+            padding: 7px;
+            spacing: 10px;
+            alignment: end;
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+                // order: best · pick · keep · rest · reject
+                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-best; }
+                Text { text: root.count-best; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-pick; }
+                Text { text: root.count-pick; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-keep; }
+                Text { text: root.count-keep; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-rest; }
+                Text { text: root.count-rest; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-reject; }
+                Text { text: root.count-reject; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+            }
+
+            Rectangle {
+                background: Theme.tier-color(TierCode.for-name(root.tier));
+                border-radius: Theme.r-md;
+                width: badge-text.preferred-width + 14px;
+                badge-text := Text {
+                    text: root.tier == "Rest" ? "REST" : root.tier.to-uppercase();
+                    font-family: Theme.font-mono;
+                    font-weight: 600;
+                    font-size: 12px;
+                    letter-spacing: 1px;
+                    color: Theme.on-accent;
+                    x: 7px;
+                    vertical-alignment: center;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+// ── bottom-left: tag chip + filter label + seen progress (DESIGN §4 1b) ──
+// NB histogram + EXIF line are Defer (§6) — not built.
+export component HudBottomLeft inherits Rectangle {
+    // Comma-joined tags straight from HudText.tags (the pure interface keeps this a
+    // single String, not a list — see task-9 report for the disclosed single-chip
+    // simplification vs. DESIGN's per-tag chip row).
+    in property <string> tags;
+    in property <string> filter-label;
+    in property <string> progress;
+    background: transparent;
+
+    panel := Rectangle {
+        x: 14px;
+        y: parent.height - self.height - 14px;
+        width: 280px;
+        height: tags == "" ? 54px : 76px;
+        background: Theme.panel-hud;
+        border-radius: Theme.r-md;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 6px;
+            alignment: start;
+            if root.tags != "": Rectangle {
+                height: 20px;
+                background: Theme.chip-bg;
+                border-radius: Theme.r-sm;
+                Text {
+                    text: root.tags;
+                    font-family: Theme.font-mono;
+                    font-size: 10.5px;
+                    color: Theme.text-2;
+                    x: 6px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+            Text {
+                text: root.filter-label;
+                font-family: Theme.font-mono;
+                font-size: 10.5px;
+                color: Theme.label;
+            }
+            Text {
+                text: root.progress;
+                font-family: Theme.font-mono;
+                font-size: 10.5px;
+                color: Theme.text-dim;
+            }
+        }
+    }
+}
+
+// ── tag entry (DESIGN §4 2f): photo stays visible (no scrim), bottom-center panel ──
+export component TagEntry inherits Rectangle {
+    in-out property <string> text;
+    in property <[string]> suggestions;
+    callback changed(string);
+    callback committed(string);
+    callback cancelled();
+
+    // Fills the loupe stage but paints nothing itself — 2f explicitly keeps the photo
+    // undimmed, so (unlike the brief's placeholder) there is no scrim rectangle here.
+    background: transparent;
+
+    panel := Rectangle {
+        width: 380px;
+        height: 220px;
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 14px;
+        background: Theme.panel-dialog;
+        border-radius: Theme.r-xl;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        clip: true;
+
+        // Wraps the LineEdit so Escape (unhandled by the LineEdit's own text editing)
+        // bubbles up to a FocusScope that actually surrounds it — the brief's sketch put
+        // `esc := FocusScope` as a *sibling* of the edit row, which per Slint's key-event
+        // delivery model (a FocusScope only receives bubbled keys from a scope it
+        // *surrounds*) would never see Escape while the LineEdit has focus. Fixed here.
+        scope := FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.cancelled();
+                    return accept;
+                }
+                return reject;
+            }
+
+            VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                alignment: start;
+
+                input-row := Rectangle {
+                    height: 34px;
+                    background: Theme.input-inset;
+                    border-radius: Theme.r-md;
+                    border-width: 1px;
+                    border-color: Theme.border-input;
+                    edit := LineEdit {
+                        text <=> root.text;
+                        placeholder-text: "sky, portrait, keeper";
+                        font-family: Theme.font-mono;
+                        edited(t) => { root.changed(t); }
+                        accepted(t) => { root.committed(t); }
+                    }
+                }
+
+                for s[i] in root.suggestions: row := Rectangle {
+                    height: 22px;
+                    background: area.has-hover ? Theme.chip-bg : transparent;
+                    border-radius: Theme.r-sm;
+                    Text {
+                        text: s;
+                        font-family: Theme.font-mono;
+                        font-size: 12px;
+                        color: Theme.accent-hi;
+                        x: 6px;
+                        vertical-alignment: center;
+                    }
+                    area := TouchArea {
+                        clicked => { root.committed(s); }
+                    }
+                }
+
+                Text {
+                    text: "enter add · comma next tag · esc done";
+                    font-family: Theme.font-mono;
+                    font-size: 9.5px;
+                    color: Theme.text-faint;
+                }
+            }
+        }
+    }
+
+    init => { edit.focus(); }
+}
