@@ -990,4 +990,32 @@ mod tests {
         assert!(decode(&p2, TargetSize::Scaled(2)).is_err());
         assert!(decode(&p2, TargetSize::Fit(64, 64)).is_err());
     }
+
+    /// Regression pin (not a RED/GREEN TDD test — the behavior under test is
+    /// already correct): `decode_fit`'s box-swap-for-rotation composes correctly
+    /// with EXIF orientation end to end. `orientation_6.jpg` is stored landscape
+    /// 120x80 with Orientation=6, which displays upright portrait 80x120.
+    /// Fitting into a 30x60 box: because orientation rotates (5..=8), `decode_fit`
+    /// swaps the box to (60, 30) in STORED space before picking a turbojpeg scale
+    /// denom and resizing, then `decode()` applies the orientation rotation
+    /// afterward, swapping w/h back. Equivalently, in DISPLAY space: scale =
+    /// min(30/80, 60/120) = 0.375 applied to the oriented 80x120 frame -> 30x45.
+    #[test]
+    fn fit_box_swap_composes_with_orientation_e2e() {
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/orientation_6.jpg");
+        assert!(
+            fx.exists(),
+            "commit culler-core/tests/fixtures/orientation_6.jpg — a 120x80 stored-landscape \
+             JPEG with EXIF Orientation=6 (see fixtures/README.md)"
+        );
+
+        let img = decode(&fx, TargetSize::Fit(30, 60)).expect("decode fixture at Fit(30, 60)");
+        assert_eq!(
+            (img.w, img.h),
+            (30, 45),
+            "Fit(30, 60) on the oriented 80x120 frame must scale by 0.375 -> 30x45"
+        );
+        assert_eq!(img.rgba.len(), 30 * 45 * 4);
+    }
 }
