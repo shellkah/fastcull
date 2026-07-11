@@ -775,6 +775,76 @@ mod tests {
         );
     }
 
+    /// Reject side of the MAX_DECODE_PIXELS boundary: 20000 x 15001 =
+    /// 300_020_000, exactly 20_000 pixels over the 300_000_000 cap. Both axes
+    /// stay well under libjpeg-turbo's own per-axis ceiling of 65500 (the value
+    /// `decode_rejects_pathological_header_dimensions` uses to prove read_header
+    /// itself accepts dims that large), so read_header accepts this header and
+    /// ONLY our guard stands between it and the allocation.
+    #[test]
+    fn decode_rejects_dimensions_one_pixel_over_cap() {
+        let jpeg = patch_sof0_dims(synth_jpeg(64, 48), 20000, 15001);
+        let (_dir, path) = write_temp_named("over_cap.jpg", &jpeg);
+
+        match decode(&path, TargetSize::Full) {
+            Err(DecodeError::Decode(msg)) => {
+                assert!(
+                    msg.contains("decode limit"),
+                    "300_020_000 pixels (just over the cap) must trip the guard, got: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected an error for a 300_020_000-pixel header, got Ok"),
+            Err(other) => {
+                panic!("expected DecodeError::Decode with a decode-limit message, got {other:?}")
+            }
+        }
+    }
+
+    /// Accept side of the MAX_DECODE_PIXELS boundary: 20000 x 15000 =
+    /// 300_000_000, exactly AT the cap. The guard's condition is
+    /// `pixels <= MAX_DECODE_PIXELS`, so this must NOT trip it.
+    ///
+    /// The synthetic scan data is only encoded for 64x48 pixels, so decode
+    /// still fails downstream once tjDecompress2 hits the header/scan
+    /// mismatch — this test can't observe a successful decode at this size.
+    /// What distinguishes "guard fired" from "guard passed, something else
+    /// failed" is the ERROR MESSAGE: a guard-fired error contains "decode
+    /// limit" (see the reject-side test above); a downstream turbojpeg
+    /// failure does not. Asserting the message does NOT contain that phrase
+    /// is therefore the only way to pin that the guard let this exact-cap
+    /// value through.
+    ///
+    /// Uses `TargetSize::Scaled(8)`, not `Full`: `decompress_scaled` allocates
+    /// its OUTPUT buffer at the scaled dims derived from the header
+    /// (2500x1875 here, ~18.75 MB), not the full 20000x15000 dims (~1.2 GB).
+    /// Full would still be guarded correctly, but there's no reason for this
+    /// test's own memory footprint to be 1.2 GB when 1/8 scale exercises the
+    /// exact same guard (which checks the FULL unscaled header product either
+    /// way, per decompress_scaled's doc comment).
+    #[test]
+    fn decode_accepts_dimensions_exactly_at_cap() {
+        let jpeg = patch_sof0_dims(synth_jpeg(64, 48), 20000, 15000);
+        let (_dir, path) = write_temp_named("at_cap.jpg", &jpeg);
+
+        match decode(&path, TargetSize::Scaled(8)) {
+            Err(DecodeError::Decode(msg)) => {
+                assert!(
+                    !msg.contains("decode limit"),
+                    "300_000_000 pixels (exactly at the cap, pixels <= cap) must NOT \
+                     trip the guard, but got a decode-limit message: {msg}"
+                );
+            }
+            Ok(_) => panic!(
+                "expected a downstream Decode error from the header/scan size mismatch \
+                 (64x48 scan data can't satisfy a 20000x15000 header), got Ok"
+            ),
+            Err(other) => panic!(
+                "expected a downstream Decode error (header/scan mismatch, not a \
+                 decode-limit rejection), got {other:?}"
+            ),
+        }
+    }
+
     #[test]
     fn decode_errors_map_correctly() {
         // Missing / unreadable file -> Io
