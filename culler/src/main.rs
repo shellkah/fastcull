@@ -1,5 +1,7 @@
 slint::include_modules!();
 
+mod input;
+
 // Bundled IBM Plex fonts (culler/ui/fonts/) need no registration call here: Slint
 // 1.17 has no public `register_font_from_path`/`register_font_from_data` free
 // function (only a per-renderer trait method used internally by the compiler).
