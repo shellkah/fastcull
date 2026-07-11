@@ -134,6 +134,7 @@ mod tests {
             }],
             decisions: std::collections::HashMap::new(),
             current: 0,
+            pending_apply: None,
             undo: Vec::new(),
         };
         session.decisions.insert(

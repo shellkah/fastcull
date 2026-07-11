@@ -135,6 +135,11 @@ pub struct Session {
     /// Keyed by `Shot.stem` so resume re-attaches decisions after a rescan.
     pub decisions: std::collections::HashMap<String, Decision>,
     pub current: usize, // index into `shots`
+    /// In-flight Apply destination (crash-detection breadcrumb, spec §6/§8
+    /// rev 3). Set + autosaved just before an apply's first move; cleared on
+    /// success. `default` keeps pre-rev-3 session files loading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_apply: Option<std::path::PathBuf>,
     #[serde(skip)]
     pub undo: Vec<UndoEntry>, // bounded (UNDO_LIMIT), most-recent last
 }
@@ -455,6 +460,7 @@ mod tests {
             }],
             decisions: std::collections::HashMap::new(),
             current: 0,
+            pending_apply: None,
             undo: vec![UndoEntry {
                 stem: "IMG_0001".to_string(),
                 previous: Decision::default(),
@@ -494,6 +500,7 @@ mod tests {
             }],
             decisions: std::collections::HashMap::new(),
             current: 0,
+            pending_apply: None,
             undo: Vec::new(),
         };
         let d = session.decision(0);
@@ -709,6 +716,25 @@ mod tests {
         assert_eq!(
             session.all_tags(),
             vec!["beach".to_string(), "sky".to_string(), "tree".to_string()]
+        );
+    }
+
+    #[test]
+    fn pending_apply_breadcrumb_serde_defaults_and_round_trips() {
+        // Pre-rev-3 session files have no `pending_apply` — they must still load.
+        let old_json = r#"{"source_dir":"/src","shots":[],"decisions":{},"current":0}"#;
+        let old: Session = serde_json::from_str(old_json).unwrap();
+        assert_eq!(old.pending_apply, None);
+
+        // The breadcrumb round-trips when set, and is omitted when None.
+        let mut s = Session::default();
+        assert!(!serde_json::to_string(&s).unwrap().contains("pending_apply"));
+        s.pending_apply = Some(std::path::PathBuf::from("/shoot/sorted"));
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.pending_apply,
+            Some(std::path::PathBuf::from("/shoot/sorted"))
         );
     }
 }
