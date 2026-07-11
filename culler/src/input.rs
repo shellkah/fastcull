@@ -439,11 +439,13 @@ pub fn apply_action(action: Action, session: &mut Session, auto_advance: bool, f
         Action::SetTier(tier) => {
             let idx = session.current;
             session.set_tier(idx, tier);
-            if tier.is_some() && auto_advance
-                && let Some(i) = step_filtered(session, filter, true) {
-                    session.current = i;
-                    session.mark_visited(i);
-                }
+            if tier.is_some()
+                && auto_advance
+                && let Some(i) = step_filtered(session, filter, true)
+            {
+                session.current = i;
+                session.mark_visited(i);
+            }
         }
         Action::Undo => {
             session.undo();
