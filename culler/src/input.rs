@@ -412,3 +412,174 @@ mod filter_tests {
         assert!(parse_tags("").is_empty());
     }
 }
+
+/// Execute a model-mutating action. UI-only actions are no-ops (handled by the ui glue).
+/// `filter` confines prev/next and auto-advance to the working set; `auto_advance`
+/// only affects `SetTier(Some(_))` (clear never advances).
+pub fn apply_action(action: Action, session: &mut Session, auto_advance: bool, filter: Filter) {
+    match action {
+        Action::Prev => {
+            if let Some(i) = step_filtered(session, filter, false) {
+                session.current = i;
+                session.mark_visited(i);
+            }
+        }
+        Action::Next => {
+            if let Some(i) = step_filtered(session, filter, true) {
+                session.current = i;
+                session.mark_visited(i);
+            }
+        }
+        Action::NextUnvisited => {
+            if let Some(i) = session.next_unvisited(session.current) {
+                session.current = i;
+                session.mark_visited(i);
+            }
+        }
+        Action::SetTier(tier) => {
+            let idx = session.current;
+            session.set_tier(idx, tier);
+            if tier.is_some() && auto_advance
+                && let Some(i) = step_filtered(session, filter, true) {
+                    session.current = i;
+                    session.mark_visited(i);
+                }
+        }
+        Action::Undo => {
+            session.undo();
+        }
+        // UI-only — the ui glue handles these; no model mutation here.
+        Action::OpenTagEntry
+        | Action::ToggleZoom
+        | Action::CycleFilter
+        | Action::OpenApply
+        | Action::ForceSave => {}
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+    use culler_core::model::{CaptureTime, Decision, Session, Shot, Tier};
+
+    fn mk_session(tiers: &[Option<Tier>]) -> Session {
+        let mut shots = Vec::new();
+        let mut decisions = std::collections::HashMap::new();
+        for (i, t) in tiers.iter().enumerate() {
+            let stem = format!("IMG_{i:04}");
+            shots.push(Shot {
+                stem: stem.clone(),
+                jpeg: std::path::PathBuf::from(format!("/src/{stem}.JPG")),
+                raw: None,
+                sidecar: None,
+                capture: CaptureTime::default(),
+            });
+            decisions.insert(
+                stem,
+                Decision {
+                    tier: *t,
+                    tags: vec![],
+                    visited: false,
+                },
+            );
+        }
+        Session {
+            source_dir: "/src".into(),
+            shots,
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn settier_some_records_and_autoadvances() {
+        let mut s = mk_session(&[None, None, None]);
+        apply_action(Action::SetTier(Some(Tier::Keep)), &mut s, true, Filter::All);
+        assert_eq!(s.decision(0).tier, Some(Tier::Keep));
+        assert_eq!(s.current, 1); // advanced
+        assert!(s.decision(1).visited);
+    }
+
+    #[test]
+    fn settier_some_no_autoadvance_when_disabled() {
+        let mut s = mk_session(&[None, None]);
+        apply_action(
+            Action::SetTier(Some(Tier::Pick)),
+            &mut s,
+            false,
+            Filter::All,
+        );
+        assert_eq!(s.current, 0);
+    }
+
+    #[test]
+    fn clear_never_autoadvances_even_when_enabled() {
+        let mut s = mk_session(&[Some(Tier::Keep), None]);
+        apply_action(Action::SetTier(None), &mut s, true, Filter::All);
+        assert_eq!(s.decision(0).tier, None);
+        assert_eq!(s.current, 0);
+    }
+
+    #[test]
+    fn undo_reverts_last_tier_change() {
+        let mut s = mk_session(&[None]);
+        apply_action(
+            Action::SetTier(Some(Tier::Best)),
+            &mut s,
+            false,
+            Filter::All,
+        );
+        apply_action(Action::Undo, &mut s, false, Filter::All);
+        assert_eq!(s.decision(0).tier, None);
+    }
+
+    #[test]
+    fn next_prev_move_and_mark_visited() {
+        let mut s = mk_session(&[None, None]);
+        apply_action(Action::Next, &mut s, false, Filter::All);
+        assert_eq!(s.current, 1);
+        assert!(s.decision(1).visited);
+        apply_action(Action::Prev, &mut s, false, Filter::All);
+        assert_eq!(s.current, 0);
+    }
+
+    #[test]
+    fn autoadvance_respects_active_filter() {
+        // Keep, None, Keep : tiering @0 with >=Keep filter should skip None@1 to Keep@2
+        let mut s = mk_session(&[None, None, None]);
+        // set up so 2 already passes >=Keep, 1 does not
+        apply_action(
+            Action::SetTier(Some(Tier::Keep)),
+            &mut s,
+            false,
+            Filter::All,
+        ); // s.current stays 0
+        s.decisions.get_mut("IMG_0002").unwrap().tier = Some(Tier::Keep);
+        s.current = 0;
+        apply_action(
+            Action::SetTier(Some(Tier::Keep)),
+            &mut s,
+            true,
+            Filter::Keep,
+        );
+        assert_eq!(s.current, 2); // skipped the un-tiered @1
+    }
+
+    #[test]
+    fn ui_only_actions_do_not_mutate_model() {
+        let mut s = mk_session(&[None, None]);
+        for a in [
+            Action::OpenTagEntry,
+            Action::ToggleZoom,
+            Action::CycleFilter,
+            Action::OpenApply,
+            Action::ForceSave,
+        ] {
+            apply_action(a, &mut s, true, Filter::All);
+        }
+        assert_eq!(s.current, 0);
+        assert_eq!(s.decision(0), &Decision::default());
+    }
+}
