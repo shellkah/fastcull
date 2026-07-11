@@ -61,7 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dialog / Task 13 banner) — for now this is a launch-time eprintln.
     match probe_breadcrumb(&mut session) {
         BreadcrumbProbe::CrashedJournal(j) => {
-            eprintln!("{}", journal_report(&j).unwrap_or_default());
+            eprintln!(
+                "{}",
+                journal_report(&j).unwrap_or_else(|e| format!(
+                    "Interrupted apply found at {} but the journal could not be read: {e}",
+                    j.display()
+                ))
+            );
         }
         BreadcrumbProbe::StaleCleared(dest) => {
             // Autosave the cleared breadcrumb immediately so a repeat crash
@@ -78,7 +84,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DESTINATION). Done before wrapping `session` in Rc/RefCell — this is a
     // plain startup check, not part of the live event-loop state.
     if let Some(j) = find_crashed_apply(&source) {
-        eprintln!("{}", journal_report(&j).unwrap_or_default());
+        eprintln!(
+            "{}",
+            journal_report(&j).unwrap_or_else(|e| format!(
+                "Interrupted apply found at {} but the journal could not be read: {e}",
+                j.display()
+            ))
+        );
     }
 
     let app = AppWindow::new()?;
@@ -127,6 +139,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if is_current {
                             ui::set_loupe(&app, &res.image);
                         }
+                        // Neighbor prefetches land here too (spec §12 "tiles
+                        // refine lazily") — hop through the Send-safe slint
+                        // callback rather than capturing refresh_view (an
+                        // Rc-based closure) directly in this Send closure.
+                        app.invoke_thumbs_updated();
                     }
                 }
             }
@@ -218,6 +235,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Lazy tile refinement (spec §12): the decode pipeline's event-loop hop
+    // (on_ready, above) invokes this slint callback after a prefetched
+    // neighbor's FIT-target result is cached, so the filmstrip repaints from
+    // grey without waiting for the next user event. Registered here (after
+    // refresh_view exists) rather than captured in the pipeline closure
+    // itself, since that closure must stay Send and refresh_view holds Rc
+    // state.
+    {
+        let refresh_view = refresh_view.clone();
+        app.on_thumbs_updated(move || {
+            refresh_view();
+        });
+    }
+
     // Key dispatch: pure map -> action -> mutate model or UI state, then refresh.
     {
         let session = session.clone();
@@ -301,12 +332,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let filter = filter.clone();
         let request_current = request_current.clone();
         let refresh_view = refresh_view.clone();
+        let dirty = dirty.clone();
         app.on_film_clicked(move |offset| {
             let (indices, _) =
                 ui::build_filmstrip_window(&session.borrow(), *filter.borrow(), FILMSTRIP_BUFFER);
             if let Some(&idx) = indices.get(offset as usize) {
                 session.borrow_mut().current = idx;
                 session.borrow_mut().mark_visited(idx);
+                dirty.set(true); // picked up by the debounced autosave
                 request_current();
                 refresh_view();
             }
