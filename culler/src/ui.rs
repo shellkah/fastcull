@@ -165,6 +165,37 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
     }
 }
 
+/// Sticky loupe zoom/pan. Both `zoomed` and pan persist across prev/next so the
+/// same crop can be compared through a burst (§9).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ZoomState {
+    pub zoomed: bool,
+    pub pan_x: f32,
+    pub pan_y: f32,
+}
+
+impl ZoomState {
+    /// `Z`: flip 1:1 zoom, leaving pan untouched.
+    pub fn toggle(&mut self) {
+        self.zoomed = !self.zoomed;
+    }
+
+    /// Navigating to another shot keeps zoom + pan exactly as they were.
+    pub fn on_navigate(&mut self) {
+        // Intentionally a no-op: persistence IS the behavior. Kept explicit so a
+        // future "reset pan on navigate" option has an obvious home.
+    }
+
+    /// Which decode target the loupe needs right now.
+    pub fn target(&self, fit_w: u32, fit_h: u32) -> culler_core::decode::TargetSize {
+        if self.zoomed {
+            culler_core::decode::TargetSize::Full // bypasses the LRU cache (dedicated slot)
+        } else {
+            culler_core::decode::TargetSize::Fit(fit_w, fit_h)
+        }
+    }
+}
+
 #[cfg(test)]
 mod hud_tests {
     use super::*;
@@ -371,5 +402,36 @@ mod color_tests {
         let (indices, cur_off) = build_filmstrip_window(&s, Filter::Keep, 5);
         assert_eq!(indices, vec![0, 2, 4, 6, 8]);
         assert_eq!(indices[cur_off], 4);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn toggle_flips_zoom_but_keeps_pan() {
+        let mut z = ZoomState::default();
+        assert!(!z.zoomed);
+        z.pan_x = 120.0;
+        z.pan_y = -40.0;
+        z.toggle();
+        assert!(z.zoomed);
+        // toggling zoom must NOT reset the pan
+        assert_eq!(z.pan_x, 120.0);
+        assert_eq!(z.pan_y, -40.0);
+    }
+
+    #[test]
+    fn navigation_preserves_zoom_and_pan() {
+        let mut z = ZoomState {
+            zoomed: true,
+            pan_x: 200.0,
+            pan_y: 55.0,
+        };
+        z.on_navigate(); // moving to another shot
+        assert!(z.zoomed); // still zoomed
+        assert_eq!(z.pan_x, 200.0); // pan sticky across prev/next
+        assert_eq!(z.pan_y, 55.0);
     }
 }

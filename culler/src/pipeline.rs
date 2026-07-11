@@ -340,6 +340,31 @@ impl Pipeline {
     }
 }
 
+/// Single dedicated slot for the current 1:1/Full frame, kept OUT of the LRU so a
+/// ~180 MB RGBA decode never evicts prefetched fit-size neighbors (§12).
+#[derive(Default)]
+pub struct FullSlot {
+    pub index: Option<usize>,
+    pub image: Option<Arc<DecodedImage>>,
+}
+
+impl FullSlot {
+    /// Store the full decode for `index`, replacing any prior one.
+    pub fn set(&mut self, index: usize, image: Arc<DecodedImage>) {
+        self.index = Some(index);
+        self.image = Some(image);
+    }
+
+    /// The stored full image iff it is for `index`.
+    pub fn get(&self, index: usize) -> Option<Arc<DecodedImage>> {
+        if self.index == Some(index) {
+            self.image.clone()
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod marshal_tests {
     use super::*;
