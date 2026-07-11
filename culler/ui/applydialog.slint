@@ -1,0 +1,260 @@
+import { LineEdit } from "std-widgets.slint";
+import { ApplyPreviewUi } from "globals.slint";
+import { Theme } from "theme.slint";
+
+// culler/ui/applydialog.slint — the §6 Apply dialog (DESIGN.md §4 screens
+// 2b apply-dialog / 2c apply-progress / 2d crash-recovery accent). Task 12.
+// Buttons are custom Rectangle+TouchArea (matching the rest of this UI's
+// convention — see hud.slint/filmstrip.slint — not std-widgets Button, since
+// the design calls for theme-colored fills std-widgets can't give us).
+export component ApplyDialog inherits Rectangle {
+    in-out property <string> dest;
+    in property <string> dest-error;
+    in property <bool> preview-ready;
+    in property <ApplyPreviewUi> preview;
+    // True once a crashed journal is detected at `dest` (Task 12 amendment E,
+    // set from Rust in the dest-changed handler): the confirm button becomes
+    // "Resume apply" in gold (DESIGN 2d) instead of green "Move shots".
+    in property <bool> resume-mode;
+    // 2c progress state: while true the dialog body swaps to the progress
+    // screen and Cancel/Confirm are hidden (no Stop button — the plan
+    // provides no stop mechanism; the journaled engine makes closing the
+    // app safe mid-apply, a known, disclosed design deviation from 2c's
+    // sketch).
+    in property <bool> apply-running;
+    in property <string> apply-progress;
+    // Real resolved bucket names, index order [rejected, rest, keep, picks,
+    // bests] — fed from Rust so a CLI bucket-name override is reflected
+    // rather than the dialog hardcoding "00_rejected" etc.
+    in property <[string]> bucket-names;
+
+    callback dest-changed(string);
+    callback refresh();
+    callback confirmed();
+    callback cancelled();
+
+    background: Theme.scrim;
+
+    // [name, count, tier-color-code] per row, in display order
+    // rejected/rest/keep/picks/bests — code order reject=4, rest=0, keep=1,
+    // pick=2, best=3 (DESIGN §4 2b, `Theme.tier-color`).
+    property <[{name: string, count: int, code: int}]> bucket-rows: [
+        { name: root.bucket-names[0], count: root.preview.rejected, code: 4 },
+        { name: root.bucket-names[1], count: root.preview.rest, code: 0 },
+        { name: root.bucket-names[2], count: root.preview.keep, code: 1 },
+        { name: root.bucket-names[3], count: root.preview.picks, code: 2 },
+        { name: root.bucket-names[4], count: root.preview.bests, code: 3 },
+    ];
+
+    panel := Rectangle {
+        width: 560px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.panel-dialog;
+        border-radius: Theme.r-xl;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        clip: true;
+
+        // ---- 2b: gather + preview + confirm ----
+        if !root.apply-running: VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+
+            Text {
+                text: "Apply — reorganize into destination";
+                font-family: Theme.font-sans;
+                font-weight: 600;
+                font-size: 15px;
+                color: Theme.text;
+            }
+            Text {
+                text: "nothing is deleted";
+                font-family: Theme.font-mono;
+                font-size: 11px;
+                color: Theme.label;
+            }
+
+            Text {
+                text: "DESTINATION";
+                font-family: Theme.font-mono;
+                font-weight: 600;
+                font-size: 9.5px;
+                letter-spacing: 1.3px;
+                color: Theme.label;
+            }
+            dest-row := Rectangle {
+                height: 34px;
+                background: Theme.input-inset;
+                border-radius: Theme.r-md;
+                border-width: 1px;
+                border-color: Theme.border-input;
+                LineEdit {
+                    text <=> root.dest;
+                    placeholder-text: "/path/to/destination (a source subfolder is allowed)";
+                    font-family: Theme.font-mono;
+                    edited(t) => { root.dest-changed(t); }
+                }
+            }
+            if root.dest-error != "": Text {
+                text: root.dest-error;
+                font-family: Theme.font-mono;
+                font-size: 11px;
+                color: Theme.danger;
+                wrap: word-wrap;
+            }
+            if root.dest-error == "" && root.dest != "": Text {
+                text: "subfolder of source is allowed";
+                font-family: Theme.font-mono;
+                font-size: 11px;
+                color: Theme.accent-confirm;
+            }
+
+            preview-btn := Rectangle {
+                height: 30px;
+                background: transparent;
+                border-radius: Theme.r-md;
+                border-width: 1px;
+                border-color: Theme.border-btn;
+                Text {
+                    text: "Compute preview";
+                    font-family: Theme.font-sans;
+                    font-size: 12px;
+                    color: Theme.text-muted;
+                    x: (parent.width - self.width) / 2;
+                    vertical-alignment: center;
+                }
+                TouchArea { clicked => { root.refresh(); } }
+            }
+
+            if root.preview-ready: VerticalLayout {
+                spacing: 0px;
+                for row[i] in root.bucket-rows: VerticalLayout {
+                    spacing: 0px;
+                    HorizontalLayout {
+                        height: 24px;
+                        spacing: 8px;
+                        Rectangle {
+                            width: 6px;
+                            height: 6px;
+                            border-radius: 3px;
+                            y: (parent.height - self.height) / 2;
+                            background: Theme.tier-color(row.code);
+                        }
+                        Text {
+                            text: row.name;
+                            font-family: Theme.font-mono;
+                            font-size: 12px;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                            width: 110px;
+                        }
+                        Rectangle { }
+                        Text {
+                            text: row.count;
+                            font-family: Theme.font-mono;
+                            font-size: 12px;
+                            color: Theme.text-2;
+                            vertical-alignment: center;
+                        }
+                    }
+                    if i < 4: Rectangle { height: 1px; background: Theme.border-faint; }
+                }
+
+                Text {
+                    text: "collisions auto-suffixed: " + root.preview.collisions
+                        + "   sidecar writes skipped: " + root.preview.skipped-sidecars;
+                    font-family: Theme.font-mono;
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                }
+                Text {
+                    text: "stale (vanished): " + root.preview.stale
+                        + "   unrecognized files left behind: " + root.preview.leftovers;
+                    font-family: Theme.font-mono;
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                }
+                Text {
+                    text: "total: " + root.preview.total-mb + " MB"
+                        + (root.preview.cross-fs
+                            ? (root.preview.enough-space ? "  (cross-FS: space OK)" : "  (cross-FS: NOT ENOUGH SPACE)")
+                            : "  (same filesystem)");
+                    font-family: Theme.font-mono;
+                    font-size: 11px;
+                    color: root.preview.enough-space ? Theme.accent-confirm : Theme.danger;
+                }
+            }
+
+            HorizontalLayout {
+                alignment: end;
+                spacing: 8px;
+                cancel-btn := Rectangle {
+                    height: 34px;
+                    width: cancel-text.preferred-width + 24px;
+                    background: transparent;
+                    border-radius: Theme.r-md;
+                    border-width: 1px;
+                    border-color: Theme.border-btn;
+                    cancel-text := Text {
+                        text: "Cancel";
+                        font-family: Theme.font-sans;
+                        font-weight: 600;
+                        font-size: 13px;
+                        color: Theme.text-muted;
+                        x: (parent.width - self.width) / 2;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { clicked => { root.cancelled(); } }
+                }
+                confirm-btn := Rectangle {
+                    height: 34px;
+                    width: confirm-text.preferred-width + 24px;
+                    background: root.resume-mode ? Theme.accent-warn : Theme.accent-confirm;
+                    border-radius: Theme.r-md;
+                    opacity: (root.preview-ready && root.preview.enough-space) ? 1.0 : 0.5;
+                    confirm-text := Text {
+                        text: root.resume-mode ? "Resume apply" : "Move shots";
+                        font-family: Theme.font-sans;
+                        font-weight: 600;
+                        font-size: 13px;
+                        color: Theme.on-accent;
+                        x: (parent.width - self.width) / 2;
+                        vertical-alignment: center;
+                    }
+                    TouchArea {
+                        enabled: root.preview-ready && root.preview.enough-space;
+                        clicked => { root.confirmed(); }
+                    }
+                }
+            }
+        }
+
+        // ---- 2c: apply in flight ----
+        if root.apply-running: VerticalLayout {
+            padding: 20px;
+            spacing: 10px;
+            Text {
+                text: "Moving shots…";
+                font-family: Theme.font-sans;
+                font-weight: 600;
+                font-size: 15px;
+                color: Theme.text;
+            }
+            Text {
+                text: root.apply-progress;
+                font-family: Theme.font-mono;
+                font-size: 12px;
+                color: Theme.text-2;
+                wrap: word-wrap;
+            }
+            Text {
+                text: "journal: " + root.dest + "/.fastcull-apply.json";
+                font-family: Theme.font-mono;
+                font-size: 10.5px;
+                color: Theme.text-dim;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

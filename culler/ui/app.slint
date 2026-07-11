@@ -1,8 +1,9 @@
 import { Theme } from "theme.slint";
 import { Loupe } from "loupe.slint";
 import { Filmstrip } from "filmstrip.slint";
-import { FilmstripItem } from "globals.slint";
+import { FilmstripItem, ApplyPreviewUi } from "globals.slint";
 import { HudTopLeft, HudTopRight, HudBottomLeft, TagEntry } from "hud.slint";
+import { ApplyDialog } from "applydialog.slint";
 
 // culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8) +
 // HUD overlays + tag entry (Task 9), wired to the pure input/pipeline glue in
@@ -53,9 +54,33 @@ export component AppWindow inherits Window {
     // without waiting for the next user event (spec §12 "tiles refine lazily").
     callback thumbs-updated();
 
-    // Apply dialog (Task 12 builds the dialog itself); Task 11 lands the
-    // property so `InputContext::ApplyDialog` can be selected on `A`.
+    // Apply dialog (Task 12): §6 workflow — gather/preview/confirm/apply/resume,
+    // wired in `applyflow::wire_apply_dialog` (DESIGN.md §4 screens 2b/2c/2d).
+    // `apply-open` itself landed in Task 11 so `InputContext::ApplyDialog` can
+    // be selected on `A`.
     in-out property <bool> apply-open: false;
+    in-out property <string> dest-path;
+    in property <string> dest-error;
+    in property <bool> preview-ready;
+    in property <ApplyPreviewUi> preview;
+    // Set from Rust (`applyflow::wire_apply_dialog`'s dest-changed handler)
+    // when a crashed journal is detected at the chosen dest (DESIGN 2d).
+    in property <bool> resume-mode;
+    // Real resolved bucket names (CLI may override them), index order
+    // [rejected, rest, keep, picks, bests].
+    in property <[string]> bucket-names;
+    // 2c progress: true while the worker thread runs apply/resume; the polled
+    // journal-status text the dialog renders while running.
+    in-out property <bool> apply-running;
+    in property <string> apply-progress;
+    callback dest-changed(string);
+    callback apply-refresh();
+    callback apply-confirmed();
+    callback apply-cancelled();
+    // Invoked from the worker's completion hop (`upgrade_in_event_loop`); its
+    // handler (registered in `wire_apply_dialog`) owns all Rc-held state,
+    // since Rc/RefCell must never cross the thread boundary.
+    callback apply-finished(bool, string);
 
     forward-focus: keyscope;
     keyscope := FocusScope {
@@ -109,6 +134,24 @@ export component AppWindow inherits Window {
                 current: root.film-current;
                 clicked(i) => { root.film-clicked(i); }
             }
+        }
+
+        // Full-window scrim + centered modal (DESIGN §4 2b/2c) — a sibling of
+        // the VerticalLayout above rather than nested inside it, so the scrim
+        // covers the filmstrip too, not just the loupe stage.
+        if root.apply-open: ApplyDialog {
+            dest <=> root.dest-path;
+            dest-error: root.dest-error;
+            preview-ready: root.preview-ready;
+            preview: root.preview;
+            resume-mode: root.resume-mode;
+            bucket-names: root.bucket-names;
+            apply-running: root.apply-running;
+            apply-progress: root.apply-progress;
+            dest-changed(d) => { root.dest-changed(d); }
+            refresh() => { root.apply-refresh(); }
+            confirmed() => { root.apply-confirmed(); }
+            cancelled() => { root.apply-cancelled(); }
         }
     }
 }
