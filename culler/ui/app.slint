@@ -1,11 +1,14 @@
+import { Theme } from "theme.slint";
+
 export component AppWindow inherits Window {
     title: "FastCull";
     preferred-width: 1280px;
     preferred-height: 820px;
-    background: #141414;
+    background: Theme.bg;
     Text {
         text: "FastCull — point me at a folder of shots";
-        color: #cccccc;
+        color: Theme.text;
+        font-family: Theme.font-mono;
         font-size: 18px;
     }
 }

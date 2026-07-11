@@ -1,0 +1,82 @@
+// Bundled IBM Plex weights (Sans + Mono, 400/500/600). Slint's `import "<file>";`
+// form (a bare foreign-file import, not a `{ Name } from` type import) embeds the
+// referenced font bytes at compile time and auto-registers them in the generated
+// component's init code — no `slint::register_font_*` Rust call is needed or, as of
+// Slint 1.17, even exists as a public free function (see theme.slint provenance note
+// in task-1b-report.md). Paths are relative to this file, i.e. culler/ui/fonts/.
+import "fonts/IBMPlexMono-Regular.ttf";
+import "fonts/IBMPlexMono-Medium.ttf";
+import "fonts/IBMPlexMono-SemiBold.ttf";
+import "fonts/IBMPlexSans-Regular.ttf";
+import "fonts/IBMPlexSans-Medium.ttf";
+import "fonts/IBMPlexSans-SemiBold.ttf";
+
+// culler/ui/theme.slint — single source of visual truth.
+// Values distilled from docs/design/DESIGN.md. Do not hardcode colors elsewhere.
+export global Theme {
+    // ── surfaces ──
+    out property <brush> bg: #0f1012;
+    out property <brush> bg-radial-in: #141519;    // startup/crash gradient inner
+    out property <brush> bg-radial-out: #0b0c0e;    // startup/crash gradient outer
+    out property <brush> scrim: #05060799;          // modal backdrop over the image  (rgba 5,6,7,.6)
+    out property <brush> panel-hud: #0a0b0db8;      // 1b floating panels             (rgba 10,11,13,.72)
+    out property <brush> panel-dialog: #0d0e11d1;   // modal dialog bodies            (rgba 13,14,17,.82)
+    out property <brush> panel-toast: #0d0e11e6;    // toasts                         (rgba 13,14,17,.9)
+    out property <brush> input-inset: #00000059;    // input fields                   (rgba 0,0,0,.35)
+
+    // ── borders ──
+    out property <brush> border-faint: #ffffff0d;   // .05  table rows
+    out property <brush> border: #ffffff14;         // .08  hud / panel
+    out property <brush> border-strong: #ffffff1a;  // .10  dialog / toast
+    out property <brush> chip-bg: #ffffff1f;        // .12  key caps / tag chips
+    out property <brush> border-input: #ffffff24;   // .14  inputs / key caps
+    out property <brush> border-btn: #ffffff2e;     // .18  secondary button
+
+    // ── text ramp ──
+    out property <brush> text: #e8e9ea;
+    out property <brush> text-2: #c9cacc;
+    out property <brush> text-3: #a8abb0;
+    out property <brush> text-muted: #9fa3a9;
+    out property <brush> text-dim: #7d8087;
+    out property <brush> label: #63666c;            // uppercase labels, notes (== Rest tier)
+    out property <brush> text-faint: #54575d;
+    out property <brush> on-accent: #0e0f11;        // dark text on colored fills
+
+    // ── tier palette ──
+    out property <brush> tier-reject: #d05f5f;
+    out property <brush> tier-rest:   #63666c;
+    out property <brush> tier-keep:   #57a86d;
+    out property <brush> tier-pick:   #5a93d4;
+    out property <brush> tier-best:   #d2a545;
+    out property <brush> accent-hi:   #7fb0e4;      // autocomplete match / hover
+    // semantic roles (alias the tiers)
+    out property <brush> accent-primary: self.tier-pick;
+    out property <brush> accent-confirm: self.tier-keep;
+    out property <brush> accent-warn:    self.tier-best;
+    out property <brush> danger:         self.tier-reject;
+
+    // ── type ──
+    out property <string> font-sans: "IBM Plex Sans";
+    out property <string> font-mono: "IBM Plex Mono";
+    out property <length> fs-wordmark: 22px;
+    out property <length> fs-title: 15px;
+    out property <length> fs-body: 12px;
+    out property <length> fs-small: 10.5px;
+    out property <length> fs-label: 9.5px;          // uppercase, letter-spacing 0.14em
+
+    // ── radii ──
+    out property <length> r-sm: 3px;
+    out property <length> r-key: 4px;
+    out property <length> r-md: 6px;
+    out property <length> r-lg: 8px;
+    out property <length> r-xl: 10px;
+
+    // tier code -> color  (0 rest, 1 keep, 2 pick, 3 best, 4 reject — matches ui::tier_color_code)
+    pure function tier-color(code: int) -> brush {
+        return code == 1 ? self.tier-keep
+             : code == 2 ? self.tier-pick
+             : code == 3 ? self.tier-best
+             : code == 4 ? self.tier-reject
+             : self.tier-rest;
+    }
+}
