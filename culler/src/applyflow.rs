@@ -41,6 +41,32 @@ pub struct ApplyPreview {
     pub enough_space: bool,
 }
 
+/// C3 fix: `culler_core::plan::plan` is pure I/O-free code — its own doc
+/// contract (plan.rs) and spec §10 both say the BINARY existence-checks
+/// shots, drops the missing ones before calling `plan`, and reports them as
+/// stale. A shot's files are `shot.files()` (jpeg + raw? + sidecar?); if ANY
+/// sibling has vanished from disk since scan, the WHOLE shot is dropped — a
+/// partial move (e.g. jpeg present, raw gone) would be worse than skipping
+/// it outright. Returns a session copy whose `shots` keep only the survivors
+/// (the `decisions` map is left untouched — `plan` keys off `shots`, not
+/// `decisions` — and `current` is left as-is too: it is an index into the UI
+/// filmstrip, irrelevant to planning) plus the SORTED stale stems.
+fn partition_stale(session: &Session) -> (Session, Vec<String>) {
+    let mut kept = Vec::with_capacity(session.shots.len());
+    let mut stale = Vec::new();
+    for shot in &session.shots {
+        if shot.files().iter().all(|f| f.exists()) {
+            kept.push(shot.clone());
+        } else {
+            stale.push(shot.stem.clone());
+        }
+    }
+    stale.sort();
+    let mut filtered = session.clone();
+    filtered.shots = kept;
+    (filtered, stale)
+}
+
 /// Gather the plan's I/O-derived inputs so `plan` itself stays pure:
 ///  - `existing`: bucket-relative paths already under the dest buckets (per-directory collision detection, rev 3)
 ///  - `sizes`: stem -> total bytes of the shot's files (free-space preflight)
@@ -119,8 +145,15 @@ pub fn gather_apply_inputs(
 }
 
 /// Assemble the preview from a computed plan + gathered facts.
+///
+/// `stale` is the caller's pre-verification count (C3 fix), NOT
+/// `planned.stale.len()`: `plan()` never fills its own `stale` field (it
+/// does no I/O — see plan.rs's doc contract), so by the time `planned` gets
+/// here it was already built from a session `partition_stale` filtered; the
+/// stale count has to be threaded through separately.
 pub fn build_preview(
     planned: &ApplyPlan,
+    stale: usize,
     leftovers: usize,
     cross_fs: bool,
     free_bytes: Option<u64>,
@@ -134,7 +167,7 @@ pub fn build_preview(
         per_bucket: planned.per_bucket_counts,
         collisions,
         skipped_sidecars: planned.skipped_sidecar_writes.len(),
-        stale: planned.stale.len(),
+        stale,
         leftovers,
         total_bytes: planned.total_bytes,
         cross_fs,
@@ -157,22 +190,27 @@ fn probe_cross_fs(fs: &RealFs, source: &Path, dest: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Gather + plan + preview in one step (used by the dialog's "Compute preview").
+/// Gather + plan + preview in one step (used by the dialog's "Compute
+/// preview"). C3 fix: pre-verifies shot existence first (plan.rs's doc
+/// contract / spec §10) — a shot whose files vanished from disk since scan
+/// is dropped before `gather`/`plan` ever see it, and its stem is counted in
+/// the preview's `stale`.
 pub fn compute_preview(
     session: &Session,
     dest: &Path,
     buckets: &[String; 5],
 ) -> (ApplyPlan, ApplyPreview) {
-    let (existing, sizes, leftovers) = gather_apply_inputs(session, dest, buckets);
-    let planned = plan(session, dest, buckets, &existing, &sizes);
+    let (filtered, stale) = partition_stale(session);
+    let (existing, sizes, leftovers) = gather_apply_inputs(&filtered, dest, buckets);
+    let planned = plan(&filtered, dest, buckets, &existing, &sizes);
     let fs = RealFs;
-    let cross_fs = probe_cross_fs(&fs, &session.source_dir, dest);
+    let cross_fs = probe_cross_fs(&fs, &filtered.source_dir, dest);
     let free_bytes = if cross_fs {
         fs.free_space(dest).ok()
     } else {
         None
     };
-    let preview = build_preview(&planned, leftovers, cross_fs, free_bytes);
+    let preview = build_preview(&planned, stale.len(), leftovers, cross_fs, free_bytes);
     (planned, preview)
 }
 
@@ -257,14 +295,30 @@ fn first_free(dir: &Path, base: &str) -> PathBuf {
     }
 }
 
-/// Fresh apply: gather -> plan -> journaled apply -> clear breadcrumb ->
-/// relocate session record. Takes the session BY VALUE — this runs on a worker
-/// thread against a snapshot, never on the UI thread.
+/// Fresh apply: pre-verify -> gather -> plan -> journaled apply -> clear
+/// breadcrumb -> relocate session record. Takes the session BY VALUE — this
+/// runs on a worker thread against a snapshot, never on the UI thread.
 pub fn run_apply(
     mut session: Session,
     dest: &Path,
     buckets: &[String; 5],
 ) -> Result<ApplyReport, String> {
+    // C3 fix: re-verify existence AGAIN here, on the confirm-time snapshot —
+    // a file can vanish between the dialog's preview and this call. Bail out
+    // BEFORE touching disk (no `mkdir_p`, no journal) when every shot is
+    // stale: applying an empty plan would still create an empty `dest` and a
+    // journal for zero ops, which is pointless, and a shot whose files
+    // vanished must never reach `plan`/`apply` (its encoded moves would ENOENT
+    // and, worse, jam `resume` on that same ENOENT forever).
+    let (filtered, stale) = partition_stale(&session);
+    if !session.shots.is_empty() && filtered.shots.is_empty() {
+        return Err(format!(
+            "Apply refused: nothing left to apply, {} shot{} stale (source files vanished since scan).",
+            stale.len(),
+            if stale.len() == 1 { "" } else { "s" }
+        ));
+    }
+
     // C1 fix: `culler_core::apply::apply()` journals into
     // `dest/.fastcull-apply.json` BEFORE the first move (journal-first
     // durability), and `culler_core` only ever creates the BUCKET
@@ -278,8 +332,8 @@ pub fn run_apply(
         .mkdir_p(dest)
         .map_err(|e| format!("Could not create destination {}: {e}", dest.display()))?;
 
-    let (existing, sizes, _leftovers) = gather_apply_inputs(&session, dest, buckets);
-    let planned = plan(&session, dest, buckets, &existing, &sizes);
+    let (existing, sizes, _leftovers) = gather_apply_inputs(&filtered, dest, buckets);
+    let planned = plan(&filtered, dest, buckets, &existing, &sizes);
     let fs = RealFs;
     let journal_path = dest.join(JOURNAL_FILE);
     let report =
@@ -610,7 +664,7 @@ mod applyflow_tests {
         assert_eq!(leftovers, 1); // clip.MOV stays behind
 
         let planned = plan(&session, &dest, &buckets, &existing, &sizes);
-        let preview = build_preview(&planned, leftovers, false, None);
+        let preview = build_preview(&planned, 0, leftovers, false, None);
         assert_eq!(preview.per_bucket.keep, 1);
         assert_eq!(preview.per_bucket.rejected, 1);
         assert_eq!(preview.leftovers, 1);
@@ -630,9 +684,9 @@ mod applyflow_tests {
             stale: vec![],
             total_bytes: 1_000,
         };
-        let ok = build_preview(&planned, 0, true, Some(2_000));
+        let ok = build_preview(&planned, 0, 0, true, Some(2_000));
         assert!(ok.cross_fs && ok.enough_space);
-        let tight = build_preview(&planned, 0, true, Some(500));
+        let tight = build_preview(&planned, 0, 0, true, Some(500));
         assert!(tight.cross_fs && !tight.enough_space); // 500 < 1000
     }
 
@@ -906,6 +960,211 @@ mod applyflow_tests {
             !session_file.exists(),
             "no sidecar should land on disk when the save fails"
         );
+    }
+
+    /// C3 (critical defect): a shot whose JPEG vanished from disk after scan
+    /// (but is still listed in the session) must be dropped BEFORE `plan`
+    /// ever sees it, and counted as stale in the preview — per plan.rs's own
+    /// doc contract and spec §10.
+    #[test]
+    fn preview_reports_vanished_shot_as_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap(); // survives -> Keep
+        std::fs::write(src.join("IMG_2.JPG"), b"bbbbbb").unwrap(); // will vanish -> Reject
+
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(
+            "IMG_1".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "IMG_2".to_string(),
+            Decision {
+                tier: Some(Tier::Reject),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session {
+            source_dir: src.to_path_buf(),
+            shots: vec![mk_shot("IMG_1", src), mk_shot("IMG_2", src)],
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: vec![],
+        };
+        let buckets = crate::startup::default_buckets();
+        let dest = src.join("sorted");
+
+        // The JPEG vanishes AFTER the session/shot list was built (e.g.
+        // deleted out-of-band between scan and apply) — exactly the gap
+        // plan.rs's doc contract requires the BINARY to close.
+        std::fs::remove_file(src.join("IMG_2.JPG")).unwrap();
+
+        let (planned, preview) = compute_preview(&session, &dest, &buckets);
+
+        assert_eq!(preview.stale, 1, "vanished shot must be counted as stale");
+        assert!(
+            planned.ops.iter().all(|o| o.stem != "IMG_2"),
+            "the stale stem must not appear in the plan's ops: {:?}",
+            planned.ops.iter().map(|o| &o.stem).collect::<Vec<_>>()
+        );
+        assert!(
+            planned.ops.iter().any(|o| o.stem == "IMG_1"),
+            "the surviving shot must still be planned"
+        );
+    }
+
+    /// C3 follow-up: `run_apply` must exclude a vanished shot from the
+    /// actual moves and still complete cleanly for the survivors.
+    #[test]
+    fn run_apply_excludes_vanished_shots_and_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap(); // survives -> Keep
+        std::fs::write(src.join("IMG_2.JPG"), b"bbbbbb").unwrap(); // will vanish -> Reject
+
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(
+            "IMG_1".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "IMG_2".to_string(),
+            Decision {
+                tier: Some(Tier::Reject),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session {
+            source_dir: src.to_path_buf(),
+            shots: vec![mk_shot("IMG_1", src), mk_shot("IMG_2", src)],
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: vec![],
+        };
+        let buckets = crate::startup::default_buckets();
+        let dest = src.join("sorted");
+
+        std::fs::remove_file(src.join("IMG_2.JPG")).unwrap();
+
+        let report = run_apply(session, &dest, &buckets)
+            .unwrap_or_else(|e| panic!("run_apply must succeed excluding the stale shot: {e}"));
+
+        assert_eq!(report.moved_shots, 1, "only the surviving shot is moved");
+        assert!(
+            dest.join(&buckets[2]).join("IMG_1.JPG").exists(),
+            "surviving Keep file landed"
+        );
+        for bucket in &buckets {
+            assert!(
+                !dest.join(bucket).join("IMG_2.JPG").exists(),
+                "the vanished stem must not appear in any bucket"
+            );
+        }
+        assert!(
+            !dest.join(JOURNAL_FILE).exists(),
+            "journal removed on clean completion"
+        );
+    }
+
+    /// C3 follow-up: if EVERY shot has vanished by confirm time, applying an
+    /// empty plan would silently "succeed" while doing nothing useful and
+    /// leaving a pointless empty `dest` behind — `run_apply` must fail
+    /// loudly instead, and touch no disk state at all (no journal, no dest).
+    #[test]
+    fn run_apply_all_stale_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap();
+        std::fs::write(src.join("IMG_2.JPG"), b"bbbbbb").unwrap();
+
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(
+            "IMG_1".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "IMG_2".to_string(),
+            Decision {
+                tier: Some(Tier::Reject),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session {
+            source_dir: src.to_path_buf(),
+            shots: vec![mk_shot("IMG_1", src), mk_shot("IMG_2", src)],
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: vec![],
+        };
+        let buckets = crate::startup::default_buckets();
+        let dest = src.join("sorted");
+
+        std::fs::remove_file(src.join("IMG_1.JPG")).unwrap();
+        std::fs::remove_file(src.join("IMG_2.JPG")).unwrap();
+
+        let err = run_apply(session, &dest, &buckets).expect_err(
+            "an apply where every shot vanished must fail loudly, not apply an empty plan",
+        );
+        let lower = err.to_lowercase();
+        assert!(
+            lower.contains("stale") || lower.contains("nothing"),
+            "error must mention stale/nothing to apply: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "no partial destination state must be created: {}",
+            dest.display()
+        );
+    }
+
+    /// C3 follow-up: `partition_stale` treats a missing RAW sibling the same
+    /// as a missing JPEG — a shot's files are jpeg + raw? + sidecar?, and a
+    /// missing sibling makes the WHOLE shot stale (a partial move would be
+    /// worse than dropping it).
+    #[test]
+    fn partition_stale_missing_raw_sibling_marks_shot_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap();
+
+        let mut shot = mk_shot("IMG_1", src);
+        shot.raw = Some(src.join("IMG_1.CR3")); // never written -> missing sibling
+
+        let session = Session {
+            source_dir: src.to_path_buf(),
+            shots: vec![shot],
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            pending_apply: None,
+            undo: vec![],
+        };
+
+        let (filtered, stale) = partition_stale(&session);
+
+        assert!(
+            filtered.shots.is_empty(),
+            "a shot with any missing sibling file must be dropped"
+        );
+        assert_eq!(stale, vec!["IMG_1".to_string()]);
     }
 }
 
