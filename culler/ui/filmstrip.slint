@@ -12,6 +12,14 @@ export component Filmstrip inherits Rectangle {
     background: Theme.panel-hud;
     border-radius: Theme.r-lg;
     clip: true;
+    // The tile row is a HorizontalLayout of fixed-width tiles, so its min-width
+    // is the sum of all visible tiles. Without this floor that content-width
+    // propagated up as the whole WINDOW's minimum width (e.g. 3000px+ for a
+    // 25-shot window), forcing the window wider than the screen and resizing it
+    // as the virtualized tile count changed on navigation. The strip is clipped
+    // and center-aligned, so it should simply fill the available width and clip
+    // any overflow — never dictate the window size. min-width: 0 decouples it.
+    min-width: 0px;
     // DESIGN §2.6 card shadow `0 2px 10px rgba(0,0,0,.5)` — a structural
     // shadow color (like the filmstrip dot-ring), not a Theme-token duplicate.
     drop-shadow-offset-y: 2px;
