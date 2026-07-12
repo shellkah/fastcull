@@ -291,6 +291,31 @@ pub fn run_apply(
     Ok(report)
 }
 
+/// Spec §6 rev 3: the in-flight `dest` must be recorded on `session` and
+/// autosaved BEFORE any move, so a crash mid-apply is detectable on the next
+/// launch. C2 fix: if the save itself fails (read-only or full source volume
+/// — plausible on SD/USB workflows), the apply must not start at all — a
+/// move without a landed breadcrumb is an UNDETECTABLE crash waiting to
+/// happen. On failure the in-memory `pending_apply` is cleared back to
+/// `None` too, so no phantom breadcrumb (set in memory but never persisted)
+/// lingers around to mislead anything that inspects `session` afterward.
+fn record_breadcrumb(
+    session: &mut Session,
+    dest: &Path,
+    session_file: &Path,
+) -> Result<(), String> {
+    session.pending_apply = Some(dest.to_path_buf());
+    if let Err(e) = save(session, session_file) {
+        session.pending_apply = None;
+        return Err(format!(
+            "Cannot start apply: failed to record the crash-recovery breadcrumb in {}: {e} — \
+             the apply was NOT started. Fix the source volume (read-only/full?) and retry.",
+            session_file.display()
+        ));
+    }
+    Ok(())
+}
+
 fn to_ui_preview(p: &ApplyPreview) -> crate::ApplyPreviewUi {
     crate::ApplyPreviewUi {
         rejected: p.per_bucket.rejected as i32,
@@ -434,10 +459,17 @@ pub fn wire_apply_dialog(
 
             // Breadcrumb FIRST (spec §6 rev 3): record + autosave the in-flight
             // dest BEFORE any move, so a crash is detectable on next launch.
+            // C2 fix: if that save fails, refuse to start the apply — bail
+            // out here, before apply_running/the poll timer/the worker
+            // thread are ever touched below.
             {
                 let mut s = session.borrow_mut();
-                s.pending_apply = Some(dest.clone());
-                let _ = save(&s, &source.join(SESSION_FILE));
+                let session_file = source.join(SESSION_FILE);
+                if let Err(e) = record_breadcrumb(&mut s, &dest, &session_file) {
+                    drop(s);
+                    app.set_dest_error(e.into());
+                    return;
+                }
             }
 
             // C1 audit: `find_crashed_apply` only returns `Some` when
@@ -776,8 +808,103 @@ mod applyflow_tests {
 
         let err = result.expect_err("dest creation under a read-only parent must fail loudly");
         assert!(
+            err.contains("Could not create destination"),
+            "error must name the failure: {err}"
+        );
+        assert!(
             err.contains(&dest.display().to_string()),
             "error must name the dest: {err}"
+        );
+    }
+
+    /// C2 (critical defect): the crash-detection breadcrumb (`pending_apply`
+    /// and its autosave) must land on disk BEFORE any move happens — spec §6
+    /// rev 3. `record_breadcrumb` is the pure(ish) core the confirm handler
+    /// delegates to, so the save-then-refuse contract is unit-testable
+    /// without a Slint event loop.
+    #[test]
+    fn record_breadcrumb_persists_before_apply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        let mut session = Session {
+            source_dir: src.to_path_buf(),
+            ..Session::default()
+        };
+        let dest = src.join("sorted");
+        let session_file = src.join(SESSION_FILE);
+
+        record_breadcrumb(&mut session, &dest, &session_file)
+            .expect("breadcrumb save must succeed into a writable tempdir");
+
+        assert_eq!(session.pending_apply, Some(dest.clone()));
+
+        let on_disk = std::fs::read_to_string(&session_file).unwrap();
+        assert!(
+            on_disk.contains("pending_apply"),
+            "sidecar must record the breadcrumb: {on_disk}"
+        );
+        assert!(
+            on_disk.contains(&dest.display().to_string()),
+            "sidecar must name the in-flight dest: {on_disk}"
+        );
+    }
+
+    /// C2 follow-up: when the breadcrumb save itself fails (read-only or
+    /// full source volume — plausible on SD/USB workflows), the apply must
+    /// be refused, and no phantom breadcrumb may linger in memory once it
+    /// never made it to disk.
+    #[test]
+    fn record_breadcrumb_failure_refuses_and_clears() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Environment probe (mirrors run_apply_uncreatable_dest_errors_loudly
+        // above): some sandboxes/CI run as root, or on a filesystem that
+        // ignores unix perms, where 0o555 never actually blocks a write — in
+        // that case this test cannot exercise EACCES, so skip rather than
+        // assert on an impossible-to-produce condition.
+        let probe = src.join(".rw_probe");
+        let probe_writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if probe_writable {
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipping record_breadcrumb_failure_refuses_and_clears: {} is writable despite \
+                 0o555 (likely running as root) — cannot produce EACCES in this environment",
+                src.display()
+            );
+            return;
+        }
+
+        let mut session = Session {
+            source_dir: src.clone(),
+            ..Session::default()
+        };
+        let dest = src.join("sorted");
+        let session_file = src.join(SESSION_FILE);
+
+        let result = record_breadcrumb(&mut session, &dest, &session_file);
+
+        // Restore perms before any assertion panics / before tempdir drop.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("a failed breadcrumb save must refuse the apply");
+        assert!(
+            err.contains(&session_file.display().to_string()),
+            "error must name the session file: {err}"
+        );
+        assert_eq!(
+            session.pending_apply, None,
+            "in-memory breadcrumb must be cleared, not left phantom on a failed save"
+        );
+        assert!(
+            !session_file.exists(),
+            "no sidecar should land on disk when the save fails"
         );
     }
 }
