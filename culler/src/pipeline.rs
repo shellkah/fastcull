@@ -373,17 +373,16 @@ impl Pipeline {
                             image: Arc::new(img),
                         }),
                         Err(e) => {
-                            // I1: deliver a placeholder so the loupe repaints for
-                            // the current shot instead of showing the previous
-                            // shot's photo (spec §10). Delivery-time freshness in
-                            // main.rs's on_ready still gates this to the current
-                            // index; a placeholder for a stale neighbor is
-                            // harmlessly cached/ignored just like a real decode.
-                            on_ready(DecodeResult {
-                                req: job.req,
-                                target: job.target,
-                                image: Arc::new(placeholder_image()),
-                            });
+                            // I1 follow-up: placeholder only for the current shot
+                            // (thumb_first=false); neighbor tiles keep their
+                            // embedded thumbnail or grey rather than being blacked out.
+                            if !job.thumb_first {
+                                on_ready(DecodeResult {
+                                    req: job.req,
+                                    target: job.target,
+                                    image: Arc::new(placeholder_image()),
+                                });
+                            }
                             eprintln!("decode {:?} failed: {:?}", job.path, e);
                         }
                     }
