@@ -6,6 +6,7 @@ import { HudTopLeft, HudTopRight, HudBottomLeft, TagEntry } from "hud.slint";
 import { ApplyDialog } from "applydialog.slint";
 import { KeySheet } from "keysheet.slint";
 import { Toast } from "toast.slint";
+import { CrashRecovery } from "crashrecovery.slint";
 
 // culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8) +
 // HUD overlays + tag entry (Task 9), wired to the pure input/pipeline glue in
@@ -97,6 +98,22 @@ export component AppWindow inherits Window {
     // since Rc/RefCell must never cross the thread boundary.
     callback apply-finished(bool, string);
 
+    // Crash-recovery startup screen (Task A3, DESIGN.md §4 2d): shown at
+    // launch instead of the culling view when `startup::find_startup_crash`
+    // detects an interrupted apply. Wired in `applyflow::wire_crash_recovery`.
+    in-out property <bool> crash-open: false;
+    in property <string> crash-journal-path;
+    in property <int> crash-done: 0;
+    in property <int> crash-total: 0;
+    in-out property <string> crash-report;
+    in-out property <bool> crash-report-open: false;
+    in-out property <bool> crash-resuming: false;
+    callback crash-show-report();
+    callback crash-resume();
+    // Worker completion hop (like apply-finished): registered on the UI
+    // thread so its handler may touch Rc-held state.
+    callback crash-finished(bool, string);
+
     forward-focus: keyscope;
     keyscope := FocusScope {
         key-pressed(event) => {
@@ -177,5 +194,20 @@ export component AppWindow inherits Window {
         // Keymap cheat-sheet (DESIGN §4 2e): another full-window scrim +
         // centered modal sibling, same reasoning as ApplyDialog above.
         if root.help-open: KeySheet { }
+
+        // Crash-recovery startup screen (DESIGN §4 2d): painted AFTER the
+        // KeySheet `if` so it sits on top of everything, including any other
+        // overlay — it is shown at launch, before the user can reach any of
+        // those other screens anyway, but this keeps z-order unambiguous.
+        if root.crash-open: CrashRecovery {
+            journal-path: root.crash-journal-path;
+            done: root.crash-done;
+            total: root.crash-total;
+            report-text: root.crash-report;
+            report-open: root.crash-report-open;
+            resuming: root.crash-resuming;
+            show-report() => { root.crash-show-report(); }
+            resume() => { root.crash-resume(); }
+        }
     }
 }

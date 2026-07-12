@@ -24,10 +24,7 @@ use input::{
     Action, Filter, InputContext, apply_action, key_to_action, next_filter, parse_tags, to_key,
 };
 use pipeline::{FullSlot, Pipeline, prefetch_set, to_slint_image};
-use startup::{
-    BreadcrumbProbe, Cli, find_crashed_apply, journal_report, probe_breadcrumb, reattach,
-    resolve_buckets, validate_buckets,
-};
+use startup::{Cli, reattach, resolve_buckets, validate_buckets};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -52,44 +49,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scanned = scan(&source)?;
     let mut session = reattach(&source, scanned, prev);
 
-    // Crash detection (spec §6 rev 3): the session breadcrumb points at the
-    // in-flight dest of a crashed apply — that is what makes "detected on next
-    // launch" work, since the journal lives in DEST while launches open SOURCE.
-    // A breadcrumb whose dest carries no journal is stale (crash before the
-    // first journal write, or a vanished dest) and is cleared rather than
-    // haunting every future launch. UI surfaces resume-or-report (Task 12
-    // dialog / Task 13 banner) — for now this is a launch-time eprintln.
-    match probe_breadcrumb(&mut session) {
-        BreadcrumbProbe::CrashedJournal(j) => {
-            eprintln!(
-                "{}",
-                journal_report(&j).unwrap_or_else(|e| format!(
-                    "Interrupted apply found at {} but the journal could not be read: {e}",
-                    j.display()
-                ))
-            );
-        }
-        BreadcrumbProbe::StaleCleared(dest) => {
-            // Autosave the cleared breadcrumb immediately so a repeat crash
-            // right after launch can't resurrect it from the on-disk session.
-            let _ = save(&session, &source.join(SESSION_FILE));
-            eprintln!(
-                "stale pending_apply breadcrumb cleared (no journal at {}); proceeding",
-                dest.display()
-            );
-        }
-        BreadcrumbProbe::NoBreadcrumb => {}
-    }
-    // The source dir itself is also probed (it may have been a prior run's
-    // DESTINATION). Done before wrapping `session` in Rc/RefCell — this is a
-    // plain startup check, not part of the live event-loop state.
-    if let Some(j) = find_crashed_apply(&source) {
+    // Crash detection (spec §6 rev 3; DESIGN.md §4 2d): the session
+    // breadcrumb points at the in-flight dest of a crashed apply — that is
+    // what makes "detected on next launch" work, since the journal lives in
+    // DEST while launches open SOURCE. `find_startup_crash` (Task A1) routes
+    // both detection channels (breadcrumb + source-dir probe) into one
+    // result; a breadcrumb whose dest carries no journal is stale (crash
+    // before the first journal write, or a vanished dest) and is cleared
+    // rather than haunting every future launch. Done before wrapping
+    // `session` in Rc/RefCell — this is a plain startup check, not part of
+    // the live event-loop state. The `Found` arm is handled below, once
+    // `app`/`session`/`applied` exist (Task A3 wires the 2d panel there).
+    let startup_crash = startup::find_startup_crash(&mut session, &source);
+    if let startup::StartupCrash::StaleCleared(dest) = &startup_crash {
+        // Autosave the cleared breadcrumb immediately so a repeat crash
+        // right after launch can't resurrect it from the on-disk session.
+        let _ = save(&session, &source.join(SESSION_FILE));
         eprintln!(
-            "{}",
-            journal_report(&j).unwrap_or_else(|e| format!(
-                "Interrupted apply found at {} but the journal could not be read: {e}",
-                j.display()
-            ))
+            "stale pending_apply breadcrumb cleared (no journal at {}); proceeding",
+            dest.display()
         );
     }
 
@@ -330,6 +308,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(app) = app_w.upgrade() else {
                 return false;
             };
+            // Crash-recovery gate (Task A3) FIRST, ahead of every other
+            // context: the 2d panel is shown at launch, before culling ever
+            // starts, and has no keyboard dismiss (matches the design) — so
+            // it swallows every key rather than letting any culling/help/tag/
+            // apply keymap leak through underneath it.
+            if app.get_crash_open() {
+                return true;
+            }
             // Help overlay gating (Task 9b) FIRST and separate from the pure
             // §9 keymap below: while it's open, only `?`/Escape do anything
             // (close it) and every other key is swallowed outright, so none
@@ -528,6 +514,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply dialog callbacks are wired in Task 12 (applyflow).
     applyflow::wire_apply_dialog(&app, session.clone(), buckets, applied.clone());
+
+    // Crash-recovery startup screen (Task A3, DESIGN.md §4 2d): shown
+    // INSTEAD of the culling view when `find_startup_crash` (above) found a
+    // genuine interrupted apply. Seeds the panel's journal path + done/total
+    // from the journal on disk, then hands off to `wire_crash_recovery` for
+    // show-report/resume/completion — the CLI fast path with no crash
+    // (`StartupCrash::None`) leaves `crash-open` at its `false` default and
+    // behaves exactly as before.
+    if let startup::StartupCrash::Found(crash) = startup_crash {
+        app.set_crash_journal_path(crash.journal.display().to_string().into());
+        let (done, total) = startup::journal_counts(&crash.journal).unwrap_or((0, 0));
+        app.set_crash_done(done as i32);
+        app.set_crash_total(total as i32);
+        app.set_crash_open(true);
+        applyflow::wire_crash_recovery(&app, session.clone(), applied.clone(), crash);
+    }
 
     // Debounced autosave: flush the dirty flag at most every 2s, off the hot
     // key path. The Timer binding must outlive run() or it is cancelled.

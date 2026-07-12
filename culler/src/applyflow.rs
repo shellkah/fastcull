@@ -12,14 +12,14 @@
 //! `find_crashed_apply` / `journal_report` already live in `startup` (Task 11).
 
 use crate::AppWindow;
-use crate::startup::{dest_is_source_root, find_crashed_apply, journal_report};
+use crate::startup::{dest_is_source_root, find_crashed_apply, journal_counts, journal_report};
 use culler_core::apply::{ApplyError, ApplyReport, apply, resume};
 use culler_core::fsops::{FsOps, RealFs};
 use culler_core::model::{JOURNAL_FILE, SESSION_FILE, Session};
 use culler_core::persist::save;
 use culler_core::plan::{ApplyPlan, TierCountsPlan, plan};
 use slint::ComponentHandle;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -666,6 +666,155 @@ pub fn wire_apply_dialog(
             if let Some(a) = app_w.upgrade() {
                 a.set_apply_open(false);
             }
+        });
+    }
+}
+
+/// Success-message formatting for a completed crash-recovery resume
+/// (`wire_crash_recovery`'s worker thread) — extracted from that closure so
+/// the completion-branch decision it feeds is unit-testable without a Slint
+/// event loop, mirroring `wire_apply_dialog`'s inline success-string build
+/// but worded "Recovered" (2d) rather than "Applied" (2b/2c).
+pub fn crash_success_message(report: &ApplyReport, warning: &Option<String>) -> String {
+    let success = format!(
+        "Recovered: {} shots, {} files moved, {} sidecars written.",
+        report.moved_shots, report.moved_files, report.sidecars_written
+    );
+    match warning {
+        // I3 fix (mirrors run_apply's arm): a relocation-failure warning is
+        // appended, never turned into a failure — the moves already happened.
+        Some(w) => format!("{success}\n\nWarning: {w}"),
+        None => success,
+    }
+}
+
+/// Wire the 2d crash-recovery startup screen (Task A3, DESIGN.md §4 2d):
+/// show-report / resume / completion. Resume reuses `resume_on_worker` (A2)
+/// — the SAME shared executor the Apply dialog's resume arm calls — so the
+/// healing logic exists exactly once; this function only adds the 200ms
+/// journal-count poll (a thin progress reader) and the completion routing
+/// specific to the startup screen (drop into culling vs. stay open on
+/// failure, breadcrumb-clear + `applied` guard only when the crash was OUR
+/// OWN apply).
+pub fn wire_crash_recovery(
+    app: &AppWindow,
+    session: Rc<RefCell<Session>>,
+    applied: Rc<Cell<bool>>,
+    crash: crate::startup::CrashInfo,
+) {
+    // Show report: render `journal_report` on demand (empty until clicked).
+    {
+        let crash = crash.clone();
+        let app_w = app.as_weak();
+        app.on_crash_show_report(move || {
+            let Some(app) = app_w.upgrade() else { return };
+            let report = journal_report(&crash.journal)
+                .unwrap_or_else(|e| format!("could not read journal: {e}"));
+            app.set_crash_report(report.into());
+            app.set_crash_report_open(true);
+        });
+    }
+
+    // Poll-timer holder, exactly like `wire_apply_dialog`'s `progress_timer`
+    // — owned here so the completion sink can drop it (stopping the poll)
+    // and the resume handler can (re)start it.
+    let poll_timer: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
+
+    // Completion sink — registered on the UI thread, so it may touch Rc
+    // state. The worker thread reaches it via `invoke_crash_finished` (Rc/
+    // RefCell are not Send; only the AppWindow Weak crosses the thread
+    // boundary).
+    {
+        let session = session.clone();
+        let applied = applied.clone();
+        let poll_timer = poll_timer.clone();
+        let crash = crash.clone();
+        let app_w = app.as_weak();
+        app.on_crash_finished(move |ok, msg| {
+            let Some(app) = app_w.upgrade() else { return };
+            poll_timer.borrow_mut().take(); // dropping the Timer stops the polling
+            app.set_crash_resuming(false);
+            if ok {
+                app.set_crash_open(false); // drop into culling
+                if crash.from_breadcrumb {
+                    // This shoot's own apply just completed: mirror the
+                    // on-disk breadcrumb clear in the live session, and — I-1
+                    // style — do not let main's autosave timer / exit-flush
+                    // resurrect the now-retired source `.fastcull.json`; the
+                    // audit record lives in `dest`.
+                    session.borrow_mut().pending_apply = None;
+                    applied.set(true);
+                }
+                // NOT from_breadcrumb: a source-dir-probe crash (source was a
+                // prior run's DESTINATION) — the current session is not that
+                // apply, so `applied` stays false and the user keeps culling
+                // the source normally. Toast either way.
+                app.invoke_show_toast("✓ recovery complete".into(), 1);
+            } else {
+                // Keep the panel open so the user sees why it failed and can
+                // retry (Resume apply again) or quit.
+                app.set_crash_report(msg);
+                app.set_crash_report_open(true);
+            }
+        });
+    }
+
+    // Resume: worker-thread `resume_on_worker` call + 200ms journal-count
+    // poll for the gold progress bar.
+    {
+        let session = session.clone();
+        let poll_timer = poll_timer.clone();
+        let crash = crash.clone();
+        let app_w = app.as_weak();
+        app.on_crash_resume(move || {
+            let Some(app) = app_w.upgrade() else { return };
+            app.set_crash_resuming(true);
+
+            let timer = slint::Timer::default();
+            {
+                let app_w = app_w.clone();
+                let journal = crash.journal.clone();
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    std::time::Duration::from_millis(200),
+                    move || {
+                        // Ignore Err: the journal is retired on success, so a
+                        // read failure near completion just means "done" —
+                        // the completion hop (not this poll) is what closes
+                        // the panel.
+                        if let Some(app) = app_w.upgrade()
+                            && let Ok((d, t)) = journal_counts(&journal)
+                        {
+                            app.set_crash_done(d as i32);
+                            app.set_crash_total(t as i32);
+                        }
+                    },
+                );
+            }
+            *poll_timer.borrow_mut() = Some(timer);
+
+            let snapshot = session.borrow().clone();
+            let app_w2 = app_w.clone();
+            let crash2 = crash.clone();
+            std::thread::spawn(move || {
+                // A2 shared executor — do NOT re-inline resume/finish_apply.
+                let result = resume_on_worker(
+                    &crash2.journal,
+                    &crash2.dest,
+                    snapshot,
+                    crash2.from_breadcrumb,
+                    &RealFs,
+                );
+                let (ok, msg) = match result {
+                    Ok((report, warning)) => (true, crash_success_message(&report, &warning)),
+                    // The Err(String) is already self-descriptive
+                    // (format_apply_error's wording) — shown verbatim.
+                    Err(e) => (false, e),
+                };
+                let _ = app_w2.upgrade_in_event_loop(move |app| {
+                    app.invoke_crash_finished(ok, msg.into());
+                });
+            });
         });
     }
 }
@@ -1512,5 +1661,44 @@ mod format_apply_error_tests {
             "message was: {msg}"
         );
         assert!(msg.contains("not overwritten"), "message was: {msg}");
+    }
+}
+
+/// Task A3: the one integration-adjacent piece of `wire_crash_recovery` that
+/// is testable without a Slint event loop — the success-message formatting
+/// fed to `crash-finished`/the "✓ recovery complete" toast.
+#[cfg(test)]
+mod crash_success_message_tests {
+    use super::*;
+
+    fn report(moved_shots: usize, moved_files: usize, sidecars_written: usize) -> ApplyReport {
+        ApplyReport {
+            moved_shots,
+            moved_files,
+            sidecars_written,
+            stopped_at: None,
+        }
+    }
+
+    #[test]
+    fn formats_recovered_shape_with_no_warning() {
+        let msg = crash_success_message(&report(3, 5, 2), &None);
+        assert_eq!(
+            msg,
+            "Recovered: 3 shots, 5 files moved, 2 sidecars written."
+        );
+    }
+
+    #[test]
+    fn appends_warning_when_present() {
+        let msg = crash_success_message(&report(1, 1, 1), &Some("dest went read-only".into()));
+        assert!(
+            msg.starts_with("Recovered: 1 shots, 1 files moved, 1 sidecars written."),
+            "message was: {msg}"
+        );
+        assert!(
+            msg.contains("Warning: dest went read-only"),
+            "message was: {msg}"
+        );
     }
 }
