@@ -72,7 +72,6 @@ pub fn refresh_filmstrip(
             thumb: thumb_for(i),
             color_code: tier_color_code(d),
             dim: dim_flag(d),
-            selected: i == session.current,
         });
     }
     let model = Rc::new(VecModel::from(items));

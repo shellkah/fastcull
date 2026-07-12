@@ -2,7 +2,10 @@ export struct FilmstripItem {
     thumb: image,
     color-code: int,   // 0 rest/grey, 1 keep/green, 2 pick/blue, 3 best/gold, 4 reject/red
     dim: bool,         // unvisited rest -> rendered dimmer
-    selected: bool,
+    // M-3: no `selected` field — filmstrip.slint highlights the current tile
+    // via `i == root.current` (app.slint's `film-current`, set from
+    // ui.rs's `refresh_filmstrip`), which is the only mechanism actually
+    // read by the .slint side.
 }
 
 export struct ApplyPreviewUi {

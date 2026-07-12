@@ -298,7 +298,12 @@ fn to_ui_preview(p: &ApplyPreview) -> crate::ApplyPreviewUi {
 /// Wire the Apply dialog callbacks: dest validation + crash-journal probe,
 /// preview, confirm (worker-thread apply-or-resume with breadcrumb + journal
 /// polling), completion sink, cancel.
-pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets: [String; 5]) {
+pub fn wire_apply_dialog(
+    app: &AppWindow,
+    session: Rc<RefCell<Session>>,
+    buckets: [String; 5],
+    applied: std::rc::Rc<std::cell::Cell<bool>>,
+) {
     // Feed the real resolved bucket names to the per-bucket table (index
     // order [rejected, rest, keep, picks, bests]) — the CLI may override
     // names, so the dialog must never hardcode "00_rejected" etc.
@@ -367,6 +372,7 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
     {
         let session = session.clone();
         let progress_timer = progress_timer.clone();
+        let applied = applied.clone();
         let app_w = app.as_weak();
         app.on_apply_finished(move |ok, msg| {
             let Some(app) = app_w.upgrade() else { return };
@@ -377,6 +383,13 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
                 // Mirror the on-disk clear in the live session.
                 session.borrow_mut().pending_apply = None;
                 app.set_apply_open(false);
+                // M-2: a completed apply is never a resume target — don't
+                // stick in resume mode if the dialog is reopened.
+                app.set_resume_mode(false);
+                // I-1: post-apply, the session record lives in dest; do not
+                // let main's autosave timer / exit-flush resurrect the
+                // retired source .fastcull.json.
+                applied.set(true);
                 // Toast (Task 9b, DESIGN §4 2g): shortened per the task brief
                 // rather than echoing the full "Applied: N shots, ..." message.
                 // tier-keep (code 1) is the closest available "confirm" dot —
@@ -464,7 +477,10 @@ pub fn wire_apply_dialog(app: &AppWindow, session: Rc<RefCell<Session>>, buckets
                             report.moved_shots, report.moved_files, report.sidecars_written
                         ),
                     ),
-                    Err(e) => (false, format!("Apply failed: {e}")),
+                    // M-5: `e` is already self-descriptive (format_apply_error's
+                    // "Apply refused: ...", "Move failed at ...", the
+                    // relocation-failure string, etc.) — no extra prefix.
+                    Err(e) => (false, e),
                 };
                 let _ = app_w2.upgrade_in_event_loop(move |app| {
                     app.invoke_apply_finished(ok, msg.into());

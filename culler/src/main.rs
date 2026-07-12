@@ -106,6 +106,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     // Debounced-autosave dirty flag (spec §12: never a sync fsync per keypress).
     let dirty = Rc::new(std::cell::Cell::new(false));
+    // Set by applyflow's on_apply_finished once a successful apply retires
+    // source/.fastcull.json into dest. Post-apply, the session record lives
+    // in dest; the autosave timer and exit-flush below must not resurrect
+    // the retired source copy.
+    let applied = Rc::new(std::cell::Cell::new(false));
 
     // Decode pipeline. on_ready DROPS STALE RESULTS AT DELIVERY (§12): results
     // land in completion order, so a prefetched NEIGHBOR or a superseded decode
@@ -310,6 +315,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 return true;
             }
+            // M-1: Apply dialog keyboard dismiss, mirroring the help_open
+            // gate above — Escape closes it, but only when the worker
+            // thread isn't mid-apply (abandoning the progress view would
+            // orphan the journal-polling UI with no way back to see the
+            // outcome). The pure §9 keymap stays inert for ApplyDialog
+            // either way (key_to_action returns None for ctx != Loupe).
+            if app.get_apply_open() && text == "Escape" && !app.get_apply_running() {
+                app.set_apply_open(false);
+                return true;
+            }
             let ctx = if app.get_help_open() {
                 // Unreachable given the early return above — kept so the pure
                 // layer stays inert here too if that gate is ever changed
@@ -475,7 +490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Apply dialog callbacks are wired in Task 12 (applyflow).
-    applyflow::wire_apply_dialog(&app, session.clone(), buckets);
+    applyflow::wire_apply_dialog(&app, session.clone(), buckets, applied.clone());
 
     // Debounced autosave: flush the dirty flag at most every 2s, off the hot
     // key path. The Timer binding must outlive run() or it is cancelled.
@@ -484,11 +499,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let session = session.clone();
         let source = source.clone();
         let dirty = dirty.clone();
+        let applied = applied.clone();
         autosave_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(2),
             move || {
-                if dirty.replace(false) {
+                // I-1: post-apply, the session record lives in dest; do not
+                // resurrect the retired source copy.
+                if !applied.get() && dirty.replace(false) {
                     let _ = save(&session.borrow(), &source.join(SESSION_FILE));
                 }
             },
@@ -506,7 +524,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     request_current();
     refresh_view();
     app.run()?;
-    // Flush any still-debounced state on the way out.
-    let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+    // Flush any still-debounced state on the way out. I-1: post-apply, the
+    // session record lives in dest; do not resurrect the retired source copy.
+    if !applied.get() {
+        let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+    }
     Ok(())
 }
