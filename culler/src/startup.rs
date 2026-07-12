@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 #[derive(clap::Parser, Debug)]
 #[command(name = "culler", about = "FastCull — keyboard-driven photo culling")]
 pub struct Cli {
-    /// Source folder of shots (scanned flat, non-recursive).
-    pub source: PathBuf,
+    /// Source folder of shots (scanned flat, non-recursive). Omit to open the
+    /// startup screen and pick a folder interactively.
+    pub source: Option<PathBuf>,
     /// Disable single-key auto-advance (tiering stays on the current shot).
     #[arg(long)]
     pub no_auto_advance: bool,
@@ -540,7 +541,7 @@ mod startup_tests {
             ["00_rejected", "01_rest", "02_keep", "03_picks", "04_bests"].map(String::from)
         );
         let cli = Cli {
-            source: "/x".into(),
+            source: Some("/x".into()),
             no_auto_advance: false,
             bucket_rejected: Some("trash".into()),
             bucket_rest: None,

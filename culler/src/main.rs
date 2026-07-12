@@ -17,7 +17,7 @@ mod ui;
 
 use clap::Parser;
 use culler_core::decode::TargetSize;
-use culler_core::model::SESSION_FILE;
+use culler_core::model::{SESSION_FILE, Session};
 use culler_core::persist::{load_or_fresh, save};
 use culler_core::scan::scan;
 use input::{
@@ -60,16 +60,36 @@ fn install_signal_quit_handler() -> std::io::Result<()> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-    let source = cli.source.clone();
-    let auto_advance = !cli.no_auto_advance;
-    let buckets = resolve_buckets(&cli);
-    if let Err(msg) = validate_buckets(&buckets) {
-        eprintln!("{msg}");
-        return Err(msg.into());
-    }
+/// Everything `main` must keep alive across the culling event loop, for
+/// EITHER entry path (Task B: the CLI fast path and the 2a folder-picker
+/// path both call `build_culling_ui` and get one of these back). Before this
+/// extraction, `pipeline`/`autosave_timer` were kept alive implicitly by
+/// living on `main`'s stack until `app.run()` returned; now that
+/// construction happens in a helper function, the caller must hold this
+/// struct until after the event loop returns, or their worker threads/timer
+/// stop.
+struct CullingUi {
+    app: AppWindow,
+    session: Rc<RefCell<Session>>,
+    applied: Rc<std::cell::Cell<bool>>,
+    source: std::path::PathBuf,
+    // keep-alives: these must outlive the event loop or their timers/threads stop
+    _pipeline: Arc<pipeline::Pipeline>,
+    _autosave_timer: slint::Timer,
+}
 
+/// Build the culling UI for `source`: load-or-fresh, scan, reattach, crash
+/// detection/routing (Task A3's 2d panel), the `AppWindow`, all event-loop
+/// wiring (decode pipeline, key dispatch, filmstrip clicks, tag entry, apply
+/// dialog, crash recovery), and the debounced-autosave timer. Does NOT show
+/// the window, run the event loop, install the signal handler, or perform
+/// the exit-flush — those are entry-path-specific and stay in `main` (Task B
+/// extraction; behavior-preserving for the CLI fast path).
+fn build_culling_ui(
+    source: std::path::PathBuf,
+    buckets: [String; 5],
+    auto_advance: bool,
+) -> Result<CullingUi, Box<dyn std::error::Error>> {
     // Startup: load-or-fresh, always rescan, reattach by stem.
     let prev = load_or_fresh(&source)?; // corrupt -> .bad + Ok(None), reported by core
     let scanned = scan(&source)?;
@@ -588,14 +608,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     request_current();
     refresh_view();
+
+    Ok(CullingUi {
+        app,
+        session,
+        applied,
+        source,
+        _pipeline: pipeline,
+        _autosave_timer: autosave_timer,
+    })
+}
+
+/// Flush any still-debounced state on the way out, for either entry path
+/// (Task B). I-1: post-apply, the session record lives in dest; do not
+/// resurrect the retired source copy.
+fn flush_on_exit(ui: &CullingUi) {
+    if !ui.applied.get() {
+        let _ = save(&ui.session.borrow(), &ui.source.join(SESSION_FILE));
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let auto_advance = !cli.no_auto_advance;
+    let buckets = resolve_buckets(&cli);
+    if let Err(msg) = validate_buckets(&buckets) {
+        eprintln!("{msg}");
+        return Err(msg.into());
+    }
+
+    // Signal-driven clean-flush works for either window (Task C) — installed
+    // once, up front, so it's live even during the 2a picker's wait for a
+    // folder choice, not just once culling starts.
     if let Err(e) = install_signal_quit_handler() {
         eprintln!("warning: could not install SIGTERM/SIGINT clean-flush handler: {e}");
     }
-    app.run()?;
-    // Flush any still-debounced state on the way out. I-1: post-apply, the
-    // session record lives in dest; do not resurrect the retired source copy.
-    if !applied.get() {
-        let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+
+    match cli.source {
+        Some(source) => {
+            // CLI-arg fast path — unchanged behavior.
+            let ui = build_culling_ui(source, buckets, auto_advance)?;
+            ui.app.show()?;
+            slint::run_event_loop()?;
+            flush_on_exit(&ui);
+        }
+        None => {
+            // 2a startup landing (DESIGN.md §4 2a, Task B): no CLI source
+            // given — show the wordmark + dropzone and let the native folder
+            // picker (rfd, xdg-desktop-portal at runtime) choose one, then
+            // build the SAME culling UI the fast path builds and hide the
+            // startup window. `ui_holder` survives the closure so the
+            // exit-flush below can still reach the session if a folder was
+            // ever opened.
+            let startup = StartupWindow::new()?;
+            let ui_holder: Rc<RefCell<Option<CullingUi>>> = Rc::new(RefCell::new(None));
+            {
+                let ui_holder = ui_holder.clone();
+                let startup_w = startup.as_weak();
+                let buckets = buckets.clone();
+                startup.on_open_folder(move || {
+                    let Some(startup) = startup_w.upgrade() else {
+                        return;
+                    };
+                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                        match build_culling_ui(path, buckets.clone(), auto_advance) {
+                            Ok(ui) => {
+                                if ui.app.show().is_ok() {
+                                    let _ = startup.hide();
+                                    *ui_holder.borrow_mut() = Some(ui);
+                                }
+                            }
+                            Err(e) => {
+                                startup.set_error(format!("could not open folder: {e}").into());
+                            }
+                        }
+                    }
+                    // No selection (dialog cancelled) — stay on the startup
+                    // screen, no error to show.
+                });
+            }
+            startup.show()?;
+            slint::run_event_loop()?;
+            if let Some(ui) = ui_holder.borrow().as_ref() {
+                flush_on_exit(ui);
+            }
+        }
     }
     Ok(())
 }

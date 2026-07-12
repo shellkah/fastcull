@@ -1,0 +1,143 @@
+import { Theme } from "theme.slint";
+
+// culler/ui/startup2a.slint — DESIGN.md §4 screen 2a: the startup landing
+// (wordmark + tagline + dropzone + native folder picker), shown at launch
+// when NO CLI source-folder argument was given (Task B, Phase 6b). The
+// RECENT list (§4 2a) is DEFER — no recents store in v1 — so only the
+// wordmark + dropzone render; that omission is expected, not a regression
+// (DESIGN §6).
+//
+// Two disclosed deviations, same class as DESIGN §5's documented "no blur"
+// gap:
+//  1. Slint 1.17's `Rectangle` has no dashed-border support. The dropzone's
+//     dashed outline (§2.3 color `#34373d`) is rendered as a solid 1.5px
+//     hairline instead.
+//  2. OS-level folder drag-and-drop is NOT implemented — Slint 1.17 has no
+//     first-class external-file-drop API. The dropzone is visual only and
+//     the "or drop a folder here" hint is aspirational, same as RECENT.
+//
+// Layout note: unlike crashrecovery.slint/applydialog.slint (which nest a
+// `VerticalLayout` inside their fixed-size panel), the `Open source folder…`
+// button here is positioned with explicit `x`/`y` rather than living inside
+// a `VerticalLayout`, so it gets TRUE fixed-width horizontal centering
+// (`x: (parent.width - self.width) / 2`) rather than depending on a
+// `VerticalLayout`'s cross-axis stretch/centering semantics for a
+// non-full-width child — this mirrors hud.slint's already-established
+// absolute-positioning convention for badges/panels that must not stretch.
+export component StartupWindow inherits Window {
+    title: "FastCull";
+    preferred-width: 1280px;
+    preferred-height: 820px;
+
+    // Optional scan/open failure surfaced from Rust (e.g. the chosen folder
+    // failed to load) — rendered as a red line under the dropzone.
+    in property <string> error;
+    callback open-folder();
+
+    // Full-window backdrop: the shared startup gradient (DESIGN §2.2/§5),
+    // the same token pair crashrecovery.slint's 2d panel sits on. This is
+    // the WINDOW's only top-level child, so it defaults to filling it
+    // (Slint's "100% of parent when not inside a *Layout" sizing rule —
+    // see hud.slint's provenance comment for the same idiom).
+    backdrop := Rectangle {
+        background: @radial-gradient(circle, Theme.bg-radial-in 0%, Theme.bg-radial-out 70%);
+
+        // Centered content column, ~520px wide (DESIGN §4 2a). Fixed height
+        // literal rather than one derived from its children's preferred
+        // sizes — the same binding-loop hazard applydialog.slint/
+        // crashrecovery.slint already disclose for their panels (a
+        // Rectangle not managed by an outer layout defaults its own size to
+        // 100% of ITS parent, so deriving height FROM children while a
+        // child's own layout silently depends back on this Rectangle's
+        // width is exactly the shape of binding loop the compiler rejects).
+        column := Rectangle {
+            width: 520px;
+            height: root.error != "" ? 296px : 260px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: transparent;
+
+            wordmark := Text {
+                y: 0px;
+                width: parent.width;
+                text: "fastcull";
+                font-family: Theme.font-mono;
+                font-weight: 600;
+                font-size: Theme.fs-wordmark;
+                color: Theme.text;
+                horizontal-alignment: center;
+            }
+
+            tagline := Text {
+                y: wordmark.y + 34px;
+                width: parent.width;
+                text: "keyboard-driven photo culling";
+                font-family: Theme.font-mono;
+                font-size: 13px;
+                color: Theme.text-dim;
+                horizontal-alignment: center;
+            }
+
+            // Dropzone (DESIGN §4 2a Build): dashed-style border, generous
+            // vertical padding, the primary action button + hint line.
+            dropzone := Rectangle {
+                y: tagline.y + 20px + 26px; // tagline row + §2.6 "startup blocks" gap
+                width: parent.width;
+                height: 150px;
+                border-width: 1.5px;
+                // §2.3 names #34373d the "dashed dropzone" color — a literal,
+                // like the crash panel's gold border, since Theme has no
+                // token for it. KNOWN DEVIATION: rendered as a solid
+                // hairline (see file header) — Slint 1.17 has no dashed
+                // border.
+                border-color: #34373d;
+                border-radius: Theme.r-lg;
+                background: transparent;
+
+                open-btn := Rectangle {
+                    y: 40px;
+                    height: 40px;
+                    width: open-btn-text.preferred-width + 40px;
+                    x: (parent.width - self.width) / 2;
+                    background: Theme.accent-primary;
+                    border-radius: Theme.r-md;
+                    open-btn-text := Text {
+                        text: "Open source folder…";
+                        font-family: Theme.font-sans;
+                        font-weight: 600;
+                        font-size: 13px;
+                        color: Theme.on-accent;
+                        x: (parent.width - self.width) / 2;
+                        height: parent.height;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { clicked => { root.open-folder(); } }
+                }
+
+                hint := Text {
+                    y: open-btn.y + open-btn.height + 14px;
+                    width: parent.width;
+                    text: "or drop a folder here · or: fastcull ~/shoots/…";
+                    font-family: Theme.font-mono;
+                    font-size: 12px;
+                    color: Theme.text-dim;
+                    horizontal-alignment: center;
+                }
+            }
+
+            // RECENT list intentionally NOT rendered — DEFER (no recents
+            // store in v1; DESIGN §4 2a / §6).
+
+            if root.error != "": Text {
+                y: dropzone.y + dropzone.height + 14px;
+                width: parent.width;
+                text: root.error;
+                font-family: Theme.font-mono;
+                font-size: 12px;
+                color: Theme.danger;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
