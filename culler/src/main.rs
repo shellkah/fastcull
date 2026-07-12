@@ -47,19 +47,26 @@ fn install_signal_quit_handler() -> std::io::Result<()> {
     use signal_hook::iterator::Signals;
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     std::thread::spawn(move || {
-        for _sig in signals.forever() {
-            // Keep trying until the request actually reaches a running event
-            // loop. A signal delivered before the Slint backend is up (e.g.
-            // during the initial scan, since this handler is installed at the
-            // top of main) makes invoke_from_event_loop return Err; don't give
-            // up — wait for the next signal and retry, so one early signal can
-            // never permanently disable the clean-flush quit path.
-            if slint::invoke_from_event_loop(|| {
-                let _ = slint::quit_event_loop();
-            })
-            .is_ok()
-            {
-                break;
+        // Block until the first SIGINT/SIGTERM.
+        if signals.forever().next().is_some() {
+            // Retry the already-received quit request until the Slint event loop
+            // is up and accepts it. The handler is installed before the backend
+            // exists (to also cover the interactive picker wait), so a signal
+            // delivered during the initial scan would otherwise be lost —
+            // invoke_from_event_loop returns Err until the loop is running.
+            // Retry (not `signals.forever()` again, which would block for a
+            // brand-new signal supervised environments never send) so the quit
+            // still fires once the loop starts. A signal arriving after a normal
+            // exit just spins harmlessly until the process ends.
+            loop {
+                if slint::invoke_from_event_loop(|| {
+                    let _ = slint::quit_event_loop();
+                })
+                .is_ok()
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     });
@@ -112,16 +119,17 @@ fn build_culling_ui(
     // `session` in Rc/RefCell — this is a plain startup check, not part of
     // the live event-loop state. The `Found` arm is handled below, once
     // `app`/`session`/`applied` exist (Task A3 wires the 2d panel there).
-    let startup_crash = startup::find_startup_crash(&mut session, &source);
-    if let startup::StartupCrash::StaleCleared(dest) = &startup_crash {
+    let scan = startup::find_startup_crash(&mut session, &source);
+    if let Some(d) = scan.stale_cleared.as_ref() {
         // Autosave the cleared breadcrumb immediately so a repeat crash
         // right after launch can't resurrect it from the on-disk session.
         let _ = save(&session, &source.join(SESSION_FILE));
         eprintln!(
             "stale pending_apply breadcrumb cleared (no journal at {}); proceeding",
-            dest.display()
+            d.display()
         );
     }
+    let startup_crash = scan.crash; // Option<CrashInfo>, handled after the app is built
 
     let app = AppWindow::new()?;
     let session = Rc::new(RefCell::new(session));
@@ -512,7 +520,18 @@ fn build_culling_ui(
         let request_current = request_current.clone();
         let refresh_view = refresh_view.clone();
         let dirty = dirty.clone();
+        let app_w = app.as_weak();
         app.on_film_clicked(move |offset| {
+            // Crash-recovery gate (F3), mirroring `on_key_pressed`'s gate: the
+            // 2d screen's TouchArea backdrop should already swallow this click,
+            // but this is the Rust-side belt-and-suspenders in case a click
+            // ever reaches here while the crash screen is up — it must never
+            // mutate `session.current`/`visited` nor mark the session dirty.
+            if let Some(app) = app_w.upgrade()
+                && app.get_crash_open()
+            {
+                return;
+            }
             let (indices, _) =
                 ui::build_filmstrip_window(&session.borrow(), *filter.borrow(), FILMSTRIP_BUFFER);
             if let Some(&idx) = indices.get(offset as usize) {
@@ -572,13 +591,24 @@ fn build_culling_ui(
     // genuine interrupted apply. Seeds the panel's journal path + done/total
     // from the journal on disk, then hands off to `wire_crash_recovery` for
     // show-report/resume/completion — the CLI fast path with no crash
-    // (`StartupCrash::None`) leaves `crash-open` at its `false` default and
+    // (`scan.crash == None`) leaves `crash-open` at its `false` default and
     // behaves exactly as before.
-    if let startup::StartupCrash::Found(crash) = startup_crash {
+    if let Some(crash) = startup_crash {
         app.set_crash_journal_path(crash.journal.display().to_string().into());
-        let (done, total) = startup::journal_counts(&crash.journal).unwrap_or((0, 0));
-        app.set_crash_done(done as i32);
-        app.set_crash_total(total as i32);
+        // F4: a corrupt/unreadable journal must not read as "0 of 0 moves
+        // completed" (which looks like an empty no-op) — distinguish the
+        // parse-error case explicitly so the panel can show "journal
+        // unreadable — see report" instead.
+        match startup::journal_counts(&crash.journal) {
+            Ok((done, total)) => {
+                app.set_crash_done(done as i32);
+                app.set_crash_total(total as i32);
+                app.set_crash_unreadable(false);
+            }
+            Err(_) => {
+                app.set_crash_unreadable(true);
+            }
+        }
         app.set_crash_open(true);
         applyflow::wire_crash_recovery(&app, session.clone(), applied.clone(), crash);
     }
@@ -591,13 +621,21 @@ fn build_culling_ui(
         let source = source.clone();
         let dirty = dirty.clone();
         let applied = applied.clone();
+        let app_w = app.as_weak();
         autosave_timer.start(
             slint::TimerMode::Repeated,
             std::time::Duration::from_secs(2),
             move || {
                 // I-1: post-apply, the session record lives in dest; do not
-                // resurrect the retired source copy.
-                if !applied.get() && dirty.replace(false) {
+                // resurrect the retired source copy. F3: the crash-recovery
+                // screen (2d) freezes every other input path
+                // (on_key_pressed, on_film_clicked) — this un-gated timer
+                // must not be the one path that still silently persists
+                // state while that frozen decision point is up.
+                if !applied.get()
+                    && dirty.replace(false)
+                    && !app_w.upgrade().is_some_and(|a| a.get_crash_open())
+                {
                     let _ = save(&session.borrow(), &source.join(SESSION_FILE));
                 }
             },

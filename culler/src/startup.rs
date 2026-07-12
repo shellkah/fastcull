@@ -234,48 +234,62 @@ pub struct CrashInfo {
     pub from_breadcrumb: bool,
 }
 
-/// Outcome of `find_startup_crash`: routes both crash-detection channels the
-/// spec requires into one result for the caller.
+/// Result of the two INDEPENDENT startup crash-detection channels.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StartupCrash {
-    /// No crash detected via either channel.
-    None,
-    /// The breadcrumb pointed at a dest with no journal there; it has already
-    /// been cleared from `session` (set to `None`). The caller should
-    /// autosave the session and log this before proceeding fresh.
-    StaleCleared(PathBuf),
-    /// A genuine crashed apply was found.
-    Found(CrashInfo),
+pub struct StartupScan {
+    /// A stale `pending_apply` breadcrumb was cleared in-memory (its dest had no
+    /// journal). The caller must persist the cleared session + log. Orthogonal to
+    /// `crash` — a stale breadcrumb can co-occur with a real source-dir journal.
+    pub stale_cleared: Option<PathBuf>,
+    /// A journal to surface in the 2d screen, if any. Breadcrumb-detected takes
+    /// priority (`from_breadcrumb: true`); else the source-dir probe
+    /// (`from_breadcrumb: false`).
+    pub crash: Option<CrashInfo>,
 }
 
 /// Single entry point routing both crash-detection channels the spec
 /// requires: the breadcrumb (`session.pending_apply`, the primary
 /// "detected on next launch" mechanism) and the source-dir probe (for when
 /// `source` was itself a prior run's destination). The breadcrumb channel
-/// takes priority when both point at a live journal.
-pub fn find_startup_crash(session: &mut Session, source: &Path) -> StartupCrash {
+/// takes priority when both point at a live journal. The two channels are
+/// INDEPENDENT: a stale-breadcrumb clear never short-circuits the source-dir
+/// probe, since `source` can itself be a former apply destination with its
+/// own leftover journal (F1 fix — the two used to be mutually exclusive).
+pub fn find_startup_crash(session: &mut Session, source: &Path) -> StartupScan {
     let bc_dest = session.pending_apply.clone();
     match probe_breadcrumb(session) {
-        BreadcrumbProbe::CrashedJournal(j) => StartupCrash::Found(CrashInfo {
-            dest: bc_dest.expect("breadcrumb present on CrashedJournal"),
-            journal: j,
-            from_breadcrumb: true,
-        }),
-        BreadcrumbProbe::StaleCleared(d) => StartupCrash::StaleCleared(d),
-        BreadcrumbProbe::NoBreadcrumb => match find_crashed_apply(source) {
-            Some(j) => StartupCrash::Found(CrashInfo {
+        BreadcrumbProbe::CrashedJournal(j) => StartupScan {
+            stale_cleared: None,
+            crash: Some(CrashInfo {
+                dest: bc_dest.expect("breadcrumb present on CrashedJournal"),
+                journal: j,
+                from_breadcrumb: true,
+            }),
+        },
+        BreadcrumbProbe::StaleCleared(d) => StartupScan {
+            stale_cleared: Some(d),
+            // INDEPENDENT source-dir probe still runs.
+            crash: find_crashed_apply(source).map(|j| CrashInfo {
                 dest: source.to_path_buf(),
                 journal: j,
                 from_breadcrumb: false,
             }),
-            None => StartupCrash::None,
+        },
+        BreadcrumbProbe::NoBreadcrumb => StartupScan {
+            stale_cleared: None,
+            crash: find_crashed_apply(source).map(|j| CrashInfo {
+                dest: source.to_path_buf(),
+                journal: j,
+                from_breadcrumb: false,
+            }),
         },
     }
 }
 
 /// Task A1: `journal_counts` (done/total for the crash-recovery panel) and
 /// `find_startup_crash` (routes the breadcrumb + source-probe crash-detection
-/// channels into a single `StartupCrash` outcome for the caller).
+/// channels into a `StartupScan` outcome for the caller — the two channels
+/// are independent, see F1 fix round 2).
 #[cfg(test)]
 mod crash_info_tests {
     use super::*;
@@ -361,7 +375,9 @@ mod crash_info_tests {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path();
         let mut session = session_with(source, None);
-        assert_eq!(find_startup_crash(&mut session, source), StartupCrash::None);
+        let scan = find_startup_crash(&mut session, source);
+        assert_eq!(scan.stale_cleared, None);
+        assert_eq!(scan.crash, None);
     }
 
     #[test]
@@ -374,14 +390,12 @@ mod crash_info_tests {
         write_journal_fixture(&dest, vec![OpState::Pending]);
 
         let mut session = session_with(&source, Some(dest.clone()));
-        match find_startup_crash(&mut session, &source) {
-            StartupCrash::Found(info) => {
-                assert!(info.from_breadcrumb);
-                assert_eq!(info.dest, dest);
-                assert_eq!(info.journal, dest.join(JOURNAL_FILE));
-            }
-            other => panic!("expected Found, got {other:?}"),
-        }
+        let scan = find_startup_crash(&mut session, &source);
+        let info = scan.crash.expect("crash detected");
+        assert!(info.from_breadcrumb);
+        assert_eq!(info.dest, dest);
+        assert_eq!(info.journal, dest.join(JOURNAL_FILE));
+        assert_eq!(scan.stale_cleared, None);
         // Breadcrumb kept — the caller still needs it (spec: A3 uses it).
         assert_eq!(session.pending_apply, Some(dest));
     }
@@ -394,10 +408,9 @@ mod crash_info_tests {
         let dest = tmp.path().join("sorted"); // never created / no journal there
 
         let mut session = session_with(&source, Some(dest.clone()));
-        assert_eq!(
-            find_startup_crash(&mut session, &source),
-            StartupCrash::StaleCleared(dest)
-        );
+        let scan = find_startup_crash(&mut session, &source);
+        assert_eq!(scan.stale_cleared, Some(dest));
+        assert_eq!(scan.crash, None);
         assert_eq!(session.pending_apply, None);
     }
 
@@ -409,14 +422,12 @@ mod crash_info_tests {
         write_journal_fixture(&source, vec![OpState::Pending]);
 
         let mut session = session_with(&source, None);
-        match find_startup_crash(&mut session, &source) {
-            StartupCrash::Found(info) => {
-                assert!(!info.from_breadcrumb);
-                assert_eq!(info.dest, source);
-                assert_eq!(info.journal, source.join(JOURNAL_FILE));
-            }
-            other => panic!("expected Found, got {other:?}"),
-        }
+        let scan = find_startup_crash(&mut session, &source);
+        let info = scan.crash.expect("crash detected");
+        assert!(!info.from_breadcrumb);
+        assert_eq!(info.dest, source);
+        assert_eq!(info.journal, source.join(JOURNAL_FILE));
+        assert_eq!(scan.stale_cleared, None);
     }
 
     #[test]
@@ -431,13 +442,58 @@ mod crash_info_tests {
         write_journal_fixture(&dest, vec![OpState::Pending]);
 
         let mut session = session_with(&source, Some(dest.clone()));
-        match find_startup_crash(&mut session, &source) {
-            StartupCrash::Found(info) => {
-                assert!(info.from_breadcrumb);
-                assert_eq!(info.dest, dest);
-            }
-            other => panic!("expected Found, got {other:?}"),
-        }
+        let scan = find_startup_crash(&mut session, &source);
+        let info = scan.crash.expect("crash detected");
+        assert!(info.from_breadcrumb);
+        assert_eq!(info.dest, dest);
+        assert_eq!(scan.stale_cleared, None);
+    }
+
+    /// F1 (adversarial fix): the breadcrumb and source-dir probe channels
+    /// are INDEPENDENT — a stale breadcrumb clear must not short-circuit the
+    /// source-dir probe. Here `source` is itself a former apply DESTINATION
+    /// with a leftover journal, while the session ALSO carries a stale
+    /// breadcrumb pointing elsewhere (with no journal there).
+    #[test]
+    fn stale_breadcrumb_and_live_source_journal_shows_2d() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        write_journal_fixture(&source, vec![OpState::Pending]); // real journal IN source
+
+        let dest_without_journal = tmp.path().join("stale-dest"); // never created
+        let mut session = session_with(&source, Some(dest_without_journal.clone()));
+
+        let scan = find_startup_crash(&mut session, &source);
+        assert_eq!(scan.stale_cleared, Some(dest_without_journal));
+        assert_eq!(
+            scan.crash,
+            Some(CrashInfo {
+                dest: source.clone(),
+                journal: source.join(JOURNAL_FILE),
+                from_breadcrumb: false,
+            })
+        );
+        assert_eq!(session.pending_apply, None); // breadcrumb cleared
+    }
+
+    /// F1 companion case: stale breadcrumb, but no journal in `source` either
+    /// — the independent probe correctly reports no crash and the caller
+    /// proceeds straight into culling.
+    #[test]
+    fn stale_breadcrumb_and_no_source_journal_is_cull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        // No journal written into `source`.
+
+        let dest = tmp.path().join("stale-dest"); // never created / no journal there
+        let mut session = session_with(&source, Some(dest.clone()));
+
+        let scan = find_startup_crash(&mut session, &source);
+        assert_eq!(scan.stale_cleared, Some(dest));
+        assert_eq!(scan.crash, None);
+        assert_eq!(session.pending_apply, None);
     }
 }
 

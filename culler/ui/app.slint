@@ -112,6 +112,10 @@ export component AppWindow inherits Window {
     in property <string> crash-journal-path;
     in property <int> crash-done: 0;
     in property <int> crash-total: 0;
+    // F4: a corrupt/unreadable journal must not read as "0 of 0 moves
+    // completed" (an empty no-op look-alike) — main.rs sets this true when
+    // `journal_counts` fails to parse the journal, leaving done/total at 0.
+    in property <bool> crash-unreadable: false;
     in-out property <string> crash-report;
     in-out property <bool> crash-report-open: false;
     in-out property <bool> crash-resuming: false;
@@ -210,6 +214,7 @@ export component AppWindow inherits Window {
             journal-path: root.crash-journal-path;
             done: root.crash-done;
             total: root.crash-total;
+            unreadable: root.crash-unreadable;
             report-text: root.crash-report;
             report-open: root.crash-report-open;
             resuming: root.crash-resuming;
