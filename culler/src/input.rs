@@ -608,4 +608,29 @@ mod action_tests {
         assert_eq!(s.current, 0);
         assert_eq!(s.decision(0), &Decision::default());
     }
+
+    #[test]
+    fn next_unvisited_jumps_to_next_unvisited_shot() {
+        let mut s = mk_session(&[None, None, None, None]);
+        // All 4 shots start unvisited. Mark 0 and 1 as visited.
+        s.mark_visited(0);
+        s.mark_visited(1);
+        s.current = 0;
+
+        // From current=0 (visited), NextUnvisited should jump to 2 (first unvisited).
+        apply_action(Action::NextUnvisited, &mut s, false, Filter::All);
+        assert_eq!(s.current, 2);
+        assert!(
+            s.decision(2).visited,
+            "landed shot should be marked visited"
+        );
+
+        // From current=2 (now visited), NextUnvisited should jump to 3 (next unvisited).
+        apply_action(Action::NextUnvisited, &mut s, false, Filter::All);
+        assert_eq!(s.current, 3);
+        assert!(
+            s.decision(3).visited,
+            "landed shot should be marked visited"
+        );
+    }
 }
