@@ -295,14 +295,44 @@ fn first_free(dir: &Path, base: &str) -> PathBuf {
     }
 }
 
+/// I3 fix: post-apply tail, extracted so relocation's failure mode is
+/// unit-testable in isolation from a real `apply()`/`resume()` call. By the
+/// time this runs the photos are ALREADY moved (and the journal already
+/// retired) — `relocate_session` failing here (e.g. dest going read-only, or
+/// filling up, between the last move and this call) is an audit-copy
+/// problem, NOT a lost photo, so it must never be reported as an apply
+/// failure. It downgrades to a warning attached to the (otherwise unchanged)
+/// success report; the caller must still surface `ok = true`.
+fn finish_apply(
+    report: ApplyReport,
+    session: Session,
+    dest: &Path,
+) -> (ApplyReport, Option<String>) {
+    match relocate_session(&session, dest) {
+        Ok(()) => (report, None),
+        Err(e) => (
+            report,
+            Some(format!(
+                "Photos moved successfully, but the session audit copy could not be written to \
+                 the destination: {e}. Your photos are safe in the destination; only the \
+                 .fastcull.json record is missing."
+            )),
+        ),
+    }
+}
+
 /// Fresh apply: pre-verify -> gather -> plan -> journaled apply -> clear
 /// breadcrumb -> relocate session record. Takes the session BY VALUE — this
 /// runs on a worker thread against a snapshot, never on the UI thread.
+/// I3 fix: the `Option<String>` alongside the success `ApplyReport` carries a
+/// relocation-failure WARNING — the apply itself succeeded (photos moved,
+/// journal retired) even when the session's audit copy could not be written
+/// to `dest`; only `apply()` failing before that point is a real `Err`.
 pub fn run_apply(
     mut session: Session,
     dest: &Path,
     buckets: &[String; 5],
-) -> Result<ApplyReport, String> {
+) -> Result<(ApplyReport, Option<String>), String> {
     // C3 fix: re-verify existence AGAIN here, on the confirm-time snapshot —
     // a file can vanish between the dialog's preview and this call. Bail out
     // BEFORE touching disk (no `mkdir_p`, no journal) when every shot is
@@ -341,8 +371,7 @@ pub fn run_apply(
     // Success: the breadcrumb has served its purpose (spec §6 rev 3) — clear it
     // before the session becomes the immutable audit record in dest.
     session.pending_apply = None;
-    relocate_session(&session, dest).map_err(|e| format!("session relocation: {e}"))?;
-    Ok(report)
+    Ok(finish_apply(report, session, dest))
 }
 
 /// Spec §6 rev 3: the in-flight `dest` must be recorded on `session` and
@@ -565,24 +594,32 @@ pub fn wire_apply_dialog(
                 let result = match resume_journal {
                     Some(j) => resume(&j, &RealFs)
                         .map_err(|e| format_apply_error(&e, &jpath2))
-                        .and_then(|r| {
-                            // Post-resume housekeeping mirrors run_apply's tail.
+                        .map(|r| {
+                            // Post-resume housekeeping mirrors run_apply's
+                            // tail (I3 fix): a relocation failure here is a
+                            // warning, not a resume failure — the moves
+                            // already completed.
                             let mut s = snapshot;
                             s.pending_apply = None;
-                            relocate_session(&s, &dest2)
-                                .map(|_| r)
-                                .map_err(|e| format!("session relocation: {e}"))
+                            finish_apply(r, s, &dest2)
                         }),
                     None => run_apply(snapshot, &dest2, &buckets),
                 };
                 let (ok, msg) = match result {
-                    Ok(report) => (
-                        true,
-                        format!(
+                    Ok((report, warning)) => {
+                        let success = format!(
                             "Applied: {} shots, {} files moved, {} sidecars written.",
                             report.moved_shots, report.moved_files, report.sidecars_written
-                        ),
-                    ),
+                        );
+                        let msg = match warning {
+                            // I3 fix: photos are safe and moved — say so
+                            // alongside the normal success summary rather
+                            // than failing the whole apply.
+                            Some(w) => format!("{success}\n\nWarning: {w}"),
+                            None => success,
+                        };
+                        (true, msg)
+                    }
                     // M-5: `e` is already self-descriptive (format_apply_error's
                     // "Apply refused: ...", "Move failed at ...", the
                     // relocation-failure string, etc.) — no extra prefix.
@@ -775,9 +812,13 @@ mod applyflow_tests {
 
         assert!(!dest.exists(), "precondition: dest must not exist yet");
 
-        let report = run_apply(session, &dest, &buckets)
+        let (report, warning) = run_apply(session, &dest, &buckets)
             .unwrap_or_else(|e| panic!("run_apply must succeed into a fresh subfolder: {e}"));
 
+        assert!(
+            warning.is_none(),
+            "a writable dest must relocate cleanly with no warning: {warning:?}"
+        );
         assert_eq!(report.moved_shots, 2);
         assert!(
             dest.join(&buckets[2]).join("IMG_1.JPG").exists(),
@@ -1059,9 +1100,13 @@ mod applyflow_tests {
 
         std::fs::remove_file(src.join("IMG_2.JPG")).unwrap();
 
-        let report = run_apply(session, &dest, &buckets)
+        let (report, warning) = run_apply(session, &dest, &buckets)
             .unwrap_or_else(|e| panic!("run_apply must succeed excluding the stale shot: {e}"));
 
+        assert!(
+            warning.is_none(),
+            "a writable dest must relocate cleanly with no warning: {warning:?}"
+        );
         assert_eq!(report.moved_shots, 1, "only the surviving shot is moved");
         assert!(
             dest.join(&buckets[2]).join("IMG_1.JPG").exists(),
@@ -1165,6 +1210,117 @@ mod applyflow_tests {
             "a shot with any missing sibling file must be dropped"
         );
         assert_eq!(stale, vec!["IMG_1".to_string()]);
+    }
+
+    /// I3 (defect): after a fully successful apply (photos moved, journal
+    /// retired), relocating the session sidecar into `dest` is an AUDIT
+    /// COPY, not the photos themselves. `finish_apply` is the extracted
+    /// post-apply tail; when `dest` is writable, relocation must succeed
+    /// silently — no warning — and the sidecar must land in `dest`.
+    #[test]
+    fn finish_apply_relocates_session_when_dest_writable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let session = Session {
+            source_dir: src.clone(),
+            ..Session::default()
+        };
+        // Pre-apply sidecar, as a real apply would have left behind.
+        save(&session, &src.join(SESSION_FILE)).unwrap();
+
+        let report = ApplyReport {
+            moved_shots: 2,
+            moved_files: 3,
+            sidecars_written: 1,
+            stopped_at: None,
+        };
+
+        let (out_report, warning) = finish_apply(report.clone(), session, &dest);
+
+        assert_eq!(
+            out_report, report,
+            "a clean relocation must not alter the ApplyReport"
+        );
+        assert!(warning.is_none(), "warning was: {warning:?}");
+        assert!(
+            dest.join(SESSION_FILE).exists(),
+            ".fastcull.json must be relocated into dest"
+        );
+    }
+
+    /// I3 follow-up: when relocation FAILS after a successful apply (dest
+    /// goes read-only between the last move and the sidecar write —
+    /// plausible on flaky removable media), `finish_apply` must downgrade
+    /// that into a WARNING, never an error — the photos already moved. The
+    /// returned `ApplyReport` must be byte-for-byte unchanged.
+    #[test]
+    fn finish_apply_downgrades_relocation_failure_to_warning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dest = tmp.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let session = Session {
+            source_dir: src.clone(),
+            ..Session::default()
+        };
+        save(&session, &src.join(SESSION_FILE)).unwrap();
+
+        // Photos are already "staged" in dest (mirrors a completed apply)
+        // BEFORE dest goes read-only — the failure under test is the
+        // relocation step, not the move itself.
+        std::fs::write(dest.join("IMG_1.JPG"), b"staged").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Environment probe (mirrors run_apply_uncreatable_dest_errors_loudly
+        // / record_breadcrumb_failure_refuses_and_clears above): some
+        // sandboxes/CI run as root, or on a filesystem that ignores unix
+        // perms, where 0o555 never actually blocks a write — in that case
+        // this test cannot exercise EACCES, so skip rather than assert on an
+        // impossible-to-produce condition.
+        let probe = dest.join(".rw_probe");
+        let probe_writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if probe_writable {
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipping finish_apply_downgrades_relocation_failure_to_warning: {} is writable \
+                 despite 0o555 (likely running as root) — cannot produce EACCES in this \
+                 environment",
+                dest.display()
+            );
+            return;
+        }
+
+        let report = ApplyReport {
+            moved_shots: 2,
+            moved_files: 3,
+            sidecars_written: 1,
+            stopped_at: None,
+        };
+
+        let (out_report, warning) = finish_apply(report.clone(), session, &dest);
+
+        // Restore perms before any assertion panics / before tempdir drop.
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            out_report, report,
+            "a relocation failure must NOT alter the (already-successful) ApplyReport"
+        );
+        let warning =
+            warning.expect("a relocation failure after a successful apply must produce a warning");
+        assert!(
+            warning.contains("audit") || warning.contains("safe"),
+            "warning must explain the photos are safe / name the audit copy: {warning}"
+        );
     }
 }
 
