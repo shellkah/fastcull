@@ -199,6 +199,255 @@ pub fn probe_breadcrumb(session: &mut Session) -> BreadcrumbProbe {
     }
 }
 
+/// Done/total op counts for the crash-recovery panel. Kept consistent with
+/// `journal_report`: `Published` is NOT counted as done (its source unlink is
+/// still owed), so an all-`Done` journal is the only way to see `done == total`.
+// Task A1 builds the pure logic layer; Task A3 wires this into the crash-
+// recovery startup screen and `main.rs`, so nothing calls it from this crate yet.
+#[allow(dead_code)]
+pub fn journal_counts(journal_path: &Path) -> std::io::Result<(usize, usize)> {
+    let bytes = std::fs::read(journal_path)?;
+    let journal: Journal = serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let done = journal
+        .statuses
+        .iter()
+        .filter(|s| **s == OpState::Done)
+        .count();
+    let total = journal.statuses.len();
+    Ok((done, total))
+}
+
+/// Everything the crash-recovery startup screen (Task A3) needs to locate and
+/// describe an interrupted apply.
+// Not yet constructed outside tests — Task A3 wires `find_startup_crash` (and
+// thus this type) into `main.rs`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrashInfo {
+    /// The `.fastcull-apply.json` path.
+    pub journal: PathBuf,
+    /// The destination dir that owns the journal.
+    pub dest: PathBuf,
+    /// `true` when found via `session.pending_apply` (our own apply crashed);
+    /// `false` when found by probing `source` (the source was itself a prior
+    /// run's destination).
+    pub from_breadcrumb: bool,
+}
+
+/// Outcome of `find_startup_crash`: routes both crash-detection channels the
+/// spec requires into one result for the caller.
+// Not yet matched outside tests — Task A3 wires `find_startup_crash` into
+// `main.rs`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupCrash {
+    /// No crash detected via either channel.
+    None,
+    /// The breadcrumb pointed at a dest with no journal there; it has already
+    /// been cleared from `session` (set to `None`). The caller should
+    /// autosave the session and log this before proceeding fresh.
+    StaleCleared(PathBuf),
+    /// A genuine crashed apply was found.
+    Found(CrashInfo),
+}
+
+/// Single entry point routing both crash-detection channels the spec
+/// requires: the breadcrumb (`session.pending_apply`, the primary
+/// "detected on next launch" mechanism) and the source-dir probe (for when
+/// `source` was itself a prior run's destination). The breadcrumb channel
+/// takes priority when both point at a live journal.
+// Task A1 builds the pure logic layer; Task A3 wires this into the crash-
+// recovery startup screen and `main.rs`, so nothing calls it from this crate yet.
+#[allow(dead_code)]
+pub fn find_startup_crash(session: &mut Session, source: &Path) -> StartupCrash {
+    let bc_dest = session.pending_apply.clone();
+    match probe_breadcrumb(session) {
+        BreadcrumbProbe::CrashedJournal(j) => StartupCrash::Found(CrashInfo {
+            dest: bc_dest.expect("breadcrumb present on CrashedJournal"),
+            journal: j,
+            from_breadcrumb: true,
+        }),
+        BreadcrumbProbe::StaleCleared(d) => StartupCrash::StaleCleared(d),
+        BreadcrumbProbe::NoBreadcrumb => match find_crashed_apply(source) {
+            Some(j) => StartupCrash::Found(CrashInfo {
+                dest: source.to_path_buf(),
+                journal: j,
+                from_breadcrumb: false,
+            }),
+            None => StartupCrash::None,
+        },
+    }
+}
+
+/// Task A1: `journal_counts` (done/total for the crash-recovery panel) and
+/// `find_startup_crash` (routes the breadcrumb + source-probe crash-detection
+/// channels into a single `StartupCrash` outcome for the caller).
+#[cfg(test)]
+mod crash_info_tests {
+    use super::*;
+    use culler_core::apply::{Journal, OpState};
+    use culler_core::model::{JOURNAL_FILE, Session};
+    use culler_core::plan::{ApplyPlan, TierCountsPlan};
+
+    fn empty_plan(dest: &std::path::Path) -> ApplyPlan {
+        ApplyPlan {
+            dest: dest.to_path_buf(),
+            buckets: default_buckets(),
+            ops: Vec::new(),
+            per_bucket_counts: TierCountsPlan::default(),
+            skipped_sidecar_writes: Vec::new(),
+            stale: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn write_journal_fixture(dest: &std::path::Path, statuses: Vec<OpState>) {
+        let journal = Journal {
+            plan: empty_plan(dest),
+            statuses,
+        };
+        std::fs::write(
+            dest.join(JOURNAL_FILE),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn session_with(dir: &std::path::Path, pending: Option<std::path::PathBuf>) -> Session {
+        Session {
+            source_dir: dir.to_path_buf(),
+            shots: Vec::new(),
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            pending_apply: pending,
+            undo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn journal_counts_done_and_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        write_journal_fixture(dest, vec![OpState::Done, OpState::Done, OpState::Pending]);
+        let j = find_crashed_apply(dest).expect("journal present");
+        assert_eq!(journal_counts(&j).unwrap(), (2, 3));
+    }
+
+    #[test]
+    fn journal_counts_published_not_counted_as_done() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        write_journal_fixture(
+            dest,
+            vec![OpState::Done, OpState::Published, OpState::Pending],
+        );
+        let j = find_crashed_apply(dest).expect("journal present");
+        assert_eq!(journal_counts(&j).unwrap(), (1, 3));
+    }
+
+    #[test]
+    fn journal_counts_all_done_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path();
+        write_journal_fixture(dest, vec![OpState::Done, OpState::Done]);
+        let j = find_crashed_apply(dest).expect("journal present");
+        assert_eq!(journal_counts(&j).unwrap(), (2, 2));
+    }
+
+    #[test]
+    fn journal_counts_rejects_corrupt_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journal_path = tmp.path().join(JOURNAL_FILE);
+        std::fs::write(&journal_path, b"{ not json").unwrap();
+        assert!(journal_counts(&journal_path).is_err());
+    }
+
+    #[test]
+    fn find_startup_crash_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path();
+        let mut session = session_with(source, None);
+        assert_eq!(find_startup_crash(&mut session, source), StartupCrash::None);
+    }
+
+    #[test]
+    fn find_startup_crash_from_breadcrumb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let dest = tmp.path().join("sorted");
+        std::fs::create_dir_all(&dest).unwrap();
+        write_journal_fixture(&dest, vec![OpState::Pending]);
+
+        let mut session = session_with(&source, Some(dest.clone()));
+        match find_startup_crash(&mut session, &source) {
+            StartupCrash::Found(info) => {
+                assert!(info.from_breadcrumb);
+                assert_eq!(info.dest, dest);
+                assert_eq!(info.journal, dest.join(JOURNAL_FILE));
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+        // Breadcrumb kept — the caller still needs it (spec: A3 uses it).
+        assert_eq!(session.pending_apply, Some(dest));
+    }
+
+    #[test]
+    fn find_startup_crash_stale_breadcrumb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let dest = tmp.path().join("sorted"); // never created / no journal there
+
+        let mut session = session_with(&source, Some(dest.clone()));
+        assert_eq!(
+            find_startup_crash(&mut session, &source),
+            StartupCrash::StaleCleared(dest)
+        );
+        assert_eq!(session.pending_apply, None);
+    }
+
+    #[test]
+    fn find_startup_crash_from_source_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        write_journal_fixture(&source, vec![OpState::Pending]);
+
+        let mut session = session_with(&source, None);
+        match find_startup_crash(&mut session, &source) {
+            StartupCrash::Found(info) => {
+                assert!(!info.from_breadcrumb);
+                assert_eq!(info.dest, source);
+                assert_eq!(info.journal, source.join(JOURNAL_FILE));
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_startup_crash_breadcrumb_takes_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        write_journal_fixture(&source, vec![OpState::Pending]); // journal in source too
+
+        let dest = tmp.path().join("sorted");
+        std::fs::create_dir_all(&dest).unwrap();
+        write_journal_fixture(&dest, vec![OpState::Pending]);
+
+        let mut session = session_with(&source, Some(dest.clone()));
+        match find_startup_crash(&mut session, &source) {
+            StartupCrash::Found(info) => {
+                assert!(info.from_breadcrumb);
+                assert_eq!(info.dest, dest);
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod startup_tests {
     use super::*;
