@@ -265,6 +265,19 @@ pub fn run_apply(
     dest: &Path,
     buckets: &[String; 5],
 ) -> Result<ApplyReport, String> {
+    // C1 fix: `culler_core::apply::apply()` journals into
+    // `dest/.fastcull-apply.json` BEFORE the first move (journal-first
+    // durability), and `culler_core` only ever creates the BUCKET
+    // subdirectories during execution (apply.rs's `execute`) — it never
+    // creates `dest` itself. Spec §6 explicitly allows a fresh, not-yet-
+    // created subfolder of the source as the destination (the dialog's own
+    // hint says so), so `dest` must exist before `apply()` is invoked, or
+    // the journal write hits ENOENT on every single attempt. Loud on
+    // failure — no silent tolerance, no worker crash.
+    RealFs
+        .mkdir_p(dest)
+        .map_err(|e| format!("Could not create destination {}: {e}", dest.display()))?;
+
     let (existing, sizes, _leftovers) = gather_apply_inputs(&session, dest, buckets);
     let planned = plan(&session, dest, buckets, &existing, &sizes);
     let fs = RealFs;
@@ -427,6 +440,13 @@ pub fn wire_apply_dialog(
                 let _ = save(&s, &source.join(SESSION_FILE));
             }
 
+            // C1 audit: `find_crashed_apply` only returns `Some` when
+            // `dest.join(JOURNAL_FILE)` is an existing FILE (startup.rs) —
+            // that can only be true if `dest` itself already exists as a
+            // directory, so the resume branch below needs no `mkdir_p`
+            // (unlike `run_apply`'s fresh-apply path, which must create a
+            // not-yet-existing subfolder). Only the `None` arm below ever
+            // calls `run_apply`, which does its own dest creation.
             let resume_journal = find_crashed_apply(&dest);
             let snapshot = session.borrow().clone(); // worker-thread copy
             let buckets = buckets.clone();
@@ -621,6 +641,143 @@ mod applyflow_tests {
         assert_eq!(
             leftovers, 1,
             "the non-UTF-8-named file must count as a leftover"
+        );
+    }
+
+    /// C1 (critical defect): apply into a NOT-YET-CREATED destination
+    /// subfolder is the primary documented workflow (spec §6: "a fresh
+    /// subfolder of the source is allowed"; the dialog's own green hint says
+    /// the same). `culler_core::apply::apply()` journals into
+    /// `dest/.fastcull-apply.json` BEFORE any move, and `culler_core` only
+    /// ever creates the BUCKET dirs during execution — never `dest` itself —
+    /// so the journal write hits ENOENT whenever `dest` doesn't exist yet.
+    /// `run_apply` must create `dest` first.
+    #[test]
+    fn run_apply_creates_missing_dest_subfolder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path();
+        std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap(); // -> Keep
+        std::fs::write(src.join("IMG_2.JPG"), b"bbbbbb").unwrap(); // -> Reject
+
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(
+            "IMG_1".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        decisions.insert(
+            "IMG_2".to_string(),
+            Decision {
+                tier: Some(Tier::Reject),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session {
+            source_dir: src.to_path_buf(),
+            shots: vec![mk_shot("IMG_1", src), mk_shot("IMG_2", src)],
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: vec![],
+        };
+        let buckets = crate::startup::default_buckets();
+        let dest = src.join("sorted"); // a source subfolder is allowed; NOT created
+
+        assert!(!dest.exists(), "precondition: dest must not exist yet");
+
+        let report = run_apply(session, &dest, &buckets)
+            .unwrap_or_else(|e| panic!("run_apply must succeed into a fresh subfolder: {e}"));
+
+        assert_eq!(report.moved_shots, 2);
+        assert!(
+            dest.join(&buckets[2]).join("IMG_1.JPG").exists(),
+            "Keep file landed"
+        );
+        assert!(
+            dest.join(&buckets[0]).join("IMG_2.JPG").exists(),
+            "Reject file landed"
+        );
+        assert!(
+            !dest.join(JOURNAL_FILE).exists(),
+            "journal removed on success"
+        );
+        assert!(
+            dest.join(SESSION_FILE).exists(),
+            "session sidecar relocated into dest"
+        );
+        assert!(
+            !src.join(SESSION_FILE).exists(),
+            "stale source sidecar retired"
+        );
+    }
+
+    /// C1 follow-up: when `dest` truly cannot be created (e.g. a read-only
+    /// parent), `run_apply` must fail LOUDLY and name the destination — never
+    /// a worker crash, never silent tolerance.
+    #[test]
+    fn run_apply_uncreatable_dest_errors_loudly() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap();
+
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(
+            "IMG_1".to_string(),
+            Decision {
+                tier: Some(Tier::Keep),
+                tags: vec![],
+                visited: true,
+            },
+        );
+        let session = Session {
+            source_dir: src.clone(),
+            shots: vec![mk_shot("IMG_1", &src)],
+            decisions,
+            current: 0,
+            pending_apply: None,
+            undo: vec![],
+        };
+        let buckets = crate::startup::default_buckets();
+
+        let parent = tmp.path().join("readonly_parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let dest = parent.join("sorted");
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Environment probe: some sandboxes/CI run as root (or under a
+        // filesystem that ignores unix perms), where 0o555 never actually
+        // blocks a create — in that case this test cannot exercise EACCES,
+        // so skip rather than assert on an impossible-to-produce condition.
+        let probe = parent.join(".rw_probe");
+        let probe_writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if probe_writable {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!(
+                "skipping run_apply_uncreatable_dest_errors_loudly: {} is writable despite 0o555 \
+                 (likely running as root) — cannot produce EACCES in this environment",
+                parent.display()
+            );
+            return;
+        }
+
+        let result = run_apply(session, &dest, &buckets);
+
+        // Restore perms before any assertion panics / before tempdir drop.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("dest creation under a read-only parent must fail loudly");
+        assert!(
+            err.contains(&dest.display().to_string()),
+            "error must name the dest: {err}"
         );
     }
 }
