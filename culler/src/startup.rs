@@ -106,11 +106,17 @@ pub fn find_crashed_apply(dir: &Path) -> Option<PathBuf> {
     if j.is_file() { Some(j) } else { None }
 }
 
+/// Read and parse the journal at `journal_path`, mapping a parse failure to
+/// `io::ErrorKind::InvalidData` (shared by `journal_report`/`journal_counts`).
+fn parse_journal(journal_path: &Path) -> std::io::Result<Journal> {
+    let bytes = std::fs::read(journal_path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Human-readable per-op status summary for the resume-or-report prompt.
 pub fn journal_report(journal_path: &Path) -> std::io::Result<String> {
-    let bytes = std::fs::read(journal_path)?;
-    let journal: Journal = serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let journal = parse_journal(journal_path)?;
     let count = |want: OpState| journal.statuses.iter().filter(|s| **s == want).count();
     // AMENDMENT: Published counts as IN-FLIGHT (pending) for progress display —
     // the publish rename landed but the source unlink is still owed (rev 4).
@@ -203,13 +209,8 @@ pub fn probe_breadcrumb(session: &mut Session) -> BreadcrumbProbe {
 /// Done/total op counts for the crash-recovery panel. Kept consistent with
 /// `journal_report`: `Published` is NOT counted as done (its source unlink is
 /// still owed), so an all-`Done` journal is the only way to see `done == total`.
-// Task A1 builds the pure logic layer; Task A3 wires this into the crash-
-// recovery startup screen and `main.rs`, so nothing calls it from this crate yet.
-#[allow(dead_code)]
 pub fn journal_counts(journal_path: &Path) -> std::io::Result<(usize, usize)> {
-    let bytes = std::fs::read(journal_path)?;
-    let journal: Journal = serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let journal = parse_journal(journal_path)?;
     let done = journal
         .statuses
         .iter()
@@ -221,9 +222,6 @@ pub fn journal_counts(journal_path: &Path) -> std::io::Result<(usize, usize)> {
 
 /// Everything the crash-recovery startup screen (Task A3) needs to locate and
 /// describe an interrupted apply.
-// Not yet constructed outside tests — Task A3 wires `find_startup_crash` (and
-// thus this type) into `main.rs`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashInfo {
     /// The `.fastcull-apply.json` path.
@@ -238,9 +236,6 @@ pub struct CrashInfo {
 
 /// Outcome of `find_startup_crash`: routes both crash-detection channels the
 /// spec requires into one result for the caller.
-// Not yet matched outside tests — Task A3 wires `find_startup_crash` into
-// `main.rs`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupCrash {
     /// No crash detected via either channel.
@@ -258,9 +253,6 @@ pub enum StartupCrash {
 /// "detected on next launch" mechanism) and the source-dir probe (for when
 /// `source` was itself a prior run's destination). The breadcrumb channel
 /// takes priority when both point at a live journal.
-// Task A1 builds the pure logic layer; Task A3 wires this into the crash-
-// recovery startup screen and `main.rs`, so nothing calls it from this crate yet.
-#[allow(dead_code)]
 pub fn find_startup_crash(session: &mut Session, source: &Path) -> StartupCrash {
     let bc_dest = session.pending_apply.clone();
     match probe_breadcrumb(session) {

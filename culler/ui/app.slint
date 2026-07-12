@@ -1,10 +1,5 @@
 import { Theme } from "theme.slint";
-// Re-exported so `slint_build::compile("ui/app.slint")` (the entry file)
-// exposes `StartupWindow` to Rust — only components exported from the entry
-// file are reachable via `include_modules!()`/`StartupWindow::new()` (Task B,
-// Phase 6b, DESIGN.md §4 2a).
 import { StartupWindow } from "startup2a.slint";
-export { StartupWindow }
 import { Loupe } from "loupe.slint";
 import { Filmstrip } from "filmstrip.slint";
 import { FilmstripItem, ApplyPreviewUi } from "globals.slint";
@@ -13,6 +8,12 @@ import { ApplyDialog } from "applydialog.slint";
 import { KeySheet } from "keysheet.slint";
 import { Toast } from "toast.slint";
 import { CrashRecovery } from "crashrecovery.slint";
+
+// Re-exported so `slint_build::compile("ui/app.slint")` (the entry file)
+// exposes `StartupWindow` to Rust — only components exported from the entry
+// file are reachable via `include_modules!()`/`StartupWindow::new()` (Task B,
+// Phase 6b, DESIGN.md §4 2a).
+export { StartupWindow }
 
 // culler/ui/app.slint — top-level window: loupe + virtualized filmstrip (Task 8) +
 // HUD overlays + tag entry (Task 9), wired to the pure input/pipeline glue in

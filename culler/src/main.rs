@@ -47,14 +47,20 @@ fn install_signal_quit_handler() -> std::io::Result<()> {
     use signal_hook::iterator::Signals;
     let mut signals = Signals::new([SIGINT, SIGTERM])?;
     std::thread::spawn(move || {
-        // `.next()` (not a `for` loop) deliberately consumes only the FIRST
-        // signal — one clean-quit request is enough, and a `for { .. break; }`
-        // here trips clippy::never_loop. If the loop has already ended
-        // (normal-close race), the ignored `Err` covers it.
-        if signals.forever().next().is_some() {
-            let _ = slint::invoke_from_event_loop(|| {
+        for _sig in signals.forever() {
+            // Keep trying until the request actually reaches a running event
+            // loop. A signal delivered before the Slint backend is up (e.g.
+            // during the initial scan, since this handler is installed at the
+            // top of main) makes invoke_from_event_loop return Err; don't give
+            // up — wait for the next signal and retry, so one early signal can
+            // never permanently disable the clean-flush quit path.
+            if slint::invoke_from_event_loop(|| {
                 let _ = slint::quit_event_loop();
-            });
+            })
+            .is_ok()
+            {
+                break;
+            }
         }
     });
     Ok(())
@@ -676,6 +682,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if ui.app.show().is_ok() {
                                     let _ = startup.hide();
                                     *ui_holder.borrow_mut() = Some(ui);
+                                } else {
+                                    startup.set_error("could not open the culling window".into());
                                 }
                             }
                             Err(e) => {
