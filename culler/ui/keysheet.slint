@@ -64,6 +64,11 @@ component KeyGroup inherits VerticalLayout {
 export component KeySheet inherits Rectangle {
     background: Theme.scrim;
 
+    // Modal backdrop: swallow pointer events so clicks don't fall through to the
+    // filmstrip beneath (F5, mirroring CrashRecovery). Buttons/content are later
+    // siblings, so they stay on top and clickable.
+    TouchArea { }
+
     panel := Rectangle {
         width: 640px;
         // Fixed height, not bound to the content VerticalLayout's preferred-height:

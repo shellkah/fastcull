@@ -91,6 +91,13 @@ struct CullingUi {
     _autosave_timer: slint::Timer,
 }
 
+/// True when a full-screen modal owns input, so the filmstrip and the debounced
+/// autosave must both stand down. Tag entry (2f) is intentionally excluded — it
+/// keeps the photo/filmstrip live by design.
+fn modal_owns_input(crash_open: bool, apply_open: bool, help_open: bool) -> bool {
+    crash_open || apply_open || help_open
+}
+
 /// Build the culling UI for `source`: load-or-fresh, scan, reattach, crash
 /// detection/routing (Task A3's 2d panel), the `AppWindow`, all event-loop
 /// wiring (decode pipeline, key dispatch, filmstrip clicks, tag entry, apply
@@ -522,14 +529,12 @@ fn build_culling_ui(
         let dirty = dirty.clone();
         let app_w = app.as_weak();
         app.on_film_clicked(move |offset| {
-            // Crash-recovery gate (F3), mirroring `on_key_pressed`'s gate: the
-            // 2d screen's TouchArea backdrop should already swallow this click,
-            // but this is the Rust-side belt-and-suspenders in case a click
-            // ever reaches here while the crash screen is up — it must never
-            // mutate `session.current`/`visited` nor mark the session dirty.
-            if let Some(app) = app_w.upgrade()
-                && app.get_crash_open()
-            {
+            // Modal-isolation belt (F3/F5): the modal's TouchArea backdrop should
+            // already swallow this click, but never mutate session.current/visited
+            // or mark dirty if a click ever reaches here while a modal owns input.
+            if app_w.upgrade().is_some_and(|a| {
+                modal_owns_input(a.get_crash_open(), a.get_apply_open(), a.get_help_open())
+            }) {
                 return;
             }
             let (indices, _) =
@@ -627,14 +632,17 @@ fn build_culling_ui(
             std::time::Duration::from_secs(2),
             move || {
                 // I-1: post-apply, the session record lives in dest; do not
-                // resurrect the retired source copy. F3: the crash-recovery
-                // screen (2d) freezes every other input path
-                // (on_key_pressed, on_film_clicked) — this un-gated timer
-                // must not be the one path that still silently persists
-                // state while that frozen decision point is up.
+                // resurrect the retired source copy. F3/F5: any full-screen
+                // modal (crash-recovery 2d, ApplyDialog 2b/2c, KeySheet 2e)
+                // freezes every other input path (on_key_pressed,
+                // on_film_clicked) — this un-gated timer must not be the one
+                // path that still silently persists state while a frozen
+                // decision point is up.
                 if !applied.get()
+                    && !app_w.upgrade().is_some_and(|a| {
+                        modal_owns_input(a.get_crash_open(), a.get_apply_open(), a.get_help_open())
+                    })
                     && dirty.replace(false)
-                    && !app_w.upgrade().is_some_and(|a| a.get_crash_open())
                 {
                     let _ = save(&session.borrow(), &source.join(SESSION_FILE));
                 }
@@ -741,4 +749,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+// Placed after `main` (not immediately below `modal_owns_input`, this crate
+// root's usual test-module convention): clippy's `items_after_test_module`
+// only fires in the binary's root module and wants test modules to trail
+// every other item here, `fn main` included.
+#[cfg(test)]
+mod modal_owns_input_tests {
+    use super::*;
+
+    #[test]
+    fn modal_owns_input_covers_crash_apply_help_not_none() {
+        assert!(!modal_owns_input(false, false, false));
+        assert!(modal_owns_input(true, false, false));
+        assert!(modal_owns_input(false, true, false));
+        assert!(modal_owns_input(false, false, true));
+    }
 }

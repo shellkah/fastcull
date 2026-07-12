@@ -35,6 +35,11 @@ export component ApplyDialog inherits Rectangle {
 
     background: Theme.scrim;
 
+    // Modal backdrop: swallow pointer events so clicks don't fall through to the
+    // filmstrip beneath (F5, mirroring CrashRecovery). Buttons/content are later
+    // siblings, so they stay on top and clickable.
+    TouchArea { }
+
     // [name, count, tier-color-code] per row, in display order
     // rejected/rest/keep/picks/bests — code order reject=4, rest=0, keep=1,
     // pick=2, best=3 (DESIGN §4 2b, `Theme.tier-color`).
