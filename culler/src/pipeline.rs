@@ -327,7 +327,20 @@ impl Pipeline {
                             target: job.target,
                             image: Arc::new(img),
                         }),
-                        Err(e) => eprintln!("decode {:?} failed: {:?}", job.path, e),
+                        Err(e) => {
+                            // I1: deliver a placeholder so the loupe repaints for
+                            // the current shot instead of showing the previous
+                            // shot's photo (spec §10). Delivery-time freshness in
+                            // main.rs's on_ready still gates this to the current
+                            // index; a placeholder for a stale neighbor is
+                            // harmlessly cached/ignored just like a real decode.
+                            on_ready(DecodeResult {
+                                req: job.req,
+                                target: job.target,
+                                image: Arc::new(placeholder_image()),
+                            });
+                            eprintln!("decode {:?} failed: {:?}", job.path, e);
+                        }
                     }
                 }
             });
@@ -396,6 +409,29 @@ mod marshal_tests {
         assert_eq!(img.size().width, 4);
         assert_eq!(img.size().height, 3);
     }
+
+    // I1: a decode failure must still deliver SOMETHING to the loupe (spec §10
+    // "corrupt/undecodable JPEG -> placeholder tile, still classifiable"), and
+    // that tile must be visibly distinct from `grey_thumb`'s not-yet-decoded
+    // mid-grey (128,128,128) so a failed decode reads differently from a
+    // pending one.
+    #[test]
+    fn placeholder_image_is_distinct_and_valid() {
+        let p = placeholder_image();
+        assert_eq!(p.rgba.len(), (p.w as usize) * (p.h as usize) * 4);
+        for px in p.rgba.chunks_exact(4) {
+            assert_eq!(px[3], 255, "placeholder must be fully opaque");
+        }
+        assert!(
+            p.rgba[0] < 64,
+            "placeholder must be a dark tile, not mid-grey"
+        );
+        assert_ne!(
+            (p.rgba[0], p.rgba[1], p.rgba[2]),
+            (128, 128, 128),
+            "placeholder must differ from grey_thumb's not-yet-decoded grey"
+        );
+    }
 }
 
 /// A 1x1 grey placeholder image for filmstrip tiles not yet decoded.
@@ -403,4 +439,20 @@ pub fn grey_thumb() -> Image {
     let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(1, 1);
     buf.make_mut_bytes().copy_from_slice(&[128, 128, 128, 255]);
     Image::from_rgba8(buf)
+}
+
+/// A small, visibly-distinct dark tile delivered when a decode fails (spec §10:
+/// corrupt/undecodable JPEG, or a stem with only a RAW / no decodable preview,
+/// must still yield a "placeholder tile, still classifiable" rather than the
+/// loupe silently keeping the previous shot's photo). Deliberately near-black
+/// (NOT `grey_thumb`'s mid-grey 128,128,128) so a failed decode reads as
+/// visually distinct from a not-yet-decoded tile. Straight RGBA8, fully opaque.
+pub fn placeholder_image() -> DecodedImage {
+    const W: u32 = 2;
+    const H: u32 = 2;
+    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
+    for _ in 0..(W * H) {
+        rgba.extend_from_slice(&[0x1a, 0x1a, 0x1a, 255]);
+    }
+    DecodedImage { w: W, h: H, rgba }
 }
