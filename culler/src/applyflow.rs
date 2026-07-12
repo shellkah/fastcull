@@ -374,6 +374,36 @@ pub fn run_apply(
     Ok(finish_apply(report, session, dest))
 }
 
+/// Shared resume executor (Task A2). Runs ON A WORKER THREAD against a
+/// session SNAPSHOT — BOTH the Apply dialog's resume arm and the future 2d
+/// startup-recovery panel call this, so the healing logic exists exactly
+/// once. `resume()` reconciles + completes the interrupted moves and retires
+/// the journal on success. `relocate` controls the post-resume session-record
+/// handling:
+///  - true  — a breadcrumb-detected crash: THIS shoot's own apply is
+///    completing, so clear the breadcrumb and relocate the session sidecar
+///    into `dest` as the audit record (via `finish_apply`); a relocation
+///    failure is a warning.
+///  - false — a source-dir-probe crash (the source folder was itself a prior
+///    run's DESTINATION): the current session is NOT that apply, so do NOT
+///    relocate or retire it — just heal the journal and return.
+pub fn resume_on_worker(
+    journal: &Path,
+    dest: &Path,
+    session: Session,
+    relocate: bool,
+    fs: &dyn FsOps,
+) -> Result<(ApplyReport, Option<String>), String> {
+    let report = resume(journal, fs).map_err(|e| format_apply_error(&e, journal))?;
+    if relocate {
+        let mut s = session;
+        s.pending_apply = None;
+        Ok(finish_apply(report, s, dest))
+    } else {
+        Ok((report, None))
+    }
+}
+
 /// Spec §6 rev 3: the in-flight `dest` must be recorded on `session` and
 /// autosaved BEFORE any move, so a crash mid-apply is detectable on the next
 /// launch. C2 fix: if the save itself fails (read-only or full source volume
@@ -589,20 +619,17 @@ pub fn wire_apply_dialog(
 
             let app_w2 = app_w.clone();
             let dest2 = dest.clone();
-            let jpath2 = jpath.clone();
             std::thread::spawn(move || {
+                // A2: the dialog path is ALWAYS `relocate: true` — a
+                // breadcrumb was recorded by `record_breadcrumb` before this
+                // point, so `snapshot.pending_apply` is `Some(dest)` and THIS
+                // shoot's own apply is the one completing. The old inlined
+                // arm passed `jpath2` (== `dest2.join(JOURNAL_FILE)` == `j`)
+                // to `format_apply_error`; `resume_on_worker` uses its
+                // `journal` parameter (`j`) for the same call, so the
+                // rendered error string is unchanged.
                 let result = match resume_journal {
-                    Some(j) => resume(&j, &RealFs)
-                        .map_err(|e| format_apply_error(&e, &jpath2))
-                        .map(|r| {
-                            // Post-resume housekeeping mirrors run_apply's
-                            // tail (I3 fix): a relocation failure here is a
-                            // warning, not a resume failure — the moves
-                            // already completed.
-                            let mut s = snapshot;
-                            s.pending_apply = None;
-                            finish_apply(r, s, &dest2)
-                        }),
+                    Some(j) => resume_on_worker(&j, &dest2, snapshot, true, &RealFs),
                     None => run_apply(snapshot, &dest2, &buckets),
                 };
                 let (ok, msg) = match result {
@@ -1249,6 +1276,109 @@ mod applyflow_tests {
         assert!(
             dest.join(SESSION_FILE).exists(),
             ".fastcull.json must be relocated into dest"
+        );
+    }
+
+    /// A2 shared fixture: the "all-Done heal" scenario `resume_on_worker`
+    /// tests exercise on a real FS (`RealFs`) — a completed move whose
+    /// journal is still present. `IMG_1.JPG` already sits at
+    /// `dest/02_keep/IMG_1.JPG` (source consumed, so `src/IMG_1.JPG` is never
+    /// created); a one-op `Journal` with `OpState::Done` records that move;
+    /// a pre-apply session sidecar sits at `src/.fastcull.json`. `resume()`
+    /// reconciles the Done op (dest present, src absent -> stays done), runs
+    /// the durability pass, and retires the journal — returns `(src, dest,
+    /// journal_path, session)` for the caller to drive `resume_on_worker`.
+    fn mk_resume_fixture(tmp: &std::path::Path) -> (PathBuf, PathBuf, PathBuf, Session) {
+        let src = tmp.join("src");
+        let dest = tmp.join("dest");
+        let bucket_dir = dest.join("02_keep");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        // The move already happened: dest file present, source consumed.
+        std::fs::write(bucket_dir.join("IMG_1.JPG"), b"aaaa").unwrap();
+
+        let plan = ApplyPlan {
+            dest: dest.clone(),
+            buckets: crate::startup::default_buckets(),
+            ops: vec![culler_core::plan::ShotOp {
+                stem: "IMG_1".into(),
+                bucket: "02_keep".into(),
+                moves: vec![culler_core::plan::FileMove {
+                    from: src.join("IMG_1.JPG"),
+                    to: bucket_dir.join("IMG_1.JPG"),
+                }],
+                write_sidecar: None,
+                suffix: None,
+            }],
+            per_bucket_counts: TierCountsPlan::default(),
+            skipped_sidecar_writes: vec![],
+            stale: vec![],
+            total_bytes: 4,
+        };
+        let journal = culler_core::apply::Journal {
+            plan,
+            statuses: vec![culler_core::apply::OpState::Done],
+        };
+        let journal_path = dest.join(JOURNAL_FILE);
+        std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let session = Session {
+            source_dir: src.clone(),
+            ..Session::default()
+        };
+        save(&session, &src.join(SESSION_FILE)).unwrap();
+
+        (src, dest, journal_path, session)
+    }
+
+    /// A2: `relocate=true` mirrors the Apply-dialog resume arm (a
+    /// breadcrumb-detected crash for THIS shoot's own apply) — the session
+    /// record must be relocated into `dest` as the audit record, and the
+    /// stale source copy retired, on top of the journal being healed/retired.
+    #[test]
+    fn resume_on_worker_relocate_true_relocates_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest, journal_path, session) = mk_resume_fixture(tmp.path());
+
+        let (report, warning) =
+            resume_on_worker(&journal_path, &dest, session, true, &RealFs).unwrap();
+        let _ = report;
+
+        assert!(warning.is_none(), "warning was: {warning:?}");
+        assert!(!journal_path.exists(), "journal must be retired");
+        assert!(
+            dest.join(SESSION_FILE).exists(),
+            "session sidecar must be relocated into dest"
+        );
+        assert!(
+            !src.join(SESSION_FILE).exists(),
+            "stale source sidecar copy must be retired"
+        );
+    }
+
+    /// A2: `relocate=false` mirrors a source-dir-probe crash (the source
+    /// folder was itself a prior run's DESTINATION) — the current session is
+    /// NOT that apply, so `resume_on_worker` must heal the journal only and
+    /// leave the session record entirely untouched.
+    #[test]
+    fn resume_on_worker_relocate_false_leaves_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dest, journal_path, session) = mk_resume_fixture(tmp.path());
+
+        let (report, warning) =
+            resume_on_worker(&journal_path, &dest, session, false, &RealFs).unwrap();
+        let _ = report;
+
+        assert!(warning.is_none(), "warning was: {warning:?}");
+        assert!(!journal_path.exists(), "journal must be retired");
+        assert!(
+            !dest.join(SESSION_FILE).exists(),
+            "session sidecar must NOT be relocated when relocate=false"
+        );
+        assert!(
+            src.join(SESSION_FILE).exists(),
+            "source sidecar must remain untouched when relocate=false"
         );
     }
 
