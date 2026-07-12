@@ -125,6 +125,15 @@ export component AppWindow inherits Window {
     // thread so its handler may touch Rc-held state.
     callback crash-finished(bool, string);
 
+    // Returning from the tag-entry overlay: TagEntry grabs keyboard focus in its
+    // `init` (edit.focus()); when it closes (`tag-open` -> false) its TextInput is
+    // destroyed and nothing holds focus, so the main keyscope stopped receiving
+    // keys until the user clicked the window again. Re-claim focus for keyscope on
+    // close so navigation works immediately.
+    changed tag-open => {
+        if (!root.tag-open) { keyscope.focus(); }
+    }
+
     forward-focus: keyscope;
     keyscope := FocusScope {
         key-pressed(event) => {
@@ -141,6 +150,15 @@ export component AppWindow inherits Window {
                 // siblings so they paint OVER the photo (DESIGN §4 1b/2f) instead of
                 // living beside it in a side column.
                 Loupe {
+                    // Fill the stage explicitly. Without a width/height the Loupe
+                    // takes its *preferred* size, which the 1:1-zoom Image (native
+                    // pixels, ImageFit.preserve, no width/height) reports as the
+                    // photo's full resolution — so the loupe ballooned to the
+                    // image's native width and overflowed the window horizontally,
+                    // shifting/resizing per photo. Binding to the parent stage
+                    // bounds it; Loupe's own clip:true still handles 1:1 pan overflow.
+                    width: parent.width;
+                    height: parent.height;
                     source: root.current-image;
                     zoomed: root.zoomed;
                     pan-x <=> root.pan-x;
