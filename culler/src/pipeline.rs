@@ -50,6 +50,16 @@ impl Scheduler {
     }
 }
 
+/// Delivery-time freshness (spec §9/§12): a decoded result is safe to PAINT
+/// iff it is for the shot currently shown AND it was not superseded by a
+/// later navigation/toggle. Index alone is not enough — e.g. a `Z` toggle
+/// bumps the generation and enqueues a `Full` request for the SAME index; a
+/// still-in-flight OLD `Fit` decode for that index must not overwrite the
+/// fresh `Full` paint just because the index still matches.
+pub fn is_fresh_delivery(req: &Request, current_index: usize, current_gen: u64) -> bool {
+    req.index == current_index && !Scheduler::is_stale(req, current_gen)
+}
+
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
@@ -82,6 +92,41 @@ mod scheduler_tests {
     fn generation_starts_at_zero() {
         let sch = Scheduler::new();
         assert_eq!(sch.generation, 0);
+    }
+
+    // I2: delivery-time freshness must check BOTH index and generation. A
+    // stale-generation Fit decode for the current index (the Z-toggle case:
+    // request_current bumps the generation and enqueues a Full request for
+    // the same index; an in-flight OLD Fit for that index must not paint
+    // over it) must read as not-fresh even though its index matches.
+    #[test]
+    fn is_fresh_delivery_true_for_same_index_and_current_generation() {
+        let req = Request {
+            index: 5,
+            generation: 2,
+        };
+        assert!(is_fresh_delivery(&req, 5, 2));
+    }
+
+    #[test]
+    fn is_fresh_delivery_false_for_same_index_but_stale_generation() {
+        // The Z-toggle case: request stamped at generation 1, but a
+        // subsequent navigation/toggle bumped the pipeline to generation 2
+        // before this result was delivered.
+        let req = Request {
+            index: 5,
+            generation: 1,
+        };
+        assert!(!is_fresh_delivery(&req, 5, 2));
+    }
+
+    #[test]
+    fn is_fresh_delivery_false_for_different_index() {
+        let req = Request {
+            index: 4,
+            generation: 2,
+        };
+        assert!(!is_fresh_delivery(&req, 5, 2));
     }
 }
 

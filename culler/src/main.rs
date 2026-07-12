@@ -104,6 +104,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let current_shot = Arc::new(std::sync::atomic::AtomicUsize::new(
         session.borrow().current,
     ));
+    // Mirrors `pipeline.generation` at the moment `request_current` last
+    // bumped it (I2). `Pipeline::bump()` happens before the current-shot
+    // `enqueue`, so this is the SAME generation stamped onto that request's
+    // `Request.generation` — a delivery whose `req.generation` is older than
+    // this is a superseded decode (e.g. a `Z`-toggle's stale `Fit`) and must
+    // not paint even if its index still matches the current shot.
+    let current_gen = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Debounced-autosave dirty flag (spec §12: never a sync fsync per keypress).
     let dirty = Rc::new(std::cell::Cell::new(false));
     // Set by applyflow's on_apply_finished once a successful apply retires
@@ -121,18 +128,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_w = cache.clone();
     let full_w = full_slot.clone();
     let cur_w = current_shot.clone();
+    let gen_w = current_gen.clone();
     let pipeline = Arc::new(Pipeline::spawn(3, move |res| {
         let weak = weak.clone();
         let cache_w = cache_w.clone();
         let full_w = full_w.clone();
         let cur_w = cur_w.clone();
+        let gen_w = gen_w.clone();
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(app) = weak.upgrade() {
-                let is_current = res.req.index == cur_w.load(Ordering::SeqCst);
+                // I2: freshness gates the PAINT only — index alone is not
+                // enough (a still-in-flight OLD Fit for the current index
+                // must not overwrite a fresh Full after a `Z` toggle bumps
+                // the generation). Caching stays unconditional below: a
+                // decoded image is valid for its index regardless of
+                // staleness.
+                let is_fresh = pipeline::is_fresh_delivery(
+                    &res.req,
+                    cur_w.load(Ordering::SeqCst),
+                    gen_w.load(Ordering::SeqCst),
+                );
                 match res.target {
                     TargetSize::Full => {
                         full_w.lock().unwrap().set(res.req.index, res.image.clone());
-                        if is_current {
+                        if is_fresh {
                             ui::set_loupe(&app, &res.image);
                         }
                     }
@@ -141,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .lock()
                             .unwrap()
                             .put(res.req.index, res.image.clone());
-                        if is_current {
+                        if is_fresh {
                             ui::set_loupe(&app, &res.image);
                         }
                         // Neighbor prefetches land here too (spec §12 "tiles
@@ -163,6 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let full_slot = full_slot.clone();
         let pipeline = pipeline.clone();
         let current_shot = current_shot.clone();
+        let current_gen = current_gen.clone();
         let app_w = app.as_weak();
         move || {
             let s = session.borrow();
@@ -170,7 +190,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let (fw, fh) = (1600u32, 1000u32);
-            pipeline.bump(); // latest-wins: supersede in-flight requests
+            // I2: bump BEFORE storing/enqueuing, and store the SAME value
+            // that `enqueue` below will stamp onto this request's
+            // `Request.generation` — so the freshly-enqueued current
+            // request can never be seen as stale by `on_ready`.
+            let new_gen = pipeline.bump(); // latest-wins: supersede in-flight requests
+            current_gen.store(new_gen, Ordering::SeqCst);
             let cur = s.current;
             current_shot.store(cur, Ordering::SeqCst); // delivery freshness anchor
             let z = *zoom.borrow();
@@ -300,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let source = source.clone();
         let dirty = dirty.clone();
         let show_toast = show_toast.clone();
+        let applied = applied.clone();
         app.on_key_pressed(move |text, ctrl| {
             let Some(app) = app_w.upgrade() else {
                 return false;
@@ -379,9 +405,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Action::ForceSave => {
                     // Ctrl+S: immediate, and the debounce flag is satisfied.
+                    // I4: post-apply, the session record lives in dest; do
+                    // not resurrect the retired source copy (mirrors the
+                    // autosave timer + exit-flush guards on `applied.get()`
+                    // above/below).
                     dirty.set(false);
-                    let _ = save(&session.borrow(), &source.join(SESSION_FILE));
-                    show_toast("session saved".to_string(), -1);
+                    if applied.get() {
+                        show_toast(
+                            "session already applied (record is in the destination)".to_string(),
+                            -1,
+                        );
+                    } else {
+                        let _ = save(&session.borrow(), &source.join(SESSION_FILE));
+                        show_toast("session saved".to_string(), -1);
+                    }
                 }
                 Action::ToggleHelp => {
                     app.set_help_open(true);
