@@ -34,6 +34,32 @@ const PREFETCH_N: usize = 4;
 const FILMSTRIP_BUFFER: usize = 8;
 const CACHE_BUDGET: usize = 512 * 1024 * 1024; // 512 MB of fit-size textures
 
+/// Install a SIGTERM/SIGINT handler that requests a clean quit of the Slint
+/// event loop, so `app.run()` returns and the normal exit-flush (final
+/// debounced autosave) runs on kill instead of losing the last <2s of
+/// decisions. Signal-safe: `signal-hook`'s `Signals` iterator runs the loop in
+/// a DEDICATED THREAD (the OS signal handler it installs only writes to a
+/// self-pipe — async-signal-safe); from that ordinary thread we hop onto the
+/// event loop via `slint::invoke_from_event_loop` and call
+/// `slint::quit_event_loop()`. We never touch the session/UI from the handler.
+fn install_signal_quit_handler() -> std::io::Result<()> {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+    std::thread::spawn(move || {
+        // `.next()` (not a `for` loop) deliberately consumes only the FIRST
+        // signal — one clean-quit request is enough, and a `for { .. break; }`
+        // here trips clippy::never_loop. If the loop has already ended
+        // (normal-close race), the ignored `Err` covers it.
+        if signals.forever().next().is_some() {
+            let _ = slint::invoke_from_event_loop(|| {
+                let _ = slint::quit_event_loop();
+            });
+        }
+    });
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let source = cli.source.clone();
@@ -562,6 +588,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     request_current();
     refresh_view();
+    if let Err(e) = install_signal_quit_handler() {
+        eprintln!("warning: could not install SIGTERM/SIGINT clean-flush handler: {e}");
+    }
     app.run()?;
     // Flush any still-debounced state on the way out. I-1: post-apply, the
     // session record lives in dest; do not resurrect the retired source copy.
