@@ -66,6 +66,13 @@ export component KeySheet inherits Rectangle {
 
     panel := Rectangle {
         width: 640px;
+        // Fixed height, not bound to the content VerticalLayout's preferred-height:
+        // this Rectangle isn't managed by an outer layout, so an unconstrained
+        // height defaults to 100% of its parent (the full-window scrim) — the
+        // same binding-loop hazard TagEntry's header comment already discloses
+        // for width. Content is static (6 groups, fixed row counts), so a fixed
+        // height sized to fit it is exact, not an approximation.
+        height: 460px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.panel-dialog;
@@ -73,6 +80,11 @@ export component KeySheet inherits Rectangle {
         border-width: 1px;
         border-color: Theme.border-strong;
         clip: true;
+        // DESIGN §2.6 dialog shadow `0 16px 50px rgba(0,0,0,.6)` — a structural
+        // shadow color (like the filmstrip dot-ring), not a Theme-token duplicate.
+        drop-shadow-offset-y: 16px;
+        drop-shadow-blur: 50px;
+        drop-shadow-color: #00000099;
 
         VerticalLayout {
             padding: 22px;

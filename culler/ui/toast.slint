@@ -21,6 +21,11 @@ export component Toast inherits Rectangle {
         border-radius: Theme.r-lg;
         border-width: 1px;
         border-color: Theme.border-strong;
+        // DESIGN §2.6 toast shadow `0 4px 16px rgba(0,0,0,.5)` — a structural
+        // shadow color (like the filmstrip dot-ring), not a Theme-token duplicate.
+        drop-shadow-offset-y: 4px;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #00000080;
 
         row := HorizontalLayout {
             padding: 10px;

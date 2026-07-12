@@ -12,6 +12,11 @@ export component Filmstrip inherits Rectangle {
     background: Theme.panel-hud;
     border-radius: Theme.r-lg;
     clip: true;
+    // DESIGN §2.6 card shadow `0 2px 10px rgba(0,0,0,.5)` — a structural
+    // shadow color (like the filmstrip dot-ring), not a Theme-token duplicate.
+    drop-shadow-offset-y: 2px;
+    drop-shadow-blur: 10px;
+    drop-shadow-color: #00000080;
 
     HorizontalLayout {
         alignment: center;

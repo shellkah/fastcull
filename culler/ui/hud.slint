@@ -112,53 +112,61 @@ export component HudTopRight inherits Rectangle {
     in property <int> count-reject: 0;
     background: transparent;
 
-    panel := Rectangle {
+    // DESIGN §4 1b / screens/1b-main.png: the counts pill and the current-tier
+    // badge are two visually distinct rounded shapes with a gap between them
+    // (the badge alone carries the §2.6 shadow) — not one merged panel. Laid
+    // out here as two independently-positioned Rectangles, badge rightmost.
+    badge := Rectangle {
         x: parent.width - self.width - 14px;
         y: 14px;
-        width: 300px;
         height: 30px;
+        background: Theme.tier-color(TierCode.for-name(root.tier));
+        border-radius: Theme.r-md;
+        width: badge-text.preferred-width + 14px;
+        // DESIGN §2.6 HUD-badge shadow `0 2px 8px rgba(0,0,0,.4)` — a
+        // structural shadow color (like the filmstrip dot-ring), not a
+        // Theme-token duplicate.
+        drop-shadow-offset-y: 2px;
+        drop-shadow-blur: 8px;
+        drop-shadow-color: #00000066;
+        badge-text := Text {
+            text: root.tier == "Rest" ? "REST" : root.tier.to-uppercase();
+            font-family: Theme.font-mono;
+            font-weight: 600;
+            font-size: 12px;
+            letter-spacing: 1px;
+            color: Theme.on-accent;
+            x: 7px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+
+    counts-panel := Rectangle {
+        x: badge.x - self.width - 8px;
+        y: 14px;
+        height: 30px;
+        width: counts-row.preferred-width + 14px;
         background: Theme.panel-hud;
         border-radius: Theme.r-md;
         border-width: 1px;
         border-color: Theme.border;
 
-        HorizontalLayout {
+        counts-row := HorizontalLayout {
             padding: 7px;
-            spacing: 10px;
-            alignment: end;
-
-            HorizontalLayout {
-                spacing: 6px;
-                alignment: center;
-                // order: best · pick · keep · rest · reject
-                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-best; }
-                Text { text: root.count-best; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
-                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-pick; }
-                Text { text: root.count-pick; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
-                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-keep; }
-                Text { text: root.count-keep; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
-                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-rest; }
-                Text { text: root.count-rest; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
-                Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-reject; }
-                Text { text: root.count-reject; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
-            }
-
-            Rectangle {
-                background: Theme.tier-color(TierCode.for-name(root.tier));
-                border-radius: Theme.r-md;
-                width: badge-text.preferred-width + 14px;
-                badge-text := Text {
-                    text: root.tier == "Rest" ? "REST" : root.tier.to-uppercase();
-                    font-family: Theme.font-mono;
-                    font-weight: 600;
-                    font-size: 12px;
-                    letter-spacing: 1px;
-                    color: Theme.on-accent;
-                    x: 7px;
-                    vertical-alignment: center;
-                    horizontal-alignment: center;
-                }
-            }
+            spacing: 6px;
+            alignment: center;
+            // order: best · pick · keep · rest · reject
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-best; }
+            Text { text: root.count-best; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-pick; }
+            Text { text: root.count-pick; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-keep; }
+            Text { text: root.count-keep; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-rest; }
+            Text { text: root.count-rest; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
+            Rectangle { width: 6px; height: 6px; border-radius: 3px; background: Theme.tier-reject; }
+            Text { text: root.count-reject; font-family: Theme.font-mono; font-size: 10.5px; color: Theme.text-muted; vertical-alignment: center; }
         }
     }
 }
@@ -240,6 +248,11 @@ export component TagEntry inherits Rectangle {
         border-width: 1px;
         border-color: Theme.border-strong;
         clip: true;
+        // DESIGN §2.6 dialog shadow `0 16px 50px rgba(0,0,0,.6)` — a structural
+        // shadow color (like the filmstrip dot-ring), not a Theme-token duplicate.
+        drop-shadow-offset-y: 16px;
+        drop-shadow-blur: 50px;
+        drop-shadow-color: #00000099;
 
         // Wraps the LineEdit so Escape (unhandled by the LineEdit's own text editing)
         // bubbles up to a FocusScope that actually surrounds it — the brief's sketch put

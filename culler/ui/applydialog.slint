@@ -48,6 +48,15 @@ export component ApplyDialog inherits Rectangle {
 
     panel := Rectangle {
         width: 560px;
+        // Fixed height, not bound to the content VerticalLayout's preferred-height
+        // (same binding-loop hazard TagEntry's header comment already discloses):
+        // this Rectangle isn't managed by an outer layout, so an unconstrained
+        // height defaults to 100% of its parent (the full-window scrim), which
+        // vertically centers the (much shorter) content in a near-window-tall box
+        // and pushes the footer off-screen. Three content shapes (2c running;
+        // 2b idle/no-preview; 2b with the bucket table) get their own fixed
+        // height, sized to fit each — mirrors HudBottomLeft's tags-ternary height.
+        height: root.apply-running ? 170px : (root.preview-ready ? 480px : 260px);
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.panel-dialog;
@@ -55,6 +64,11 @@ export component ApplyDialog inherits Rectangle {
         border-width: 1px;
         border-color: Theme.border-strong;
         clip: true;
+        // DESIGN §2.6 dialog shadow `0 16px 50px rgba(0,0,0,.6)` — a structural
+        // shadow color (like the filmstrip dot-ring), not a Theme-token duplicate.
+        drop-shadow-offset-y: 16px;
+        drop-shadow-blur: 50px;
+        drop-shadow-color: #00000099;
 
         // ---- 2b: gather + preview + confirm ----
         if !root.apply-running: VerticalLayout {

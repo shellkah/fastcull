@@ -85,7 +85,6 @@ pub fn reattach(source: &Path, scanned: Vec<Shot>, prev: Option<Session>) -> Ses
 /// True iff `dest` resolves to the source ROOT itself (which is refused).
 /// A source subfolder is allowed. A not-yet-created dest can't be the existing root.
 // Consumed by Task 12's apply-destination picker; unit-tested here now.
-#[allow(dead_code)]
 pub fn dest_is_source_root(source: &Path, dest: &Path) -> bool {
     match (source.canonicalize(), dest.canonicalize()) {
         (Ok(s), Ok(d)) => s == d,
