@@ -11,6 +11,7 @@ pub mod histogram;
 pub mod model;
 pub mod persist;
 pub mod plan;
+pub mod raw;
 pub mod scan;
 pub mod xmp;
 
