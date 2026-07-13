@@ -33,7 +33,7 @@ pub enum InputContext {
 }
 
 /// One user intent. Model-mutating variants are executed by `apply_action`;
-/// UI-only variants (OpenTagEntry, ToggleZoom, CycleFilter, OpenApply, ForceSave,
+/// UI-only variants (OpenTagEntry, ToggleZoom, ToggleRawPreview, CycleFilter, OpenApply, ForceSave,
 /// ToggleHelp, ToggleFullscreen, ToggleFocus) are dispatched by the ui glue.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
@@ -44,6 +44,7 @@ pub enum Action {
     Undo,
     OpenTagEntry,
     ToggleZoom,
+    ToggleRawPreview, // r: sticky JPEG<->RAW display source for pairs (UI-only)
     CycleFilter,
     OpenApply,
     ForceSave,
@@ -94,6 +95,7 @@ pub fn key_to_action(key: Key, mods: Modifiers, ctx: InputContext) -> Option<Act
         Key::Char('u') | Key::Char('U') => Some(Action::Undo),
         Key::Char('t') | Key::Char('T') => Some(Action::OpenTagEntry),
         Key::Char('z') | Key::Char('Z') => Some(Action::ToggleZoom),
+        Key::Char('r') | Key::Char('R') => Some(Action::ToggleRawPreview),
         Key::Char('f') | Key::Char('F') => Some(Action::CycleFilter),
         Key::Char('a') | Key::Char('A') => Some(Action::OpenApply),
         Key::Char('?') => Some(Action::ToggleHelp),
@@ -357,6 +359,23 @@ mod key_tests {
     fn help_context_is_inert() {
         assert_eq!(key_to_action(Key::Char('1'), m(), InputContext::Help), None);
     }
+
+    #[test]
+    fn r_key_toggles_raw_preview_in_loupe() {
+        assert_eq!(
+            key_to_action(Key::Char('r'), m(), LOUPE),
+            Some(Action::ToggleRawPreview)
+        );
+        assert_eq!(
+            key_to_action(Key::Char('R'), m(), LOUPE),
+            Some(Action::ToggleRawPreview)
+        );
+        // Inert while a modal owns the keyboard.
+        assert_eq!(
+            key_to_action(Key::Char('r'), m(), InputContext::TagEntry),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +582,7 @@ pub fn apply_action(action: Action, session: &mut Session, auto_advance: bool, f
         // UI-only — the ui glue handles these; no model mutation here.
         Action::OpenTagEntry
         | Action::ToggleZoom
+        | Action::ToggleRawPreview
         | Action::CycleFilter
         | Action::OpenApply
         | Action::ForceSave
@@ -725,5 +745,13 @@ mod action_tests {
             s.decision(3).visited,
             "landed shot should be marked visited"
         );
+    }
+
+    #[test]
+    fn toggle_raw_preview_does_not_mutate_model() {
+        let mut s = mk_session(&[None, None]);
+        apply_action(Action::ToggleRawPreview, &mut s, true, Filter::All);
+        assert_eq!(s.current, 0);
+        assert_eq!(s.decision(0), &Decision::default());
     }
 }
