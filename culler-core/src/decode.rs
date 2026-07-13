@@ -237,17 +237,23 @@ fn read_orientation(data: &[u8]) -> u16 {
 /// JPEG -> `Decode(msg)`. Never panics on bad input.
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
-    if !is_jpeg(&data) {
+    // The JPEG bytes to decode: the file itself if it's a JPEG, else a RAW's
+    // embedded JPEG preview (Fuji RAF today). Neither branch copies.
+    let jpeg: &[u8] = if is_jpeg(&data) {
+        &data
+    } else if let Some(slice) = crate::raw::embedded_jpeg(&data) {
+        slice
+    } else {
         return Err(DecodeError::Unsupported);
-    }
-    let orientation = read_orientation(&data);
+    };
+    let orientation = read_orientation(jpeg);
     let decoded = match target {
-        TargetSize::Full => decompress_scaled(&data, 1)?,
+        TargetSize::Full => decompress_scaled(jpeg, 1)?,
         TargetSize::Scaled(n) => match n {
-            1 | 2 | 4 | 8 => decompress_scaled(&data, n)?,
+            1 | 2 | 4 | 8 => decompress_scaled(jpeg, n)?,
             _ => return Err(DecodeError::Decode(format!("unsupported scale 1/{n}"))),
         },
-        TargetSize::Fit(w, h) => decode_fit(&data, w, h, orientation)?,
+        TargetSize::Fit(w, h) => decode_fit(jpeg, w, h, orientation)?,
     };
     let (rgba, w, h) = apply_orientation(decoded.rgba, decoded.w, decoded.h, orientation);
     Ok(DecodedImage { w, h, rgba })
@@ -258,13 +264,37 @@ fn is_jpeg(data: &[u8]) -> bool {
     data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
 }
 
-/// Extract the embedded EXIF thumbnail (fast filmstrip first paint), oriented like the
-/// primary image. Returns `None` if absent, unreadable, or the thumbnail won't decode.
+/// Extract the embedded EXIF thumbnail (fast filmstrip first paint), oriented
+/// like the primary image. For a previewable RAW (Fuji RAF), the EXIF+thumbnail
+/// live inside the embedded JPEG (kamadak-exif can't parse the RAF container),
+/// so extract that first. Returns `None` if absent, unreadable, or undecodable.
 pub fn embedded_thumbnail(path: &Path) -> Option<DecodedImage> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+    let is_raw_preview = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+        .is_some_and(crate::raw::preview_supported);
 
+    if is_raw_preview {
+        // RAF: read the file, pull the embedded JPEG, read its EXIF from memory.
+        let data = std::fs::read(path).ok()?;
+        let jpeg = crate::raw::embedded_jpeg(&data)?;
+        let mut cursor = std::io::Cursor::new(jpeg);
+        let exif = exif::Reader::new().read_from_container(&mut cursor).ok()?;
+        thumbnail_from_exif(&exif)
+    } else {
+        // JPEG: stream the EXIF straight from the file (partial read, no full load).
+        let file = std::fs::File::open(path).ok()?;
+        let mut reader = std::io::BufReader::new(file);
+        let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+        thumbnail_from_exif(&exif)
+    }
+}
+
+/// The embedded IFD1 JPEG thumbnail from an already-parsed `Exif`, decoded and
+/// EXIF-oriented. Shared by the JPEG and RAF paths of `embedded_thumbnail`.
+fn thumbnail_from_exif(exif: &exif::Exif) -> Option<DecodedImage> {
     let offset = exif
         .get_field(exif::Tag::JPEGInterchangeFormat, exif::In::THUMBNAIL)?
         .value
@@ -273,16 +303,13 @@ pub fn embedded_thumbnail(path: &Path) -> Option<DecodedImage> {
         .get_field(exif::Tag::JPEGInterchangeFormatLength, exif::In::THUMBNAIL)?
         .value
         .get_uint(0)? as usize;
-
-    // Thumbnail offsets are relative to the TIFF buffer returned by `Exif::buf()`.
     let end = offset.checked_add(length)?;
     let thumb = exif.buf().get(offset..end)?;
     if !is_jpeg(thumb) {
         return None;
     }
-
     let decoded = decompress_scaled(thumb, 1).ok()?;
-    let orientation = orientation_from(&exif);
+    let orientation = orientation_from(exif);
     let (rgba, w, h) = apply_orientation(decoded.rgba, decoded.w, decoded.h, orientation);
     Some(DecodedImage { w, h, rgba })
 }
@@ -1017,5 +1044,58 @@ mod tests {
             "Fit(30, 60) on the oriented 80x120 frame must scale by 0.375 -> 30x45"
         );
         assert_eq!(img.rgba.len(), 30 * 45 * 4);
+    }
+
+    /// Wrap JPEG bytes in a minimal Fuji RAF container (magic + offset/length @84/88).
+    fn wrap_raf(jpeg: &[u8]) -> Vec<u8> {
+        let jpeg_off = 128usize;
+        let mut raf = Vec::new();
+        raf.extend_from_slice(b"FUJIFILMCCD-RAW ");
+        raf.resize(jpeg_off, 0);
+        raf[84..88].copy_from_slice(&(jpeg_off as u32).to_be_bytes());
+        raf[88..92].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        raf.extend_from_slice(jpeg);
+        raf
+    }
+
+    #[test]
+    fn decode_reads_raf_embedded_preview() {
+        let jpeg = synth_jpeg(64, 48);
+        let raf = wrap_raf(&jpeg);
+        let (_dir, path) = write_temp_named("shot.raf", &raf);
+
+        let full = decode(&path, TargetSize::Full).expect("decode RAF Full");
+        assert_eq!((full.w, full.h), (64, 48));
+        assert!(full.rgba.chunks_exact(4).all(|p| p[3] == 255));
+
+        let fit = decode(&path, TargetSize::Fit(32, 32)).expect("decode RAF Fit");
+        assert_eq!((fit.w, fit.h), (32, 24));
+
+        let half = decode(&path, TargetSize::Scaled(2)).expect("decode RAF 1/2");
+        assert_eq!((half.w, half.h), (32, 24));
+    }
+
+    #[test]
+    fn decode_raf_with_no_embedded_jpeg_is_unsupported() {
+        // A RAF whose preview pointer is zero-length -> embedded_jpeg None -> Unsupported.
+        let jpeg = synth_jpeg(16, 16);
+        let mut raf = wrap_raf(&jpeg);
+        raf[88..92].copy_from_slice(&0u32.to_be_bytes());
+        let (_dir, path) = write_temp_named("empty.raf", &raf);
+        assert!(matches!(decode(&path, TargetSize::Full), Err(DecodeError::Unsupported)));
+    }
+
+    #[test]
+    fn decode_bomb_guard_fires_through_raf() {
+        // The dimension guard must protect the RAF path too: a patched embedded JPEG
+        // header declaring 65500x65500 must be rejected before allocation.
+        let jpeg = patch_sof0_dims(synth_jpeg(64, 48), 65500, 65500);
+        let raf = wrap_raf(&jpeg);
+        let (_dir, path) = write_temp_named("bomb.raf", &raf);
+        let result = decode(&path, TargetSize::Full);
+        assert!(matches!(result, Err(DecodeError::Decode(_))));
+        if let Err(DecodeError::Decode(msg)) = result {
+            assert!(msg.contains("decode limit"), "guard should fire: {msg}");
+        }
     }
 }
