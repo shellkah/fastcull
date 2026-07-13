@@ -232,9 +232,10 @@ fn read_orientation(data: &[u8]) -> u16 {
     }
 }
 
-/// Decode `path`'s JPEG at/around `target`, apply EXIF orientation, return straight RGBA8.
-/// Errors: unreadable file -> `Io`; non-JPEG bytes -> `Unsupported`; corrupt/undecodable
-/// JPEG -> `Decode(msg)`. Never panics on bad input.
+/// Decode `path` at/around `target`, apply EXIF orientation, return straight RGBA8.
+/// Accepts a JPEG or a previewable RAW (Fuji RAF today, via its embedded JPEG preview).
+/// Errors: unreadable file -> `Io`; bytes that are neither a JPEG nor a previewable
+/// RAW -> `Unsupported`; corrupt/undecodable JPEG -> `Decode(msg)`. Never panics on bad input.
 pub fn decode(path: &Path, target: TargetSize) -> Result<DecodedImage, DecodeError> {
     let data = std::fs::read(path).map_err(DecodeError::Io)?;
     // The JPEG bytes to decode: the file itself if it's a JPEG, else a RAW's
@@ -304,6 +305,7 @@ fn thumbnail_from_exif(exif: &exif::Exif) -> Option<DecodedImage> {
         .value
         .get_uint(0)? as usize;
     let end = offset.checked_add(length)?;
+    // Thumbnail offsets are relative to the TIFF buffer returned by `Exif::buf()`.
     let thumb = exif.buf().get(offset..end)?;
     if !is_jpeg(thumb) {
         return None;
