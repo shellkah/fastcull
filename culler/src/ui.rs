@@ -7,6 +7,90 @@ use culler_core::model::{Decision, Session};
 use slint::{ModelRc, VecModel};
 use std::rc::Rc;
 
+/// What the loupe is actually displaying for a shot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Showing {
+    Jpeg,
+    Raw,
+}
+
+/// True if the shot's RAW sibling has an embedded-preview extractor (Fuji RAF).
+fn raw_previewable(shot: &culler_core::model::Shot) -> bool {
+    shot.raw
+        .as_deref()
+        .and_then(|r| r.extension())
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+        .is_some_and(culler_core::raw::preview_supported)
+}
+
+/// Resolve which source the loupe shows for `shot` under the sticky prefer-RAW
+/// flag: a JPEG-less shot always shows RAW; a JPEG-only shot always JPEG; a pair
+/// shows RAW only when `prefer_raw` AND the RAW is previewable.
+pub fn showing(shot: &culler_core::model::Shot, prefer_raw: bool) -> Showing {
+    if shot.jpeg.is_none() || (prefer_raw && raw_previewable(shot)) {
+        Showing::Raw
+    } else {
+        Showing::Jpeg
+    }
+}
+
+/// The path the loupe should decode for `shot` under `prefer_raw`.
+pub fn decode_path(shot: &culler_core::model::Shot, prefer_raw: bool) -> &std::path::Path {
+    match showing(shot, prefer_raw) {
+        Showing::Raw => shot.raw.as_deref().unwrap_or_else(|| shot.display_path()),
+        Showing::Jpeg => shot.jpeg.as_deref().unwrap_or_else(|| shot.display_path()),
+    }
+}
+
+/// The outcome of pressing `r` on `shot`, given the prefer-RAW flag BEFORE the press.
+pub struct RawKeyOutcome {
+    /// Whether the caller should flip the sticky prefer-RAW flag.
+    pub flip: bool,
+    /// The transient toast to show (always non-empty).
+    pub toast: String,
+}
+
+/// Decide what pressing `r` does on `shot`. Flips only for a previewable pair;
+/// otherwise it's a no-op with an explanatory toast.
+pub fn on_raw_key(shot: &culler_core::model::Shot, prefer_raw_before: bool) -> RawKeyOutcome {
+    if shot.jpeg.is_none() {
+        RawKeyOutcome {
+            flip: false,
+            toast: "RAW only — no JPEG to switch to".into(),
+        }
+    } else if shot.raw.is_none() {
+        RawKeyOutcome {
+            flip: false,
+            toast: "no RAW for this shot".into(),
+        }
+    } else if !raw_previewable(shot) {
+        let ext = shot
+            .raw
+            .as_deref()
+            .and_then(|r| r.extension())
+            .and_then(|e| e.to_str())
+            .unwrap_or("raw")
+            .to_ascii_lowercase();
+        RawKeyOutcome {
+            flip: false,
+            toast: format!("RAW preview unsupported (.{ext})"),
+        }
+    } else {
+        let showing_raw_after = !prefer_raw_before;
+        let toast = if showing_raw_after {
+            "showing RAW"
+        } else {
+            "showing JPEG"
+        };
+        RawKeyOutcome {
+            flip: true,
+            toast: toast.into(),
+        }
+    }
+}
+
 /// Filmstrip color bucket: 0 rest/grey, 1 keep/green, 2 pick/blue, 3 best/gold, 4 reject/red.
 pub fn tier_color_code(d: &Decision) -> i32 {
     match d.tier {
@@ -158,6 +242,10 @@ pub struct HudText {
     pub filename: String,
     /// Whether the current shot has a RAW sibling (drives the top-left RAW badge).
     pub has_raw: bool,
+    /// Whether the current shot has NO JPEG (drives the amber "RAW ONLY" badge).
+    pub raw_only: bool,
+    /// Whether the loupe is currently showing the RAW (drives the accent badge).
+    pub showing_raw: bool,
     /// "{current+1}/{len}", 1-based for display; "0/0" when the session has no shots.
     pub position: String,
     /// EXIF line "1/250s · ƒ2.8 · ISO 400 · 85mm" (DESIGN §4 1b); empty when the
@@ -165,7 +253,7 @@ pub struct HudText {
     pub exif: String,
 }
 
-pub fn hud_text(session: &Session, filter: Filter) -> HudText {
+pub fn hud_text(session: &Session, filter: Filter, show_raw: bool) -> HudText {
     let d = session.decision(session.current);
     let tier = match d.tier {
         None => "Rest".to_string(),
@@ -189,12 +277,26 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
     }
     .to_string();
     let current_shot = session.shots.get(session.current);
-    let filename = current_shot
-        .map(|s| s.display_path())
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let has_raw = current_shot.is_some_and(|s| s.raw.is_some());
+    let (filename, has_raw, raw_only, showing_raw) = match current_shot {
+        Some(s) => {
+            let showing = showing(s, show_raw);
+            let shown = match showing {
+                Showing::Raw => s.raw.as_deref().unwrap_or_else(|| s.display_path()),
+                Showing::Jpeg => s.jpeg.as_deref().unwrap_or_else(|| s.display_path()),
+            };
+            let filename = shown
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (
+                filename,
+                s.raw.is_some(),
+                s.is_raw_only(),
+                matches!(showing, Showing::Raw),
+            )
+        }
+        None => (String::new(), false, false, false),
+    };
     let position = if session.shots.is_empty() {
         "0/0".to_string()
     } else {
@@ -212,6 +314,8 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
         filter_label,
         filename,
         has_raw,
+        raw_only,
+        showing_raw,
         position,
         exif,
     }
@@ -350,7 +454,7 @@ mod hud_tests {
     #[test]
     fn hud_text_reports_tier_counts_and_progress() {
         let s = mk(&[Some(Tier::Keep), Some(Tier::Reject), None]);
-        let h = hud_text(&s, Filter::All);
+        let h = hud_text(&s, Filter::All, false);
         assert_eq!(h.tier, "Keep"); // current @0
         assert!(h.counts.contains("keep 1"));
         assert!(h.counts.contains("reject 1"));
@@ -365,7 +469,7 @@ mod hud_tests {
     fn hud_text_shows_rest_for_undecided_current() {
         let mut s = mk(&[None, None]);
         s.current = 0;
-        let h = hud_text(&s, Filter::Keep);
+        let h = hud_text(&s, Filter::Keep, false);
         assert_eq!(h.tier, "Rest");
         assert_eq!(h.filter_label, "filter: >=Keep");
     }
@@ -380,9 +484,121 @@ mod hud_tests {
             pending_apply: None,
             undo: Vec::new(),
         };
-        let h = hud_text(&s, Filter::All);
+        let h = hud_text(&s, Filter::All, false);
         assert_eq!(h.position, "0/0");
         assert_eq!(h.tier, "Rest");
+    }
+}
+
+#[cfg(test)]
+mod raw_source_tests {
+    use super::*;
+    use culler_core::model::{CaptureTime, Shot};
+
+    fn shot(jpeg: Option<&str>, raw: Option<&str>) -> Shot {
+        Shot {
+            stem: "S".into(),
+            jpeg: jpeg.map(Into::into),
+            raw: raw.map(Into::into),
+            sidecar: None,
+            capture: CaptureTime::default(),
+            exif: None,
+        }
+    }
+
+    #[test]
+    fn showing_resolves_every_case() {
+        // JPEG-only: always JPEG.
+        assert_eq!(showing(&shot(Some("/s/S.JPG"), None), true), Showing::Jpeg);
+        // RAF-only: always RAW.
+        assert_eq!(showing(&shot(None, Some("/s/S.RAF")), false), Showing::Raw);
+        // RAF pair: follows prefer_raw.
+        assert_eq!(
+            showing(&shot(Some("/s/S.JPG"), Some("/s/S.RAF")), false),
+            Showing::Jpeg
+        );
+        assert_eq!(
+            showing(&shot(Some("/s/S.JPG"), Some("/s/S.RAF")), true),
+            Showing::Raw
+        );
+        // CR3 pair: not previewable, stays JPEG even when prefer_raw.
+        assert_eq!(
+            showing(&shot(Some("/s/S.JPG"), Some("/s/S.CR3")), true),
+            Showing::Jpeg
+        );
+    }
+
+    #[test]
+    fn decode_path_matches_showing() {
+        let pair = shot(Some("/s/S.JPG"), Some("/s/S.RAF"));
+        assert_eq!(decode_path(&pair, false), std::path::Path::new("/s/S.JPG"));
+        assert_eq!(decode_path(&pair, true), std::path::Path::new("/s/S.RAF"));
+        assert_eq!(
+            decode_path(&shot(None, Some("/s/S.RAF")), false),
+            std::path::Path::new("/s/S.RAF")
+        );
+    }
+
+    #[test]
+    fn on_raw_key_covers_four_cases() {
+        // Previewable pair: flip; toast names the post-flip state.
+        let o = on_raw_key(&shot(Some("/s/S.JPG"), Some("/s/S.RAF")), false);
+        assert!(o.flip);
+        assert_eq!(o.toast, "showing RAW");
+        let o2 = on_raw_key(&shot(Some("/s/S.JPG"), Some("/s/S.RAF")), true);
+        assert!(o2.flip);
+        assert_eq!(o2.toast, "showing JPEG");
+        // Non-previewable RAW in a pair: no flip, names the extension.
+        let o3 = on_raw_key(&shot(Some("/s/S.JPG"), Some("/s/S.CR3")), false);
+        assert!(!o3.flip);
+        assert_eq!(o3.toast, "RAW preview unsupported (.cr3)");
+        // JPEG-only: no flip.
+        let o4 = on_raw_key(&shot(Some("/s/S.JPG"), None), false);
+        assert!(!o4.flip);
+        assert_eq!(o4.toast, "no RAW for this shot");
+        // RAW-only: no flip.
+        let o5 = on_raw_key(&shot(None, Some("/s/S.RAF")), false);
+        assert!(!o5.flip);
+        assert_eq!(o5.toast, "RAW only — no JPEG to switch to");
+    }
+
+    fn one_shot_session(s: Shot) -> Session {
+        Session {
+            source_dir: "/s".into(),
+            shots: vec![s],
+            decisions: std::collections::HashMap::new(),
+            current: 0,
+            pending_apply: None,
+            undo: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hud_text_reports_raw_state_and_shown_filename() {
+        // RAF-only: raw_only + showing_raw, filename is the .RAF.
+        let h = hud_text(
+            &one_shot_session(shot(None, Some("/s/DSCF1.RAF"))),
+            Filter::All,
+            false,
+        );
+        assert!(h.has_raw && h.raw_only && h.showing_raw);
+        assert_eq!(h.filename, "DSCF1.RAF");
+        // Pair, prefer JPEG: showing JPEG, filename the .JPG.
+        let hp = hud_text(
+            &one_shot_session(shot(Some("/s/DSCF2.JPG"), Some("/s/DSCF2.RAF"))),
+            Filter::All,
+            false,
+        );
+        assert!(hp.has_raw && !hp.raw_only && !hp.showing_raw);
+        assert_eq!(hp.filename, "DSCF2.JPG");
+        // Same pair, prefer RAW: showing RAW, filename the .RAF.
+        let hr = hud_text(
+            &one_shot_session(shot(Some("/s/DSCF2.JPG"), Some("/s/DSCF2.RAF"))),
+            Filter::All,
+            true,
+        );
+        assert!(hr.showing_raw);
+        assert_eq!(hr.filename, "DSCF2.RAF");
     }
 }
 

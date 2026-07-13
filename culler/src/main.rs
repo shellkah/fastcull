@@ -289,7 +289,7 @@ fn build_culling_ui(
         move || {
             let Some(app) = app_w.upgrade() else { return };
             let s = session.borrow();
-            let h = ui::hud_text(&s, *filter.borrow());
+            let h = ui::hud_text(&s, *filter.borrow(), false);
             app.set_hud_tier(h.tier.into());
             app.set_hud_tags(h.tags.into());
             app.set_hud_counts(h.counts.into());
