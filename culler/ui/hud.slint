@@ -47,6 +47,8 @@ export global TierCode {
 export component HudTopLeft inherits Rectangle {
     in property <string> filename;
     in property <bool> has-raw;
+    in property <bool> showing-raw: false;
+    in property <bool> raw-only: false;
     in property <string> position;
     background: transparent;
 
@@ -72,19 +74,27 @@ export component HudTopLeft inherits Rectangle {
                 color: Theme.text;
                 vertical-alignment: center;
             }
-            if root.has-raw: Rectangle {
+            // RAW badge — three states:
+            //   raw-only    → amber "RAW ONLY" (no JPEG exists; standing warning)
+            //   showing-raw → accent-filled "RAW" (pair currently viewing the RAW)
+            //   has-raw     → dim outlined "RAW" (a RAW sibling exists, JPEG on screen)
+            if root.has-raw || root.raw-only: Rectangle {
                 border-radius: Theme.r-sm;
                 border-width: 1px;
-                // DESIGN §2.3 RAW-badge border — not a Theme ramp value, literal by spec.
-                border-color: #45484e;
+                border-color: root.raw-only
+                    ? Theme.accent-warn
+                    : (root.showing-raw ? Theme.accent-primary : #45484e);
+                background: root.raw-only
+                    ? Theme.accent-warn.with-alpha(0.16)
+                    : (root.showing-raw ? Theme.accent-primary.with-alpha(0.22) : transparent);
                 HorizontalLayout {
                     padding: 3px;
                     Text {
-                        text: "RAW";
+                        text: root.raw-only ? "RAW ONLY" : "RAW";
                         font-family: Theme.font-mono;
                         font-weight: 600;
                         font-size: 9px;
-                        color: Theme.text;
+                        color: root.raw-only ? Theme.accent-warn : Theme.text;
                         vertical-alignment: center;
                     }
                 }

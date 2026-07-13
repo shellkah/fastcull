@@ -143,6 +143,8 @@ fn build_culling_ui(
     let session = Rc::new(RefCell::new(session));
     let filter = Rc::new(RefCell::new(Filter::All));
     let zoom = Rc::new(RefCell::new(ui::ZoomState::default()));
+    // Sticky "prefer RAW" display source (r): persists across navigation like zoom.
+    let show_raw = Rc::new(std::cell::Cell::new(false));
     let cache = Arc::new(Mutex::new(pipeline::LruCache::new(CACHE_BUDGET)));
     let full_slot = Arc::new(Mutex::new(FullSlot::default()));
     // The shot the loupe is showing — the delivery-time freshness check reads
@@ -224,6 +226,7 @@ fn build_culling_ui(
     let request_current = {
         let session = session.clone();
         let zoom = zoom.clone();
+        let show_raw = show_raw.clone();
         let cache = cache.clone();
         let full_slot = full_slot.clone();
         let pipeline = pipeline.clone();
@@ -258,7 +261,7 @@ fn build_culling_ui(
             // Request the exact target for current.
             pipeline.enqueue(
                 cur,
-                s.shots[cur].display_path().to_path_buf(),
+                ui::decode_path(&s.shots[cur], show_raw.get()).to_path_buf(),
                 z.target(fw, fh),
                 false,
             );
@@ -284,12 +287,13 @@ fn build_culling_ui(
     let refresh_view = {
         let session = session.clone();
         let filter = filter.clone();
+        let show_raw = show_raw.clone();
         let cache = cache.clone();
         let app_w = app.as_weak();
         move || {
             let Some(app) = app_w.upgrade() else { return };
             let s = session.borrow();
-            let h = ui::hud_text(&s, *filter.borrow(), false);
+            let h = ui::hud_text(&s, *filter.borrow(), show_raw.get());
             app.set_hud_tier(h.tier.into());
             app.set_hud_tags(h.tags.into());
             app.set_hud_counts(h.counts.into());
@@ -297,6 +301,8 @@ fn build_culling_ui(
             app.set_filter_label(h.filter_label.into());
             app.set_hud_filename(h.filename.into());
             app.set_hud_has_raw(h.has_raw);
+            app.set_hud_showing_raw(h.showing_raw);
+            app.set_hud_raw_only(h.raw_only);
             app.set_hud_position(h.position.into());
             app.set_hud_exif(h.exif.into());
             let c = s.counts();
@@ -371,6 +377,7 @@ fn build_culling_ui(
         let session = session.clone();
         let filter = filter.clone();
         let zoom = zoom.clone();
+        let show_raw = show_raw.clone();
         let request_current = request_current.clone();
         let refresh_view = refresh_view.clone();
         let app_w = app.as_weak();
@@ -480,6 +487,22 @@ fn build_culling_ui(
                     zoom.borrow_mut().toggle();
                     app.set_zoomed(zoom.borrow().zoomed);
                     request_current();
+                }
+                Action::ToggleRawPreview => {
+                    let outcome = {
+                        let s = session.borrow();
+                        s.shots
+                            .get(s.current)
+                            .map(|shot| ui::on_raw_key(shot, show_raw.get()))
+                    };
+                    if let Some(o) = outcome {
+                        if o.flip {
+                            show_raw.set(!show_raw.get());
+                            request_current(); // re-decode current at the new source
+                            refresh_view(); // repaint the badge + filename now
+                        }
+                        show_toast(o.toast, -1);
+                    }
                 }
                 Action::OpenTagEntry => {
                     // Prefill existing tags, then leave the caret on a fresh empty

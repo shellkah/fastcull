@@ -45,6 +45,8 @@ export component AppWindow inherits Window {
     in property <string> filter-label: "";
     in property <string> hud-filename: "";
     in property <bool> hud-has-raw: false;
+    in property <bool> hud-showing-raw: false;
+    in property <bool> hud-raw-only: false;
     in property <string> hud-position: "0/0";
     // Per-tier counts pill ints backing HudTopRight's dots (task-9 amendment 5); the
     // formatted `hud-counts` string above stays for parity with the tested HudText
@@ -184,6 +186,8 @@ export component AppWindow inherits Window {
                     visible: !root.focus-mode;
                     filename: root.hud-filename;
                     has-raw: root.hud-has-raw;
+                    showing-raw: root.hud-showing-raw;
+                    raw-only: root.hud-raw-only;
                     position: root.hud-position;
                 }
                 HudTopRight {
