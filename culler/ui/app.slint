@@ -2,8 +2,8 @@ import { Theme } from "theme.slint";
 import { StartupWindow } from "startup2a.slint";
 import { Loupe } from "loupe.slint";
 import { Filmstrip } from "filmstrip.slint";
-import { FilmstripItem, ApplyPreviewUi } from "globals.slint";
-import { HudTopLeft, HudTopRight, HudBottomLeft, TagEntry } from "hud.slint";
+import { FilmstripItem, ApplyPreviewUi, TagSuggestion } from "globals.slint";
+import { HudTopLeft, HudTopRight, HudBottomLeft, TagEntry, HudHelpHint, HudFocusHint } from "hud.slint";
 import { ApplyDialog } from "applydialog.slint";
 import { KeySheet } from "keysheet.slint";
 import { Toast } from "toast.slint";
@@ -19,7 +19,10 @@ export { StartupWindow }
 // HUD overlays + tag entry (Task 9), wired to the pure input/pipeline glue in
 // culler/src/ui.rs (Task 11 assembles the event loop). DESIGN.md §4 screens 1b/2f.
 export component AppWindow inherits Window {
-    title: "FastCull";
+    title: "fastcull";
+    // Window/taskbar icon — same "3a" keycap mark as the startup screen
+    // (culler/ui/logo-3a.svg). See startup2a.slint for the X11/Wayland note.
+    icon: @image-url("logo-3a.svg");
     preferred-width: 1280px;
     preferred-height: 820px;
     background: Theme.bg;
@@ -28,6 +31,9 @@ export component AppWindow inherits Window {
     in-out property <bool> zoomed;
     in-out property <length> pan-x;
     in-out property <length> pan-y;
+    // Focus/zen mode (Enter): hide every HUD panel + the filmstrip, leaving only
+    // the photo and a faint exit hint. Toggled from main.rs `Action::ToggleFocus`.
+    in-out property <bool> focus-mode: false;
     in property <[FilmstripItem]> film-items;
     in property <int> film-current;
 
@@ -48,14 +54,22 @@ export component AppWindow inherits Window {
     in property <int> count-keep: 0;
     in property <int> count-rest: 0;
     in property <int> count-reject: 0;
+    // Bottom-left panel additions (DESIGN §4 1b, were §6 Defer): the EXIF line
+    // (`ui::hud_text`) + 30 normalized luma-bar heights (`culler_core::histogram`).
+    in property <string> hud-exif: "";
+    in property <[float]> histogram;
 
     // Tag entry overlay (Task 9; Task 11 wires open/close + suggest_tags on `T`/Esc/Enter).
     in property <bool> tag-open: false;
     in-out property <string> tag-text;
-    in property <[string]> tag-suggestions;
+    in property <[TagSuggestion]> tag-suggestions;
+    // Highlighted suggestion for keyboard nav (Tab/⇧Tab/↑/↓); -1 = none.
+    in-out property <int> tag-active-index: -1;
     callback tag-changed(string);
     callback tag-committed(string);
     callback tag-cancelled();
+    // Accept a suggestion row into the current tag segment (keeps entry open).
+    callback tag-accept-suggestion(int);
 
     // Keymap cheat-sheet overlay (Task 9b, DESIGN.md §4 2e), bound to `?`/Esc.
     // Static content lives entirely in keysheet.slint; main.rs only flips this.
@@ -142,6 +156,8 @@ export component AppWindow inherits Window {
             if (event.text == Key.Backspace) { return root.key-pressed("Backspace", event.modifiers.control) ? accept : reject; }
             if (event.text == Key.Tab) { return root.key-pressed("Tab", event.modifiers.control) ? accept : reject; }
             if (event.text == Key.Escape) { return root.key-pressed("Escape", event.modifiers.control) ? accept : reject; }
+            if (event.text == Key.Return) { return root.key-pressed("Return", event.modifiers.control) ? accept : reject; }
+            if (event.text == Key.F11) { return root.key-pressed("F11", event.modifiers.control) ? accept : reject; }
             return root.key-pressed(event.text, event.modifiers.control) ? accept : reject;
         }
         VerticalLayout {
@@ -165,11 +181,13 @@ export component AppWindow inherits Window {
                     pan-y <=> root.pan-y;
                 }
                 HudTopLeft {
+                    visible: !root.focus-mode;
                     filename: root.hud-filename;
                     has-raw: root.hud-has-raw;
                     position: root.hud-position;
                 }
                 HudTopRight {
+                    visible: !root.focus-mode;
                     tier: root.hud-tier;
                     count-best: root.count-best;
                     count-pick: root.count-pick;
@@ -178,24 +196,42 @@ export component AppWindow inherits Window {
                     count-reject: root.count-reject;
                 }
                 HudBottomLeft {
+                    visible: !root.focus-mode;
                     tags: root.hud-tags;
                     filter-label: root.filter-label;
                     progress: root.hud-progress;
+                    exif: root.hud-exif;
+                    histogram: root.histogram;
                 }
+                // Discoverability hint for `?` (DESIGN §4 1b bottom-right);
+                // hidden in focus mode with the rest of the chrome.
+                HudHelpHint {
+                    visible: !root.focus-mode;
+                }
+                // Focus mode's only chrome: the "press enter to exit" reminder.
+                if root.focus-mode: HudFocusHint { }
                 if root.tag-open: TagEntry {
                     text <=> root.tag-text;
                     suggestions: root.tag-suggestions;
+                    active-index <=> root.tag-active-index;
                     changed(t) => { root.tag-changed(t); }
                     committed(t) => { root.tag-committed(t); }
                     cancelled => { root.tag-cancelled(); }
+                    accept-suggestion(i) => { root.tag-accept-suggestion(i); }
                 }
                 if root.toast-text != "": Toast {
                     text: root.toast-text;
                     code: root.toast-code;
                 }
             }
-            Filmstrip {
-                height: 130px;
+            // The filmstrip is a VerticalLayout ROW, not a floating overlay, so
+            // `visible:false` would leave its band empty — gate it with `if` so
+            // focus mode reclaims the space and the loupe fills the whole window.
+            // Height trimmed 130->72px: the tile row is only ~70px tall (56px
+            // tiles + 2x7px padding), so 130px left a ~60px dead band at the
+            // bottom (the reported "dead space below the filmstrip").
+            if !root.focus-mode: Filmstrip {
+                height: 72px;
                 items: root.film-items;
                 current: root.film-current;
                 clicked(i) => { root.film-clicked(i); }

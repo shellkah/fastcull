@@ -5,7 +5,7 @@
 //! cullable shots (they are surfaced by `scan_report`, added in a later task).
 //! Zero GUI dependencies.
 
-use crate::model::{CaptureTime, JPEG_EXTS, RAW_EXTS, Shot};
+use crate::model::{CaptureTime, ExifSummary, JPEG_EXTS, RAW_EXTS, Shot};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -107,13 +107,14 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
     for (stem, group) in groups {
         match group.jpeg {
             Some(jpeg) => {
-                let capture = read_capture_time(&jpeg);
+                let (capture, exif) = read_exif_data(&jpeg);
                 shots.push(Shot {
                     stem,
                     jpeg,
                     raw: group.raw,
                     sidecar: group.sidecar,
                     capture,
+                    exif,
                 });
             }
             None => {
@@ -178,22 +179,81 @@ fn sidecar_stem(path: &Path) -> String {
     inner.to_string()
 }
 
-/// Read `DateTimeOriginal` / `SubSecTimeOriginal` from a JPEG's EXIF header.
-/// Undecodable or EXIF-less files never fail the scan — they yield a default
-/// (empty) `CaptureTime`, so such shots simply sort after all dated ones.
-fn read_capture_time(jpeg: &Path) -> CaptureTime {
+/// Read `DateTimeOriginal` / `SubSecTimeOriginal` (capture time) and the HUD's
+/// exposure/aperture/ISO/focal-length summary from a JPEG's EXIF header in a
+/// single parse (`exif::Reader` runs once; both readers share the resulting
+/// `exif::Exif`). Undecodable or EXIF-less files never fail the scan — they
+/// yield a default (empty) `CaptureTime` and `None` exif summary, so such
+/// shots simply sort after all dated ones and show no HUD line.
+fn read_exif_data(jpeg: &Path) -> (CaptureTime, Option<ExifSummary>) {
     let file = match std::fs::File::open(jpeg) {
         Ok(f) => f,
-        Err(_) => return CaptureTime::default(),
+        Err(_) => return (CaptureTime::default(), None),
     };
     let mut reader = std::io::BufReader::new(file);
     let exif = match exif::Reader::new().read_from_container(&mut reader) {
         Ok(e) => e,
-        Err(_) => return CaptureTime::default(),
+        Err(_) => return (CaptureTime::default(), None),
     };
     let datetime = ascii_field(&exif, exif::Tag::DateTimeOriginal);
     let subsec = ascii_field(&exif, exif::Tag::SubSecTimeOriginal).and_then(|s| parse_subsec(&s));
-    CaptureTime { datetime, subsec }
+    let capture = CaptureTime { datetime, subsec };
+    (capture, read_exif_summary(&exif))
+}
+
+/// Build the loupe HUD's `ExifSummary` from an already-parsed `exif::Exif`
+/// (shared with capture-time parsing above — no second file read/parse).
+/// `None` when none of the four tags parsed (e.g. a JPEG whose EXIF block
+/// carries no exposure data at all, or a JPEG with no EXIF, which never
+/// reaches this function in the first place). Never panics on a missing or
+/// oddly-typed tag — each field independently degrades to `None`.
+fn read_exif_summary(exif: &exif::Exif) -> Option<ExifSummary> {
+    let exposure = rational_field(exif, exif::Tag::ExposureTime);
+    let f_number = rational_field_f32(exif, exif::Tag::FNumber);
+    let iso = uint_field(exif, exif::Tag::PhotographicSensitivity);
+    let focal_length_mm = rational_field_f32(exif, exif::Tag::FocalLength);
+
+    if exposure.is_none() && f_number.is_none() && iso.is_none() && focal_length_mm.is_none() {
+        None
+    } else {
+        Some(ExifSummary {
+            exposure,
+            f_number,
+            iso,
+            focal_length_mm,
+        })
+    }
+}
+
+/// The first RATIONAL value of `tag` in the primary IFD, as the raw
+/// `(numerator, denominator)` pair. `None` when the tag is absent, not a
+/// `Value::Rational`, or the vector is empty.
+fn rational_field(exif: &exif::Exif, tag: exif::Tag) -> Option<(u32, u32)> {
+    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    match &field.value {
+        exif::Value::Rational(v) => v.first().map(|r| (r.num, r.denom)),
+        _ => None,
+    }
+}
+
+/// `rational_field` narrowed to `f32`, for tags the HUD renders as a decimal
+/// (FNumber, FocalLength). A zero denominator (an odd/malformed EXIF field)
+/// is treated as absent rather than dividing into an infinite or NaN value.
+fn rational_field_f32(exif: &exif::Exif, tag: exif::Tag) -> Option<f32> {
+    rational_field(exif, tag).and_then(|(num, den)| {
+        if den == 0 {
+            None
+        } else {
+            Some(num as f32 / den as f32)
+        }
+    })
+}
+
+/// The first unsigned-integer value (BYTE/SHORT/LONG) of `tag` in the primary
+/// IFD, widened to `u32`. `None` when the tag is absent or not one of those
+/// integer types (mirrors `decode::orientation_from`'s use of `get_uint`).
+fn uint_field(exif: &exif::Exif, tag: exif::Tag) -> Option<u32> {
+    exif.get_field(tag, exif::In::PRIMARY)?.value.get_uint(0)
 }
 
 /// EXIF SubSecTime* is a DECIMAL FRACTION digit string, not an integer:
@@ -621,6 +681,266 @@ mod tests {
         let shots = scan(&dir).unwrap();
         assert_eq!(shots.len(), 1);
         assert_eq!(shots[0].capture, CaptureTime::default());
+        // No EXIF at all -> no exif summary either.
+        assert_eq!(shots[0].exif, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- ExifSummary (exposure / f-number / ISO / focal length) ----
+
+    /// One Exif-IFD entry in TIFF wire format: `data.len()` must equal
+    /// `count * unit_size(type_code)`.
+    struct RawEntry {
+        tag: u16,
+        type_code: u16,
+        count: u32,
+        data: Vec<u8>,
+    }
+
+    fn ascii_entry(tag: u16, s: &str) -> RawEntry {
+        let mut data = s.as_bytes().to_vec();
+        data.push(0); // NUL-terminate
+        RawEntry {
+            tag,
+            type_code: 2, // ASCII
+            count: data.len() as u32,
+            data,
+        }
+    }
+
+    fn short_entry(tag: u16, v: u16) -> RawEntry {
+        RawEntry {
+            tag,
+            type_code: 3, // SHORT
+            count: 1,
+            data: v.to_be_bytes().to_vec(),
+        }
+    }
+
+    fn rational_entry(tag: u16, num: u32, denom: u32) -> RawEntry {
+        let mut data = num.to_be_bytes().to_vec();
+        data.extend_from_slice(&denom.to_be_bytes());
+        RawEntry {
+            tag,
+            type_code: 5, // RATIONAL
+            count: 1,
+            data,
+        }
+    }
+
+    /// Build a minimal big-endian TIFF/EXIF blob: IFD0 holds a single
+    /// `ExifIFDPointer` entry pointing at an Exif IFD containing `entries`
+    /// (caller supplies them in ascending tag order, matching a real
+    /// encoder — kamadak-exif itself does not require this on read, but this
+    /// keeps the fixture realistic). Entries whose data is `<= 4` bytes are
+    /// stored inline (left-justified, zero-padded) in the IFD entry itself,
+    /// exactly like the TIFF spec's Value/Offset field; larger entries
+    /// (RATIONAL's 8 bytes) are placed in an external block right after the
+    /// Exif IFD, with their offsets computed automatically — no hand-derived
+    /// magic numbers to keep in sync when the entry set changes.
+    fn build_tiff(entries: &[RawEntry]) -> Vec<u8> {
+        fn be16(v: u16) -> [u8; 2] {
+            v.to_be_bytes()
+        }
+        fn be32(v: u32) -> [u8; 4] {
+            v.to_be_bytes()
+        }
+
+        const IFD0_OFF: u32 = 8;
+        let exif_ifd_off: u32 = IFD0_OFF + 2 + 12 + 4; // IFD0: 1 entry, no next-IFD data
+        let exif_ifd_len: u32 = 2 + 12 * entries.len() as u32 + 4;
+        let external_start: u32 = exif_ifd_off + exif_ifd_len;
+
+        // First pass: assign every >4-byte entry an offset in the external block.
+        let mut external: Vec<u8> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::with_capacity(entries.len());
+        for e in entries {
+            if e.data.len() <= 4 {
+                offsets.push(0); // unused for inline entries
+            } else {
+                offsets.push(external_start + external.len() as u32);
+                external.extend_from_slice(&e.data);
+            }
+        }
+
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"MM"); // big-endian byte order
+        tiff.extend_from_slice(&be16(42)); // TIFF magic
+        tiff.extend_from_slice(&be32(IFD0_OFF));
+
+        // IFD0: one entry, ExifIFDPointer (0x8769, LONG) -> exif_ifd_off.
+        tiff.extend_from_slice(&be16(1));
+        tiff.extend_from_slice(&be16(0x8769));
+        tiff.extend_from_slice(&be16(4)); // LONG
+        tiff.extend_from_slice(&be32(1)); // count
+        tiff.extend_from_slice(&be32(exif_ifd_off));
+        tiff.extend_from_slice(&be32(0)); // no next IFD
+        assert_eq!(tiff.len() as u32, exif_ifd_off, "IFD0 layout drifted");
+
+        // Exif IFD.
+        tiff.extend_from_slice(&be16(entries.len() as u16));
+        for (e, &off) in entries.iter().zip(&offsets) {
+            tiff.extend_from_slice(&be16(e.tag));
+            tiff.extend_from_slice(&be16(e.type_code));
+            tiff.extend_from_slice(&be32(e.count));
+            if e.data.len() <= 4 {
+                let mut inline = [0u8; 4];
+                inline[..e.data.len()].copy_from_slice(&e.data);
+                tiff.extend_from_slice(&inline);
+            } else {
+                tiff.extend_from_slice(&be32(off));
+            }
+        }
+        tiff.extend_from_slice(&be32(0)); // no next IFD
+        assert_eq!(tiff.len() as u32, external_start, "Exif IFD layout drifted");
+
+        tiff.extend_from_slice(&external);
+        tiff
+    }
+
+    /// Wrap a TIFF/EXIF blob in a JPEG SOI + APP1 "Exif" segment + EOI.
+    fn wrap_jpeg_exif(tiff: &[u8]) -> Vec<u8> {
+        let mut jpeg: Vec<u8> = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        let seg_len = (2 + 6 + tiff.len()) as u16;
+        jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        jpeg.extend_from_slice(b"Exif\0\0");
+        jpeg.extend_from_slice(tiff);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        jpeg
+    }
+
+    #[test]
+    fn exif_summary_parses_all_four_fields() {
+        let dir = unique_temp_dir("exifsummary");
+        let entries = vec![
+            rational_entry(0x829a, 1, 250),   // ExposureTime = 1/250s
+            rational_entry(0x829d, 28, 10),   // FNumber = 2.8
+            short_entry(0x8827, 400),         // PhotographicSensitivity = ISO 400
+            rational_entry(0x920a, 850, 10),  // FocalLength = 85.0mm
+        ];
+        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(shots.len(), 1);
+        assert_eq!(
+            shots[0].exif,
+            Some(crate::model::ExifSummary {
+                exposure: Some((1, 250)),
+                f_number: Some(2.8),
+                iso: Some(400),
+                focal_length_mm: Some(85.0),
+            })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exif_summary_partial_fields_present() {
+        let dir = unique_temp_dir("exifpartial");
+        // Only FNumber and ISO present; ExposureTime and FocalLength absent.
+        let entries = vec![rational_entry(0x829d, 18, 10), short_entry(0x8827, 100)];
+        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            shots[0].exif,
+            Some(crate::model::ExifSummary {
+                exposure: None,
+                f_number: Some(1.8),
+                iso: Some(100),
+                focal_length_mm: None,
+            })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exif_summary_coexists_with_capture_time_from_one_parse() {
+        let dir = unique_temp_dir("exifboth");
+        let entries = vec![
+            rational_entry(0x829a, 1, 125), // ExposureTime = 1/125s
+            short_entry(0x8827, 200),       // ISO 200
+            ascii_entry(0x9003, "2026:07:08 10:11:12"), // DateTimeOriginal
+        ];
+        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            shots[0].capture.datetime,
+            Some("2026:07:08 10:11:12".to_string())
+        );
+        assert_eq!(
+            shots[0].exif,
+            Some(crate::model::ExifSummary {
+                exposure: Some((1, 125)),
+                f_number: None,
+                iso: Some(200),
+                focal_length_mm: None,
+            })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exif_summary_none_when_exif_present_but_no_relevant_tags() {
+        let dir = unique_temp_dir("exifirrelevant");
+        // A real EXIF block, but none of the four summary tags — just a
+        // DateTimeOriginal (already covered by `reads_datetime_and_subsec_from_exif`;
+        // the point here is that `exif` on the Shot stays `None`).
+        let entries = vec![ascii_entry(0x9003, "2026:07:08 10:11:12")];
+        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            shots[0].capture.datetime,
+            Some("2026:07:08 10:11:12".to_string())
+        );
+        assert_eq!(shots[0].exif, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exif_summary_odd_typed_tag_degrades_to_none_without_panicking() {
+        let dir = unique_temp_dir("exifoddtype");
+        // ExposureTime encoded as ASCII instead of RATIONAL (malformed/odd
+        // EXIF) alongside a well-formed ISO — the odd tag must degrade to
+        // `None` for that one field, not panic and not poison the rest.
+        let entries = vec![ascii_entry(0x829a, "not-a-rational"), short_entry(0x8827, 800)];
+        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            shots[0].exif,
+            Some(crate::model::ExifSummary {
+                exposure: None,
+                f_number: None,
+                iso: Some(800),
+                focal_length_mm: None,
+            })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exif_summary_zero_denominator_rational_degrades_to_none() {
+        let dir = unique_temp_dir("exifzeroden");
+        // A malformed FNumber with denominator 0 must not panic or produce
+        // an infinite/NaN f32 — it degrades to `None` for that field.
+        let entries = vec![rational_entry(0x829d, 5, 0), short_entry(0x8827, 100)];
+        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            shots[0].exif,
+            Some(crate::model::ExifSummary {
+                exposure: None,
+                f_number: None,
+                iso: Some(100),
+                focal_length_mm: None,
+            })
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

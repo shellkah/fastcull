@@ -11,6 +11,8 @@ pub enum Key {
     Backspace,
     Tab,
     Escape,
+    Return,
+    F11,
     Char(char),
 }
 
@@ -31,8 +33,8 @@ pub enum InputContext {
 }
 
 /// One user intent. Model-mutating variants are executed by `apply_action`;
-/// UI-only variants (OpenTagEntry, ToggleZoom, CycleFilter, OpenApply, ForceSave)
-/// are dispatched by the ui glue.
+/// UI-only variants (OpenTagEntry, ToggleZoom, CycleFilter, OpenApply, ForceSave,
+/// ToggleHelp, ToggleFullscreen, ToggleFocus) are dispatched by the ui glue.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
     Prev,
@@ -46,6 +48,8 @@ pub enum Action {
     OpenApply,
     ForceSave,
     ToggleHelp,
+    ToggleFullscreen, // F11: OS-level window fullscreen (Slint `Window::set_fullscreen`)
+    ToggleFocus,      // Enter: in-app focus mode — hide every HUD panel + the filmstrip
 }
 
 /// Decode the FocusScope-forwarded text into a semantic `Key`.
@@ -57,6 +61,8 @@ pub fn to_key(text: &str) -> Option<Key> {
         "Tab" => Some(Key::Tab),
         "Backspace" => Some(Key::Backspace),
         "Escape" => Some(Key::Escape),
+        "Return" => Some(Key::Return),
+        "F11" => Some(Key::F11),
         " " => Some(Key::Space),
         _ => text.chars().next().map(Key::Char),
     }
@@ -78,6 +84,8 @@ pub fn key_to_action(key: Key, mods: Modifiers, ctx: InputContext) -> Option<Act
         Key::Left | Key::Backspace => Some(Action::Prev),
         Key::Right | Key::Space => Some(Action::Next),
         Key::Tab => Some(Action::NextUnvisited),
+        Key::Return => Some(Action::ToggleFocus),
+        Key::F11 => Some(Action::ToggleFullscreen),
         Key::Char('1') => Some(Action::SetTier(Some(Tier::Keep))),
         Key::Char('2') => Some(Action::SetTier(Some(Tier::Pick))),
         Key::Char('3') => Some(Action::SetTier(Some(Tier::Best))),
@@ -149,6 +157,26 @@ pub fn step_filtered(session: &Session, filter: Filter, forward: bool) -> Option
             return Some(i);
         }
     }
+}
+
+/// The index the loupe should snap to for `filter`, anchored at `from`: the
+/// first passing index at or after `from`, else the nearest passing index
+/// before it, else None when nothing passes. Unlike `step_filtered` (which is
+/// exclusive of the current index and can't scan from 0), this is INCLUSIVE of
+/// `from` — it is what a *filter change* wants, so a still-passing current shot
+/// stays put. It mirrors the re-centering `ui::build_filmstrip_window` already
+/// does (`position(|&i| i >= current)`), so after `F` the loupe and the strip
+/// agree on which shot is current instead of the loupe lingering on a shot the
+/// new filter hides until the next `Space`.
+pub fn nearest_passing(session: &Session, filter: Filter, from: usize) -> Option<usize> {
+    let n = session.shots.len();
+    if n == 0 {
+        return None;
+    }
+    let from = from.min(n - 1);
+    (from..n)
+        .find(|&i| passes(filter, session.decision(i)))
+        .or_else(|| (0..from).rev().find(|&i| passes(filter, session.decision(i))))
 }
 
 /// Turn comma-separated tag-entry text into clean, order-preserving, deduped tags.
@@ -302,6 +330,30 @@ mod key_tests {
     }
 
     #[test]
+    fn f11_toggles_fullscreen_and_enter_toggles_focus() {
+        assert_eq!(
+            key_to_action(Key::F11, m(), LOUPE),
+            Some(Action::ToggleFullscreen)
+        );
+        assert_eq!(
+            key_to_action(Key::Return, m(), LOUPE),
+            Some(Action::ToggleFocus)
+        );
+        // Both are inert while a modal owns the keyboard (ctx != Loupe).
+        assert_eq!(key_to_action(Key::F11, m(), InputContext::TagEntry), None);
+        assert_eq!(
+            key_to_action(Key::Return, m(), InputContext::ApplyDialog),
+            None
+        );
+    }
+
+    #[test]
+    fn to_key_normalizes_return_and_f11() {
+        assert_eq!(to_key("Return"), Some(Key::Return));
+        assert_eq!(to_key("F11"), Some(Key::F11));
+    }
+
+    #[test]
     fn help_context_is_inert() {
         assert_eq!(key_to_action(Key::Char('1'), m(), InputContext::Help), None);
     }
@@ -323,6 +375,7 @@ mod filter_tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             });
             decisions.insert(
                 stem,
@@ -425,6 +478,41 @@ mod filter_tests {
     }
 
     #[test]
+    fn nearest_passing_prefers_at_or_after_then_falls_back() {
+        // Keep, None, Pick, None, Best
+        let s = mk_session(&[
+            Some(Tier::Keep),
+            None,
+            Some(Tier::Pick),
+            None,
+            Some(Tier::Best),
+        ]);
+        // current already passes -> stays put (inclusive of `from`)
+        assert_eq!(nearest_passing(&s, Filter::Keep, 0), Some(0));
+        // current filtered out -> first passing AT/AFTER `from`
+        assert_eq!(nearest_passing(&s, Filter::Pick, 1), Some(2));
+        assert_eq!(nearest_passing(&s, Filter::Pick, 0), Some(2));
+        // at/after wins even when a passing shot also exists before `from`
+        // (Best@4 passes >=Keep, so from=3 lands on 4, not back on 2)
+        assert_eq!(nearest_passing(&s, Filter::Keep, 3), Some(4));
+        assert_eq!(nearest_passing(&s, Filter::Best, 4), Some(4));
+
+        // fallback to nearest passing BEFORE `from` when nothing passes at/after
+        let s2 = mk_session(&[Some(Tier::Keep), None, None]);
+        assert_eq!(nearest_passing(&s2, Filter::Keep, 2), Some(0));
+    }
+
+    #[test]
+    fn nearest_passing_none_when_nothing_matches_or_empty() {
+        let s = mk_session(&[None, None, Some(Tier::Keep)]);
+        assert_eq!(nearest_passing(&s, Filter::Rejects, 1), None); // no rejects anywhere
+        let empty = mk_session(&[]);
+        assert_eq!(nearest_passing(&empty, Filter::All, 0), None);
+        // out-of-range `from` is clamped, still finds the keeper
+        assert_eq!(nearest_passing(&s, Filter::Keep, 99), Some(2));
+    }
+
+    #[test]
     fn parse_tags_splits_trims_dedupes() {
         assert_eq!(
             parse_tags("sky, tree ,  sky , , water"),
@@ -478,7 +566,9 @@ pub fn apply_action(action: Action, session: &mut Session, auto_advance: bool, f
         | Action::CycleFilter
         | Action::OpenApply
         | Action::ForceSave
-        | Action::ToggleHelp => {}
+        | Action::ToggleHelp
+        | Action::ToggleFullscreen
+        | Action::ToggleFocus => {}
     }
 }
 
@@ -498,6 +588,7 @@ mod action_tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             });
             decisions.insert(
                 stem,
@@ -602,6 +693,8 @@ mod action_tests {
             Action::OpenApply,
             Action::ForceSave,
             Action::ToggleHelp,
+            Action::ToggleFullscreen,
+            Action::ToggleFocus,
         ] {
             apply_action(a, &mut s, true, Filter::All);
         }

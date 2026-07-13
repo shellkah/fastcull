@@ -25,7 +25,12 @@ import { Theme } from "theme.slint";
 // non-full-width child — this mirrors hud.slint's already-established
 // absolute-positioning convention for badges/panels that must not stretch.
 export component StartupWindow inherits Window {
-    title: "FastCull";
+    title: "fastcull";
+    // Window/taskbar icon — the "3a" keycap mark (culler/ui/logo-3a.svg),
+    // rasterized from SVG by Slint's bundled resvg. Shown by the window
+    // manager in the title bar / taskbar / alt-tab (works on X11; a no-op on
+    // Wayland, which sources app icons from .desktop files).
+    icon: @image-url("logo-3a.svg");
     preferred-width: 1280px;
     preferred-height: 820px;
 
@@ -52,13 +57,29 @@ export component StartupWindow inherits Window {
         // width is exactly the shape of binding loop the compiler rejects).
         column := Rectangle {
             width: 520px;
-            height: root.error != "" ? 296px : 260px;
+            // Grown from 260/296 to seat the logo mark (84px) + its 16px gap
+            // above the wordmark; the column stays vertically centered so the
+            // whole lockup shifts up symmetrically rather than the wordmark
+            // dropping.
+            height: root.error != "" ? 386px : 350px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: transparent;
 
-            wordmark := Text {
+            // 3a "Keycap" brand mark (culler/ui/logo-3a.svg) — a vertical
+            // lockup: mark on top, wordmark, then tagline. `contain` keeps the
+            // square SVG crisp inside the 84px box.
+            logo := Image {
                 y: 0px;
+                width: 84px;
+                height: 84px;
+                x: (parent.width - self.width) / 2;
+                source: @image-url("logo-3a.svg");
+                image-fit: contain;
+            }
+
+            wordmark := Text {
+                y: logo.y + logo.height + 16px;
                 width: parent.width;
                 text: "fastcull";
                 font-family: Theme.font-mono;

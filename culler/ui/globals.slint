@@ -8,6 +8,16 @@ export struct FilmstripItem {
     // read by the .slint side.
 }
 
+// One tag-autocomplete row (DESIGN §4 2f): the matched `prefix` is bolded in
+// `accent-hi`, `rest` is the remainder, `count` is how many images carry the
+// tag ("sky 142"). Built by `ui::suggest_tags_counted`; when the typed segment
+// is empty (show-all), `prefix` is "" and `rest` is the whole tag.
+export struct TagSuggestion {
+    prefix: string,
+    rest: string,
+    count: int,
+}
+
 export struct ApplyPreviewUi {
     rejected: int,
     rest: int,

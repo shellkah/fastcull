@@ -7,6 +7,7 @@
 pub mod apply;
 pub mod decode;
 pub mod fsops;
+pub mod histogram;
 pub mod model;
 pub mod persist;
 pub mod plan;

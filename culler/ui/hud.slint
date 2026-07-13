@@ -1,5 +1,6 @@
 import { LineEdit } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { TagSuggestion } from "globals.slint";
 
 // culler/ui/hud.slint — floating HUD overlays + tag entry (DESIGN.md §4 screens 1b/2f).
 // Per task-9 corrections: the HUD is NOT a side column — it is a set of small
@@ -171,8 +172,15 @@ export component HudTopRight inherits Rectangle {
     }
 }
 
-// ── bottom-left: tag chip + filter label + seen progress (DESIGN §4 1b) ──
-// NB histogram + EXIF line are Defer (§6) — not built.
+// ── bottom-left: luma histogram + EXIF line + tag chip + filter + progress
+// (DESIGN §4 1b). The histogram + EXIF line were §6 "Defer"; they are now built
+// to match screens/1b-main.png. The existing filter-label + `seen` progress are
+// kept below them (they're a v1 addition not shown in 1b). Panel height is
+// computed from which optional rows are present — this Rectangle isn't in a
+// layout, so it can't auto-size to content without the binding-loop hazard the
+// header comment discloses; every row therefore has a fixed height and the sum
+// is exact. Rows (top→bottom): histogram(34) · [exif(15)] · [tags(20)] ·
+// filter(15) · progress(15), padding 8, spacing 6.
 export component HudBottomLeft inherits Rectangle {
     // Comma-joined tags straight from HudText.tags (the pure interface keeps this a
     // single String, not a list — see task-9 report for the disclosed single-chip
@@ -180,13 +188,20 @@ export component HudBottomLeft inherits Rectangle {
     in property <string> tags;
     in property <string> filter-label;
     in property <string> progress;
+    // Preformatted "1/250s · ƒ2.8 · ISO 400 · 85mm" from `ExifSummary::hud_line`
+    // (empty when the shot has no exposure EXIF).
+    in property <string> exif;
+    // 30 normalized [0,1] luma-bar heights from `culler_core::histogram`.
+    in property <[float]> histogram;
     background: transparent;
 
     panel := Rectangle {
         x: 14px;
         y: parent.height - self.height - 14px;
         width: 280px;
-        height: tags == "" ? 54px : 76px;
+        height: 92px
+              + (root.exif != "" ? 21px : 0px)
+              + (root.tags != "" ? 26px : 0px);
         background: Theme.panel-hud;
         border-radius: Theme.r-md;
         border-width: 1px;
@@ -196,6 +211,35 @@ export component HudBottomLeft inherits Rectangle {
             padding: 8px;
             spacing: 6px;
             alignment: start;
+
+            // Luma histogram — 30 bars, bottom-anchored, DESIGN §4 1b. Always
+            // present (blank until the first decode) so the panel height is
+            // stable. Bar fill is the design's literal rgba(255,255,255,.32).
+            Rectangle {
+                height: 34px;
+                HorizontalLayout {
+                    spacing: 1px;
+                    for h[i] in root.histogram: Rectangle {
+                        Rectangle {
+                            width: parent.width;
+                            height: max(1px, h * (parent.height - 2px));
+                            y: parent.height - self.height;
+                            background: #ffffff52;
+                        }
+                    }
+                }
+            }
+
+            if root.exif != "": Text {
+                height: 15px;
+                text: root.exif;
+                font-family: Theme.font-mono;
+                font-size: 10.5px;
+                color: Theme.text-dim;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+
             if root.tags != "": Rectangle {
                 height: 20px;
                 background: Theme.chip-bg;
@@ -211,16 +255,20 @@ export component HudBottomLeft inherits Rectangle {
                 }
             }
             Text {
+                height: 15px;
                 text: root.filter-label;
                 font-family: Theme.font-mono;
                 font-size: 10.5px;
                 color: Theme.label;
+                vertical-alignment: center;
             }
             Text {
+                height: 15px;
                 text: root.progress;
                 font-family: Theme.font-mono;
                 font-size: 10.5px;
                 color: Theme.text-dim;
+                vertical-alignment: center;
             }
         }
     }
@@ -229,10 +277,18 @@ export component HudBottomLeft inherits Rectangle {
 // ── tag entry (DESIGN §4 2f): photo stays visible (no scrim), bottom-center panel ──
 export component TagEntry inherits Rectangle {
     in-out property <string> text;
-    in property <[string]> suggestions;
+    in property <[TagSuggestion]> suggestions;
+    // Which suggestion row is highlighted for keyboard nav: -1 = none (Enter
+    // commits the typed text), >=0 = a row (Enter/click accepts it into the
+    // current comma-segment). Mutated in Slint by Tab/Shift+Tab/Up/Down below;
+    // reset to -1 from Rust whenever the suggestion list is rebuilt.
+    in-out property <int> active-index: -1;
     callback changed(string);
     callback committed(string);
     callback cancelled();
+    // Accept suggestion row `index` into the current segment (keeps the entry
+    // open for the next tag). Distinct from `committed`, which finalizes + closes.
+    callback accept-suggestion(int);
 
     // Fills the loupe stage but paints nothing itself — 2f explicitly keeps the photo
     // undimmed, so (unlike the brief's placeholder) there is no scrim rectangle here.
@@ -240,7 +296,13 @@ export component TagEntry inherits Rectangle {
 
     panel := Rectangle {
         width: 380px;
-        height: 220px;
+        // Height follows the content (input row + N suggestion rows + hint) so
+        // the panel snugly fits however many suggestions are showing. Bound to
+        // the inner layout's *preferred* (intrinsic, content-derived) height —
+        // not the width binding-loop this file's header warns about: the layout's
+        // allocated height depends on the panel, but its preferred height (a sum
+        // of fixed child heights) does not depend back on the panel.
+        height: body.preferred-height;
         x: (parent.width - self.width) / 2;
         y: parent.height - self.height - 14px;
         background: Theme.panel-dialog;
@@ -260,15 +322,29 @@ export component TagEntry inherits Rectangle {
         // delivery model (a FocusScope only receives bubbled keys from a scope it
         // *surrounds*) would never see Escape while the LineEdit has focus. Fixed here.
         scope := FocusScope {
+            // Escape cancels; Tab/Down move the highlight forward through the
+            // suggestions (wrapping), Shift+Tab/Up move it back. These keys aren't
+            // consumed by the single-line LineEdit, so they bubble up here. Enter
+            // is handled on the LineEdit itself (see `accepted` below).
             key-pressed(event) => {
                 if (event.text == Key.Escape) {
                     root.cancelled();
                     return accept;
                 }
+                if (root.suggestions.length > 0) {
+                    if ((event.text == Key.Tab && !event.modifiers.shift) || event.text == Key.DownArrow) {
+                        root.active-index = (root.active-index + 1) >= root.suggestions.length ? 0 : root.active-index + 1;
+                        return accept;
+                    }
+                    if ((event.text == Key.Tab && event.modifiers.shift) || event.text == Key.Backtab || event.text == Key.UpArrow) {
+                        root.active-index = root.active-index <= 0 ? root.suggestions.length - 1 : root.active-index - 1;
+                        return accept;
+                    }
+                }
                 return reject;
             }
 
-            VerticalLayout {
+            body := VerticalLayout {
                 padding: 14px;
                 spacing: 8px;
                 alignment: start;
@@ -283,30 +359,76 @@ export component TagEntry inherits Rectangle {
                         text <=> root.text;
                         placeholder-text: "sky, portrait, keeper";
                         font-family: Theme.font-mono;
-                        edited(t) => { root.changed(t); }
-                        accepted(t) => { root.committed(t); }
+                        edited(t) => {
+                            // Typing invalidates the highlight and rebuilds the
+                            // list (Rust resets active-index to -1).
+                            root.changed(t);
+                        }
+                        accepted(t) => {
+                            // Enter: accept the highlighted row if one is active,
+                            // else finalize the whole field.
+                            if (root.active-index >= 0) {
+                                root.accept-suggestion(root.active-index);
+                            } else {
+                                root.committed(t);
+                            }
+                        }
                     }
                 }
 
-                for s[i] in root.suggestions: row := Rectangle {
-                    height: 22px;
-                    background: area.has-hover ? Theme.chip-bg : transparent;
-                    border-radius: Theme.r-sm;
-                    Text {
-                        text: s;
-                        font-family: Theme.font-mono;
-                        font-size: 12px;
-                        color: Theme.accent-hi;
-                        x: 6px;
-                        vertical-alignment: center;
-                    }
-                    area := TouchArea {
-                        clicked => { root.committed(s); }
+                // Autocomplete rows (DESIGN §4 2f): matched prefix bolded in
+                // accent-hi, count right-aligned, the active row tinted pick-blue
+                // @ .22. Wrapped in a tight inner layout so rows don't inherit the
+                // outer 8px spacing.
+                if root.suggestions.length > 0: VerticalLayout {
+                    spacing: 2px;
+                    for s[i] in root.suggestions: row := Rectangle {
+                        height: 24px;
+                        background: i == root.active-index
+                            ? Theme.tier-pick.with-alpha(0.22)
+                            : (area.has-hover ? Theme.chip-bg : transparent);
+                        border-radius: Theme.r-sm;
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 8px;
+                            spacing: 6px;
+                            alignment: stretch;
+                            HorizontalLayout {
+                                spacing: 0px;
+                                alignment: start;
+                                Text {
+                                    text: s.prefix;
+                                    font-family: Theme.font-mono;
+                                    font-weight: 600;
+                                    font-size: 12px;
+                                    color: Theme.accent-hi;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: s.rest;
+                                    font-family: Theme.font-mono;
+                                    font-size: 12px;
+                                    color: Theme.text-2;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Rectangle { }
+                            Text {
+                                text: s.count;
+                                font-family: Theme.font-mono;
+                                font-size: 11px;
+                                color: Theme.text-dim;
+                                vertical-alignment: center;
+                            }
+                        }
+                        area := TouchArea {
+                            clicked => { root.accept-suggestion(i); }
+                        }
                     }
                 }
 
                 Text {
-                    text: "enter add · comma next tag · esc done";
+                    text: "tab cycle · enter add · comma next · esc done";
                     font-family: Theme.font-mono;
                     font-size: 9.5px;
                     color: Theme.text-faint;
@@ -316,4 +438,57 @@ export component TagEntry inherits Rectangle {
     }
 
     init => { edit.focus(); }
+}
+
+// ── bottom-right: a faint discoverability hint that `?` opens the keymap
+// (DESIGN §4 1b sketches an optional `?` button in this corner). Static — the
+// `?` binding already opens the KeySheet (input.rs / main.rs). Fixed width like
+// the keysheet key-caps so the centered text needs no layout-driven sizing
+// (avoids the binding-loop hazard disclosed at the top of this file). app.slint
+// hides it in focus mode via `visible`.
+export component HudHelpHint inherits Rectangle {
+    background: transparent;
+    pill := Rectangle {
+        x: parent.width - self.width - 14px;
+        y: parent.height - self.height - 14px;
+        width: 100px;
+        height: 26px;
+        background: Theme.panel-hud;
+        border-radius: Theme.r-md;
+        border-width: 1px;
+        border-color: Theme.border;
+        Text {
+            text: "? shortcuts";
+            font-family: Theme.font-mono;
+            font-size: 10.5px;
+            color: Theme.text-dim;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── focus mode's only chrome: a faint bottom-center reminder of how to leave
+// (Enter toggles focus mode — see input.rs `Action::ToggleFocus`). app.slint
+// shows this ONLY while `focus-mode` is on, when every other panel is hidden.
+export component HudFocusHint inherits Rectangle {
+    background: transparent;
+    pill := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 16px;
+        width: 148px;
+        height: 28px;
+        background: Theme.panel-hud;
+        border-radius: Theme.r-md;
+        border-width: 1px;
+        border-color: Theme.border;
+        Text {
+            text: "press enter to exit";
+            font-family: Theme.font-mono;
+            font-size: 10.5px;
+            color: Theme.text-dim;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
 }

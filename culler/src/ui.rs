@@ -79,26 +79,71 @@ pub fn refresh_filmstrip(
     app.set_film_current(cur_off as i32);
 }
 
+/// Number of luma-histogram bars in the bottom-left HUD panel (DESIGN §4 1b).
+pub const HISTOGRAM_BINS: usize = 30;
+
 /// Marshal a decoded fit image onto the loupe (called from the event loop).
 pub fn set_loupe(app: &crate::AppWindow, img: &DecodedImage) {
     app.set_current_image(to_slint_image(img));
+    // Luma histogram (DESIGN §4 1b): recomputed from the same decoded buffer
+    // we're displaying, so it always tracks the shot on screen. Cheap —
+    // `luma_histogram` samples at most ~200k px — and set_loupe fires only for
+    // the current shot (fresh delivery or cached repaint), not for prefetched
+    // neighbors. Pushed as normalized [0,1] bar heights the .slint scales.
+    let hist = culler_core::histogram::luma_histogram(img, HISTOGRAM_BINS);
+    app.set_histogram(ModelRc::from(Rc::new(VecModel::from(hist))));
 }
 
-/// Autocomplete suggestions: entries of `all` whose text starts with `prefix`
-/// (case-insensitive), excluding an exact match. Capped for a tidy popup.
-pub fn suggest_tags(all: &[String], prefix: &str) -> Vec<String> {
+/// Autocomplete rows for the tag entry (DESIGN §4 2f). Given the global
+/// tag→count list (`Session::tag_counts`, already count-desc), returns rows
+/// matching `prefix` (case-insensitive), or **all** tags when `prefix` is empty
+/// ("show all by default"). Tags already committed earlier in the same entry
+/// (`exclude`) and an exact-prefix match are dropped. Each row is
+/// `(matched-prefix, remainder, count)` so the popup can bold the prefix and
+/// right-align the count; the show-all case yields an empty prefix. Capped for a
+/// tidy popup.
+pub fn suggest_tags_counted(
+    counts: &[(String, usize)],
+    prefix: &str,
+    exclude: &[String],
+) -> Vec<(String, String, i32)> {
     let p = prefix.trim().to_lowercase();
-    if p.is_empty() {
-        return Vec::new();
-    }
-    all.iter()
-        .filter(|t| {
-            let lt = t.to_lowercase();
-            lt.starts_with(&p) && lt != p
+    let plen = prefix.trim().chars().count();
+    counts
+        .iter()
+        .filter(|(t, _)| {
+            if exclude.iter().any(|e| e.eq_ignore_ascii_case(t)) {
+                return false;
+            }
+            if p.is_empty() {
+                true
+            } else {
+                let lt = t.to_lowercase();
+                lt.starts_with(&p) && lt != p
+            }
         })
         .take(8)
-        .cloned()
+        .map(|(t, c)| {
+            let pre: String = t.chars().take(plen).collect();
+            let rest: String = t.chars().skip(plen).collect();
+            (pre, rest, *c as i32)
+        })
         .collect()
+}
+
+/// Split tag-entry text into (the segment currently being typed, the tags
+/// already committed before it). The last comma-separated field is the live
+/// segment feeding the autocomplete; earlier non-empty fields are tags already
+/// entered (excluded from suggestions).
+pub fn tag_segments(text: &str) -> (String, Vec<String>) {
+    let mut parts: Vec<&str> = text.split(',').collect();
+    let last = parts.pop().unwrap_or("").trim().to_string();
+    let exclude: Vec<String> = parts
+        .iter()
+        .map(|p| p.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (last, exclude)
 }
 
 /// Pre-rendered HUD strings (DESIGN.md §4 screen 1b: top-left filename/RAW/position,
@@ -115,6 +160,9 @@ pub struct HudText {
     pub has_raw: bool,
     /// "{current+1}/{len}", 1-based for display; "0/0" when the session has no shots.
     pub position: String,
+    /// EXIF line "1/250s · ƒ2.8 · ISO 400 · 85mm" (DESIGN §4 1b); empty when the
+    /// current shot carries no exposure EXIF.
+    pub exif: String,
 }
 
 pub fn hud_text(session: &Session, filter: Filter) -> HudText {
@@ -151,6 +199,10 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
     } else {
         format!("{}/{}", session.current + 1, session.shots.len())
     };
+    let exif = current_shot
+        .and_then(|s| s.exif.as_ref())
+        .map(|e| e.hud_line())
+        .unwrap_or_default();
     HudText {
         tier,
         tags: d.tags.join(", "),
@@ -160,6 +212,7 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
         filename,
         has_raw,
         position,
+        exif,
     }
 }
 
@@ -217,6 +270,7 @@ mod hud_tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             });
             decisions.insert(
                 stem,
@@ -238,21 +292,58 @@ mod hud_tests {
     }
 
     #[test]
-    fn suggest_tags_prefix_filters_case_insensitively() {
-        let all = vec![
-            "sky".to_string(),
-            "skyline".to_string(),
-            "sea".to_string(),
-            "Sunset".to_string(),
+    fn suggest_tags_counted_filters_shows_all_and_splits_prefix() {
+        let counts = vec![
+            ("sky".to_string(), 142usize),
+            ("skyline".to_string(), 12),
+            ("sea".to_string(), 30),
+            ("Sunset".to_string(), 7),
         ];
+        // prefix filter (case-insensitive), each row split into (prefix, rest, count)
         assert_eq!(
-            suggest_tags(&all, "sk"),
-            vec!["sky".to_string(), "skyline".to_string()]
+            suggest_tags_counted(&counts, "sk", &[]),
+            vec![
+                ("sk".to_string(), "y".to_string(), 142),
+                ("sk".to_string(), "yline".to_string(), 12),
+            ]
         );
-        assert_eq!(suggest_tags(&all, "SU"), vec!["Sunset".to_string()]);
-        assert!(suggest_tags(&all, "").is_empty()); // no prefix -> no noise
-        // an exact match is not re-suggested
-        assert!(suggest_tags(&all, "sky").iter().all(|s| s != "sky"));
+        // case-insensitive match preserves the tag's own casing in the split
+        assert_eq!(
+            suggest_tags_counted(&counts, "su", &[]),
+            vec![("Su".to_string(), "nset".to_string(), 7)]
+        );
+        // empty prefix -> ALL tags in the given (count-desc) order, nothing bolded
+        let all = suggest_tags_counted(&counts, "", &[]);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0], ("".to_string(), "sky".to_string(), 142));
+        // exact-prefix match is not re-suggested; excluded tags are dropped
+        assert!(
+            suggest_tags_counted(&counts, "sky", &[])
+                .iter()
+                .all(|(p, r, _)| format!("{p}{r}") != "sky")
+        );
+        assert!(
+            suggest_tags_counted(&counts, "", &["sky".to_string()])
+                .iter()
+                .all(|(p, r, _)| format!("{p}{r}") != "sky")
+        );
+    }
+
+    #[test]
+    fn tag_segments_splits_current_from_committed() {
+        // typing the first tag: no committed tags yet
+        assert_eq!(tag_segments("sk"), ("sk".to_string(), vec![]));
+        // trailing comma+space -> empty live segment (show-all), one committed
+        assert_eq!(
+            tag_segments("street, "),
+            ("".to_string(), vec!["street".to_string()])
+        );
+        // mid-typing a later tag
+        assert_eq!(
+            tag_segments("street, maria, mar"),
+            ("mar".to_string(), vec!["street".to_string(), "maria".to_string()])
+        );
+        assert_eq!(tag_segments(""), ("".to_string(), vec![]));
     }
 
     #[test]
@@ -363,6 +454,7 @@ mod color_tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             });
             decisions.insert(stem, Decision::default());
         }

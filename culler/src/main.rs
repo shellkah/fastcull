@@ -21,7 +21,8 @@ use culler_core::model::{SESSION_FILE, Session};
 use culler_core::persist::{load_or_fresh, save};
 use culler_core::scan::scan;
 use input::{
-    Action, Filter, InputContext, apply_action, key_to_action, next_filter, parse_tags, to_key,
+    Action, Filter, InputContext, apply_action, key_to_action, nearest_passing, next_filter,
+    parse_tags, passes, to_key,
 };
 use pipeline::{FullSlot, Pipeline, prefetch_set, to_slint_image};
 use startup::{Cli, reattach, resolve_buckets, validate_buckets};
@@ -292,6 +293,7 @@ fn build_culling_ui(
             app.set_hud_filename(h.filename.into());
             app.set_hud_has_raw(h.has_raw);
             app.set_hud_position(h.position.into());
+            app.set_hud_exif(h.exif.into());
             let c = s.counts();
             app.set_count_best(c.bests as i32);
             app.set_count_pick(c.picks as i32);
@@ -431,6 +433,32 @@ fn build_culling_ui(
                 Action::CycleFilter => {
                     let nf = next_filter(*filter.borrow());
                     *filter.borrow_mut() = nf;
+                    // Snap the loupe onto the new working set: if the current
+                    // shot no longer passes, jump to the nearest shot that does
+                    // (at/after current, else before) so the big image follows
+                    // the filter instead of lingering on a now-hidden shot until
+                    // the next Space. `nearest_passing` mirrors the filmstrip's
+                    // own re-centering (ui::build_filmstrip_window), so the loupe
+                    // and the strip stay in agreement. No match anywhere -> stay
+                    // put (nothing better to show; the strip just goes empty).
+                    let snap = {
+                        let s = session.borrow();
+                        if passes(nf, s.decision(s.current)) {
+                            None
+                        } else {
+                            nearest_passing(&s, nf, s.current)
+                        }
+                    };
+                    if let Some(idx) = snap {
+                        {
+                            let mut s = session.borrow_mut();
+                            s.current = idx;
+                            s.mark_visited(idx);
+                        }
+                        zoom.borrow_mut().on_navigate();
+                        dirty.set(true); // current moved -> debounced autosave persists it
+                        request_current();
+                    }
                     refresh_view();
                     // Toast (DESIGN §4 2g): the new filter's label + a dot in
                     // its tier color; `All` has no ladder floor, so no dot.
@@ -449,9 +477,23 @@ fn build_culling_ui(
                     request_current();
                 }
                 Action::OpenTagEntry => {
-                    let s = session.borrow();
-                    app.set_tag_text(s.decision(s.current).tags.join(", ").into());
+                    // Prefill existing tags, then leave the caret on a fresh empty
+                    // segment (trailing ", ") so the autocomplete shows ALL tags by
+                    // default — the user can Tab straight into the list. Fire
+                    // tag_changed once to populate that initial list.
+                    let prefill = {
+                        let s = session.borrow();
+                        let existing = s.decision(s.current).tags.join(", ");
+                        if existing.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{existing}, ")
+                        }
+                    };
+                    app.set_tag_text(prefill.clone().into());
+                    app.set_tag_active_index(-1);
                     app.set_tag_open(true);
+                    app.invoke_tag_changed(prefill.into());
                 }
                 Action::OpenApply => {
                     app.set_apply_open(true);
@@ -475,6 +517,23 @@ fn build_culling_ui(
                 }
                 Action::ToggleHelp => {
                     app.set_help_open(true);
+                }
+                Action::ToggleFullscreen => {
+                    // F11: OS-level window fullscreen. The winit backend is
+                    // enabled, so Slint's `Window::set_fullscreen` toggles it
+                    // live. Orthogonal to focus mode (Enter) — the two compose
+                    // into a fully immersive view. No model/session change, so no
+                    // dirty flag and no refresh.
+                    let w = app.window();
+                    w.set_fullscreen(!w.is_fullscreen());
+                }
+                Action::ToggleFocus => {
+                    // Enter: in-app focus/zen mode — hide every HUD panel and the
+                    // filmstrip so only the photo (plus a faint "press enter to
+                    // exit" hint) remains. Pure view state on the AppWindow; the
+                    // `.slint` `visible:` bindings + the filmstrip `if` do the
+                    // hiding. Navigation still works while it's on.
+                    app.set_focus_mode(!app.get_focus_mode());
                 }
                 Action::Undo => {
                     // Session::undo() (culler-core, untouched here) only
@@ -577,13 +636,43 @@ fn build_culling_ui(
         let app_w = app.as_weak();
         app.on_tag_changed(move |text| {
             if let Some(app) = app_w.upgrade() {
-                let all = session.borrow().all_tags();
-                let last = text.rsplit(',').next().unwrap_or("").to_string();
-                let sugg: Vec<slint::SharedString> = ui::suggest_tags(&all, &last)
-                    .into_iter()
-                    .map(Into::into)
-                    .collect();
-                app.set_tag_suggestions(Rc::new(slint::VecModel::from(sugg)).into());
+                let counts = session.borrow().tag_counts();
+                let (last, exclude) = ui::tag_segments(&text);
+                let model: Vec<crate::TagSuggestion> =
+                    ui::suggest_tags_counted(&counts, &last, &exclude)
+                        .into_iter()
+                        .map(|(prefix, rest, count)| crate::TagSuggestion {
+                            prefix: prefix.into(),
+                            rest: rest.into(),
+                            count,
+                        })
+                        .collect();
+                app.set_tag_suggestions(Rc::new(slint::VecModel::from(model)).into());
+                app.set_tag_active_index(-1); // rebuilt list -> no active row
+            }
+        });
+    }
+    // Accept a highlighted/clicked suggestion into the current comma-segment,
+    // then leave the entry open (trailing ", ") so the user can keep adding
+    // tags. Rebuilds suggestions for the now-empty next segment. Distinct from
+    // `on_tag_committed`, which finalizes the whole field and closes.
+    {
+        let session = session.clone();
+        let app_w = app.as_weak();
+        app.on_tag_accept_suggestion(move |index| {
+            let Some(app) = app_w.upgrade() else { return };
+            let text = app.get_tag_text().to_string();
+            let counts = session.borrow().tag_counts();
+            let (last, exclude) = ui::tag_segments(&text);
+            let rows = ui::suggest_tags_counted(&counts, &last, &exclude);
+            if let Some((prefix, rest, _)) = rows.get(index as usize) {
+                let chosen = format!("{prefix}{rest}");
+                let mut kept = exclude.clone();
+                kept.push(chosen);
+                let new_text = format!("{}, ", kept.join(", "));
+                app.set_tag_text(new_text.clone().into());
+                app.set_tag_active_index(-1);
+                app.invoke_tag_changed(new_text.into());
             }
         });
     }

@@ -97,14 +97,97 @@ pub struct CaptureTime {
     pub subsec: Option<u32>,
 }
 
+/// Exposure/aperture/ISO/focal-length summary read from EXIF, for the loupe
+/// HUD overlay. Every field is independently optional — a camera/lens may
+/// omit any of them — and parsing (`scan::read_exif_data`) never fails the
+/// shot over a missing or malformed tag. Not `Eq` (unlike `Shot`/`CaptureTime`):
+/// `f32` fields only support `PartialEq`.
+#[derive(Clone, PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ExifSummary {
+    /// EXIF `ExposureTime` exactly as stored: (numerator, denominator).
+    /// Formatting (e.g. "1/250s") happens in `hud_line`, not here.
+    pub exposure: Option<(u32, u32)>,
+    pub f_number: Option<f32>,
+    pub iso: Option<u32>,
+    pub focal_length_mm: Option<f32>,
+}
+
+impl ExifSummary {
+    /// One-line HUD summary joining every present field with " · " (space,
+    /// U+00B7 MIDDLE DOT, space). All fields `None` → `String::new()`.
+    ///
+    /// - `exposure`: sub-second exposures render as a reduced "1/Ns"
+    ///   fraction; one-second-or-longer exposures render as whole ("2s") or
+    ///   one-decimal ("1.3s") seconds. A non-positive or zero-denominator
+    ///   ratio renders nothing (rather than a bogus time).
+    /// - `f_number`: "ƒ{n}" (U+0192) with a trailing ".0" dropped
+    ///   (2.8 → "ƒ2.8", 4.0 → "ƒ4").
+    /// - `iso`: "ISO {n}".
+    /// - `focal_length_mm`: "{n}mm" with a trailing ".0" dropped
+    ///   (85.0 → "85mm", 10.5 → "10.5mm").
+    pub fn hud_line(&self) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(4);
+        if let Some((num, den)) = self.exposure
+            && let Some(s) = format_exposure(num, den)
+        {
+            parts.push(s);
+        }
+        if let Some(f) = self.f_number {
+            parts.push(format!("\u{192}{}", trim_trailing_zero(f)));
+        }
+        if let Some(iso) = self.iso {
+            parts.push(format!("ISO {iso}"));
+        }
+        if let Some(fl) = self.focal_length_mm {
+            parts.push(format!("{}mm", trim_trailing_zero(fl)));
+        }
+        parts.join(" \u{b7} ")
+    }
+}
+
+/// Render an EXIF `ExposureTime` `(numerator, denominator)` per the HUD's
+/// shutter-speed convention. `None` for a non-positive or zero-denominator
+/// ratio — such a value never renders a shutter segment rather than showing
+/// a bogus time (an infinite or NaN division).
+fn format_exposure(num: u32, den: u32) -> Option<String> {
+    if den == 0 {
+        return None;
+    }
+    let s = num as f64 / den as f64;
+    if s <= 0.0 {
+        return None;
+    }
+    if s < 1.0 {
+        let reduced = (den as f64 / num as f64).round() as u64;
+        Some(format!("1/{reduced}s"))
+    } else if s.fract() == 0.0 {
+        Some(format!("{}s", s as u64))
+    } else {
+        Some(format!("{s:.1}s"))
+    }
+}
+
+/// Format `v` with its natural shortest decimal representation, then drop a
+/// trailing ".0" (2.8 → "2.8", 4.0 → "4").
+fn trim_trailing_zero(v: f32) -> String {
+    let s = format!("{v}");
+    s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+}
+
 /// One shot = all files sharing a filename stem. Produced by `scan`.
-#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Shot {
     pub stem: String, // the shot key, e.g. "IMG_1234" (case preserved as on disk)
     pub jpeg: std::path::PathBuf, // display file, required in v1
     pub raw: Option<std::path::PathBuf>,
     pub sidecar: Option<std::path::PathBuf>, // pre-existing xmp (either convention)
     pub capture: CaptureTime,
+    /// Exposure/aperture/ISO/focal-length HUD summary, or `None` when the
+    /// JPEG carries no EXIF (or none of the four tags parsed).
+    /// `#[serde(default)]` so session files saved before this field existed
+    /// still deserialize (missing key → `None`), not just a `null` value.
+    #[serde(default)]
+    pub exif: Option<ExifSummary>,
 }
 
 impl Shot {
@@ -304,6 +387,21 @@ impl Session {
         }
         set.into_iter().collect()
     }
+
+    /// Count of shots carrying each tag across `self.decisions` (same
+    /// stale-stem-inclusive scope as `all_tags`), sorted by count descending,
+    /// then tag name ascending to break ties. Empty session → empty vec.
+    pub fn tag_counts(&self) -> Vec<(String, usize)> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for decision in self.decisions.values() {
+            for tag in &decision.tags {
+                *counts.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<(String, usize)> = counts.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +509,7 @@ mod tests {
             raw: None,
             sidecar: None,
             capture: CaptureTime::default(),
+            exif: None,
         };
         assert_eq!(
             shot.files(),
@@ -429,6 +528,7 @@ mod tests {
                 datetime: Some("2026:07:08 10:11:12".to_string()),
                 subsec: Some(42),
             },
+            exif: None,
         };
         assert_eq!(
             shot.files(),
@@ -457,6 +557,7 @@ mod tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             }],
             decisions: std::collections::HashMap::new(),
             current: 0,
@@ -497,6 +598,7 @@ mod tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             }],
             decisions: std::collections::HashMap::new(),
             current: 0,
@@ -519,6 +621,7 @@ mod tests {
             raw: None,
             sidecar: None,
             capture: CaptureTime::default(),
+            exif: None,
         });
         session.decisions.insert(
             "IMG_0001".to_string(),
@@ -556,6 +659,7 @@ mod tests {
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
+                exif: None,
             });
         }
         session
@@ -720,6 +824,34 @@ mod tests {
     }
 
     #[test]
+    fn tag_counts_orders_by_count_desc_then_name_asc() {
+        let mut session = fixture_session(&["A", "B", "C"]);
+        session.set_tags(0, vec!["sky".to_string(), "tree".to_string()]);
+        session.set_tags(1, vec!["tree".to_string(), "beach".to_string()]);
+        session.set_tags(2, vec!["sky".to_string()]);
+        // sky: 2, tree: 2, beach: 1 -> count desc, "sky" before "tree" on the tie.
+        assert_eq!(
+            session.tag_counts(),
+            vec![
+                ("sky".to_string(), 2),
+                ("tree".to_string(), 2),
+                ("beach".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn tag_counts_empty_session_is_empty() {
+        assert!(Session::default().tag_counts().is_empty());
+    }
+
+    #[test]
+    fn tag_counts_shots_with_no_tags_is_empty() {
+        let session = fixture_session(&["A", "B"]);
+        assert!(session.tag_counts().is_empty());
+    }
+
+    #[test]
     fn pending_apply_breadcrumb_serde_defaults_and_round_trips() {
         // Pre-rev-3 session files have no `pending_apply` — they must still load.
         let old_json = r#"{"source_dir":"/src","shots":[],"decisions":{},"current":0}"#;
@@ -736,5 +868,150 @@ mod tests {
             back.pending_apply,
             Some(std::path::PathBuf::from("/shoot/sorted"))
         );
+    }
+
+    #[test]
+    fn shot_exif_field_serde_defaults_for_pre_existing_sessions() {
+        // A `Shot` JSON blob saved before the `exif` field existed — no "exif"
+        // key at all (not even `"exif":null`). Must still deserialize, with
+        // `exif` defaulting to `None`.
+        let old_json = r#"{
+            "stem": "IMG_0001",
+            "jpeg": "/src/IMG_0001.JPG",
+            "raw": null,
+            "sidecar": null,
+            "capture": {"datetime": null, "subsec": null}
+        }"#;
+        let shot: Shot = serde_json::from_str(old_json).unwrap();
+        assert_eq!(shot.exif, None);
+
+        // Round-trips when set.
+        let mut shot2 = shot;
+        shot2.exif = Some(ExifSummary {
+            exposure: Some((1, 250)),
+            f_number: Some(2.8),
+            iso: Some(400),
+            focal_length_mm: Some(85.0),
+        });
+        let json = serde_json::to_string(&shot2).unwrap();
+        let back: Shot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.exif, shot2.exif);
+    }
+
+    #[test]
+    fn exif_summary_default_is_all_none() {
+        let e = ExifSummary::default();
+        assert_eq!(e.exposure, None);
+        assert_eq!(e.f_number, None);
+        assert_eq!(e.iso, None);
+        assert_eq!(e.focal_length_mm, None);
+    }
+
+    #[test]
+    fn hud_line_empty_when_all_fields_none() {
+        assert_eq!(ExifSummary::default().hud_line(), String::new());
+    }
+
+    #[test]
+    fn hud_line_formats_subsecond_exposure_as_reduced_fraction() {
+        let e = ExifSummary {
+            exposure: Some((1, 250)),
+            ..Default::default()
+        };
+        assert_eq!(e.hud_line(), "1/250s");
+    }
+
+    #[test]
+    fn hud_line_formats_integral_second_exposure() {
+        let e = ExifSummary {
+            exposure: Some((2, 1)),
+            ..Default::default()
+        };
+        assert_eq!(e.hud_line(), "2s");
+    }
+
+    #[test]
+    fn hud_line_formats_fractional_second_exposure_with_one_decimal() {
+        let e = ExifSummary {
+            exposure: Some((13, 10)), // 1.3s
+            ..Default::default()
+        };
+        assert_eq!(e.hud_line(), "1.3s");
+    }
+
+    #[test]
+    fn hud_line_skips_non_positive_or_zero_denominator_exposure() {
+        let zero_num = ExifSummary {
+            exposure: Some((0, 250)),
+            ..Default::default()
+        };
+        assert_eq!(zero_num.hud_line(), String::new());
+
+        let zero_den = ExifSummary {
+            exposure: Some((5, 0)),
+            ..Default::default()
+        };
+        assert_eq!(zero_den.hud_line(), String::new());
+    }
+
+    #[test]
+    fn hud_line_formats_f_number_dropping_trailing_zero() {
+        let with_decimal = ExifSummary {
+            f_number: Some(2.8),
+            ..Default::default()
+        };
+        assert_eq!(with_decimal.hud_line(), "\u{192}2.8");
+
+        let whole = ExifSummary {
+            f_number: Some(4.0),
+            ..Default::default()
+        };
+        assert_eq!(whole.hud_line(), "\u{192}4");
+    }
+
+    #[test]
+    fn hud_line_formats_iso() {
+        let e = ExifSummary {
+            iso: Some(400),
+            ..Default::default()
+        };
+        assert_eq!(e.hud_line(), "ISO 400");
+    }
+
+    #[test]
+    fn hud_line_formats_focal_length_dropping_trailing_zero() {
+        let whole = ExifSummary {
+            focal_length_mm: Some(85.0),
+            ..Default::default()
+        };
+        assert_eq!(whole.hud_line(), "85mm");
+
+        let fractional = ExifSummary {
+            focal_length_mm: Some(10.5),
+            ..Default::default()
+        };
+        assert_eq!(fractional.hud_line(), "10.5mm");
+    }
+
+    #[test]
+    fn hud_line_joins_all_present_fields_with_middle_dot() {
+        let e = ExifSummary {
+            exposure: Some((1, 250)),
+            f_number: Some(2.8),
+            iso: Some(400),
+            focal_length_mm: Some(85.0),
+        };
+        assert_eq!(e.hud_line(), "1/250s \u{b7} \u{192}2.8 \u{b7} ISO 400 \u{b7} 85mm");
+    }
+
+    #[test]
+    fn hud_line_joins_only_present_fields_when_some_are_missing() {
+        let e = ExifSummary {
+            exposure: None,
+            f_number: Some(1.8),
+            iso: None,
+            focal_length_mm: Some(35.0),
+        };
+        assert_eq!(e.hud_line(), "\u{192}1.8 \u{b7} 35mm");
     }
 }

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <!-- FastCull logo — design option "3a" (Keycap): a physical key with the
+       fast-forward glyph. Fixed brand colors from the design system:
+       accent #5a93d4 (== Theme.tier-pick / accent-primary), keycap face
+       #20242a. Single source of truth for both the startup lockup and the
+       window/taskbar icon (culler/ui/*.slint reference it via @image-url).
+       rgba() written as explicit *-opacity attributes for portable parsing. -->
+  <rect x="10" y="14" width="108" height="104" rx="22" fill="#101215" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2"/>
+  <rect x="10" y="10" width="108" height="98" rx="22" fill="#20242a"/>
+  <rect x="10.5" y="10.5" width="107" height="97" rx="21.5" fill="none" stroke="#ffffff" stroke-opacity="0.14" stroke-width="1"/>
+  <rect x="20" y="20" width="88" height="78" rx="14" fill="none" stroke="#ffffff" stroke-opacity="0.06" stroke-width="1.5"/>
+  <polygon points="45,40 45,78 68,59" fill="#5a93d4"/>
+  <polygon points="66,40 66,78 89,59" fill="#5a93d4"/>
+</svg>

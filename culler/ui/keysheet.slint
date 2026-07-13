@@ -2,10 +2,12 @@ import { Theme } from "theme.slint";
 
 // culler/ui/keysheet.slint — DESIGN.md §4 screen 2e: the keymap cheat-sheet,
 // bound to `?` (Task 9b, optional/cheap per DESIGN §6). Static content only —
-// the row text below mirrors the canonical §9 keymap table exactly; the four
-// groups (TIER / NAVIGATE / VIEW & TAGS / SESSION) and their row order follow
-// screens/2e-keymap.png. Gated in app.slint via `if root.help-open: KeySheet
-// {}` (same pattern as TagEntry/ApplyDialog) — this component has no
+// the row text follows the canonical §9 keymap table, terse per screens/
+// 2e-keymap.png where the fixed-width panel demands it (F reads "cycle tier
+// filter", not the full "All → ≥Keep → …" cycle, which would overflow). The
+// four groups (TIER / NAVIGATE / VIEW & TAGS / SESSION) and their row order
+// follow screens/2e-keymap.png too. Gated in app.slint via `if root.help-open:
+// KeySheet {}` (same pattern as TagEntry/ApplyDialog) — this component has no
 // visibility property of its own.
 
 // One key-cap + description row (§2.6/§5: chip-bg pill, border-input 1px,
@@ -50,6 +52,11 @@ component KeyRow inherits HorizontalLayout {
 component KeyGroup inherits VerticalLayout {
     in property <string> title;
     spacing: 6px;
+    // Pack title + rows to the top. Without this, Slint's default `alignment:
+    // stretch` spreads the rows apart whenever the enclosing grid cell is taller
+    // than this group (e.g. NAVIGATE sharing a row with the taller TIER) — the
+    // "NAVIGATE shifted down" bug.
+    alignment: start;
     Text {
         text: root.title;
         font-family: Theme.font-mono;
@@ -76,8 +83,9 @@ export component KeySheet inherits Rectangle {
         // height defaults to 100% of its parent (the full-window scrim) — the
         // same binding-loop hazard TagEntry's header comment already discloses
         // for width. Content is static (6 groups, fixed row counts), so a fixed
-        // height sized to fit it is exact, not an approximation.
-        height: 460px;
+        // height sized to fit it is exact, not an approximation. 500px fits the
+        // VIEW & TAGS group after its two added rows (enter/focus + F11).
+        height: 500px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.panel-dialog;
@@ -94,6 +102,12 @@ export component KeySheet inherits Rectangle {
         VerticalLayout {
             padding: 22px;
             spacing: 18px;
+            // Pack header + grid to the top rather than letting Slint's default
+            // `alignment: stretch` distribute any panel slack as gaps between rows.
+            // The grid's height (TIER row + VIEW&TAGS row) equals the old stacked
+            // left column the 500px was sized for, so slack is ~nil either way — but
+            // `start` keeps it deterministic.
+            alignment: start;
 
             HorizontalLayout {
                 Text {
@@ -113,11 +127,18 @@ export component KeySheet inherits Rectangle {
                 }
             }
 
-            HorizontalLayout {
-                spacing: 40px;
+            // Two-by-two group grid (screens/2e-keymap.png): TIER │ NAVIGATE on the
+            // top row, VIEW & TAGS │ SESSION on the bottom. A GridLayout — not two
+            // independent VerticalLayout columns — is what keeps the bottom-row
+            // labels aligned across columns even though TIER has one more row than
+            // NAVIGATE: the second Row starts at a single y for both cells. Column
+            // widths track content; `spacing-horizontal` is kept tight (20px) so both
+            // columns fit inside the fixed 640px panel without clipping.
+            GridLayout {
+                spacing-horizontal: 20px;
+                spacing-vertical: 18px;
 
-                VerticalLayout {
-                    spacing: 18px;
+                Row {
                     KeyGroup {
                         title: "TIER";
                         KeyRow { keycap: "1"; desc: "Keep (auto-advance)"; }
@@ -128,22 +149,25 @@ export component KeySheet inherits Rectangle {
                         KeyRow { keycap: "U"; desc: "undo last tier/tag change"; }
                     }
                     KeyGroup {
-                        title: "VIEW & TAGS";
-                        KeyRow { keycap: "T"; desc: "tag entry (autocomplete; comma-separates)"; }
-                        KeyRow { keycap: "Z"; desc: "toggle 1:1 zoom (zoom + pan persist)"; }
-                        KeyRow { keycap: "?"; desc: "this help"; }
-                    }
-                }
-
-                VerticalLayout {
-                    spacing: 18px;
-                    KeyGroup {
                         title: "NAVIGATE";
                         KeyRow { keycap: "← →"; desc: "prev / next"; }
                         KeyRow { keycap: "space"; cap-width: 60px; desc: "next"; }
                         KeyRow { keycap: "bksp"; cap-width: 60px; desc: "prev"; }
-                        KeyRow { keycap: "Tab"; desc: "jump to next unvisited shot"; }
-                        KeyRow { keycap: "F"; desc: "cycle filter: All → ≥Keep → ≥Pick → ≥Best → Rejects"; }
+                        KeyRow { keycap: "Tab"; desc: "next unvisited shot"; }
+                        // Terse per the reference sheet — the full "All → ≥Keep → …"
+                        // cycle (spec §9) overflows this two-column panel.
+                        KeyRow { keycap: "F"; desc: "cycle tier filter"; }
+                    }
+                }
+
+                Row {
+                    KeyGroup {
+                        title: "VIEW & TAGS";
+                        KeyRow { keycap: "T"; desc: "tag entry (autocomplete; comma-separates)"; }
+                        KeyRow { keycap: "Z"; desc: "toggle 1:1 zoom (zoom + pan persist)"; }
+                        KeyRow { keycap: "enter"; cap-width: 62px; desc: "focus mode (hide all HUD)"; }
+                        KeyRow { keycap: "F11"; desc: "toggle fullscreen"; }
+                        KeyRow { keycap: "?"; desc: "this help"; }
                     }
                     KeyGroup {
                         title: "SESSION";

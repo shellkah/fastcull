@@ -509,6 +509,7 @@ mod startup_tests {
             raw: None,
             sidecar: None,
             capture: CaptureTime::default(),
+            exif: None,
         }
     }
 

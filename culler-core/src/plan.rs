@@ -219,6 +219,7 @@ mod tests {
             raw: raw.map(|e| PathBuf::from(format!("/src/{stem}.{e}"))),
             sidecar: sidecar.map(PathBuf::from),
             capture: CaptureTime::default(),
+            exif: None,
         }
     }
 

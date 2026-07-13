@@ -131,6 +131,7 @@ mod tests {
                     datetime: Some("2026:07:08 10:00:00".to_string()),
                     subsec: Some(1),
                 },
+                exif: None,
             }],
             decisions: std::collections::HashMap::new(),
             current: 0,
