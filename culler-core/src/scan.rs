@@ -1,8 +1,9 @@
 //! Folder scan: a flat (non-recursive) walk that groups files by filename stem
 //! into `Shot`s and sorts them into a stable, capture-time filmstrip order.
 //!
-//! A shot REQUIRES a JPEG display file in v1: stems with only a RAW are not
-//! cullable shots (they are surfaced by `scan_report`, added in a later task).
+//! A shot needs a JPEG or a previewable RAW (Fuji RAF today, via its embedded
+//! JPEG). A RAW-only stem with no embedded-preview extractor (CR3/NEF/…) is
+//! not a cullable shot — it is surfaced separately by `scan_report`.
 //! Zero GUI dependencies.
 
 use crate::model::{CaptureTime, ExifSummary, JPEG_EXTS, RAW_EXTS, Shot};
@@ -118,13 +119,25 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
                 });
             }
             None => {
-                // No JPEG → not a cullable shot in v1. Report the RAW so a
-                // RAW-only stem isn't silently dropped (embedded-preview
-                // extraction is a phase-2 item).
-                if let Some(raw) = group.raw {
-                    raw_only.push(raw);
+                match group.raw {
+                    // A previewable RAW-only stem (Fuji RAF) is a cullable shot,
+                    // shown via its embedded JPEG. Capture/EXIF come from that JPEG.
+                    Some(raw) if raw_ext_supported(&raw) => {
+                        let (capture, exif) = read_exif_data_raf(&raw);
+                        shots.push(Shot {
+                            stem,
+                            jpeg: None,
+                            raw: Some(raw),
+                            sidecar: group.sidecar,
+                            capture,
+                            exif,
+                        });
+                    }
+                    // Non-previewable RAW (CR3/NEF/…): report it, unchanged.
+                    Some(raw) => raw_only.push(raw),
+                    // Orphan sidecar with neither JPEG nor RAW — dropped, as before.
+                    None => {}
                 }
-                // A stem with neither JPEG nor RAW (e.g. an orphan file) is dropped.
             }
         }
     }
@@ -144,6 +157,13 @@ fn ext_lower(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
+}
+
+/// True when `path`'s extension has an embedded-preview extractor (Fuji RAF today).
+fn raw_ext_supported(path: &Path) -> bool {
+    ext_lower(path)
+        .as_deref()
+        .is_some_and(crate::raw::preview_supported)
 }
 
 /// The filename portion before the final extension, as an owned `String`.
@@ -179,26 +199,45 @@ fn sidecar_stem(path: &Path) -> String {
     inner.to_string()
 }
 
-/// Read `DateTimeOriginal` / `SubSecTimeOriginal` (capture time) and the HUD's
-/// exposure/aperture/ISO/focal-length summary from a JPEG's EXIF header in a
-/// single parse (`exif::Reader` runs once; both readers share the resulting
-/// `exif::Exif`). Undecodable or EXIF-less files never fail the scan — they
-/// yield a default (empty) `CaptureTime` and `None` exif summary, so such
-/// shots simply sort after all dated ones and show no HUD line.
+/// Read capture time + HUD summary from a JPEG file's EXIF (single parse).
+/// Undecodable/EXIF-less files never fail the scan — default `CaptureTime` + `None`.
 fn read_exif_data(jpeg: &Path) -> (CaptureTime, Option<ExifSummary>) {
     let file = match std::fs::File::open(jpeg) {
         Ok(f) => f,
         Err(_) => return (CaptureTime::default(), None),
     };
     let mut reader = std::io::BufReader::new(file);
-    let exif = match exif::Reader::new().read_from_container(&mut reader) {
-        Ok(e) => e,
+    match exif::Reader::new().read_from_container(&mut reader) {
+        Ok(exif) => capture_and_summary(&exif),
+        Err(_) => (CaptureTime::default(), None),
+    }
+}
+
+/// Same as `read_exif_data` but for a Fuji RAF: the EXIF lives inside the
+/// embedded JPEG (kamadak-exif can't read the RAF container), so extract that
+/// first. Any failure degrades to default `CaptureTime` + `None`.
+fn read_exif_data_raf(raf: &Path) -> (CaptureTime, Option<ExifSummary>) {
+    let data = match std::fs::read(raf) {
+        Ok(d) => d,
         Err(_) => return (CaptureTime::default(), None),
     };
-    let datetime = ascii_field(&exif, exif::Tag::DateTimeOriginal);
-    let subsec = ascii_field(&exif, exif::Tag::SubSecTimeOriginal).and_then(|s| parse_subsec(&s));
-    let capture = CaptureTime { datetime, subsec };
-    (capture, read_exif_summary(&exif))
+    let jpeg = match crate::raw::embedded_jpeg(&data) {
+        Some(j) => j,
+        None => return (CaptureTime::default(), None),
+    };
+    let mut cursor = std::io::Cursor::new(jpeg);
+    match exif::Reader::new().read_from_container(&mut cursor) {
+        Ok(exif) => capture_and_summary(&exif),
+        Err(_) => (CaptureTime::default(), None),
+    }
+}
+
+/// Capture time + `ExifSummary` from an already-parsed `Exif` (shared by the
+/// JPEG and RAF readers — one parse each).
+fn capture_and_summary(exif: &exif::Exif) -> (CaptureTime, Option<ExifSummary>) {
+    let datetime = ascii_field(exif, exif::Tag::DateTimeOriginal);
+    let subsec = ascii_field(exif, exif::Tag::SubSecTimeOriginal).and_then(|s| parse_subsec(&s));
+    (CaptureTime { datetime, subsec }, read_exif_summary(exif))
 }
 
 /// Build the loupe HUD's `ExifSummary` from an already-parsed `exif::Exif`
@@ -651,6 +690,90 @@ mod tests {
         jpeg.extend_from_slice(&tiff);
         jpeg.extend_from_slice(&[0xFF, 0xD9]); // EOI
         jpeg
+    }
+
+    /// Wrap JPEG bytes (e.g. from `jpeg_with_exif`) in a minimal Fuji RAF container.
+    fn wrap_raf(jpeg: &[u8]) -> Vec<u8> {
+        let off = 128usize;
+        let mut raf = Vec::new();
+        raf.extend_from_slice(b"FUJIFILMCCD-RAW ");
+        raf.resize(off, 0);
+        raf[84..88].copy_from_slice(&(off as u32).to_be_bytes());
+        raf[88..92].copy_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        raf.extend_from_slice(jpeg);
+        raf
+    }
+
+    #[test]
+    fn raf_only_stem_is_promoted_with_embedded_capture_time() {
+        let dir = unique_temp_dir("rafonly");
+        std::fs::write(
+            dir.join("DSCF0001.RAF"),
+            wrap_raf(&jpeg_with_exif("2026:07:08 10:11:12", "42")),
+        )
+        .unwrap();
+
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        assert_eq!(stems(&shots), vec!["DSCF0001".to_string()]);
+        assert!(
+            raw_only.is_empty(),
+            "a previewable RAF-only stem is a shot, not raw_only"
+        );
+        assert_eq!(shots[0].jpeg, None);
+        assert_eq!(shots[0].raw, Some(dir.join("DSCF0001.RAF")));
+        assert_eq!(
+            shots[0].capture.datetime,
+            Some("2026:07:08 10:11:12".to_string())
+        );
+        assert_eq!(shots[0].capture.subsec, Some(420));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cr3_only_stem_stays_raw_only_not_a_shot() {
+        let dir = unique_temp_dir("cr3only");
+        touch(&dir.join("IMG_0001.CR3")); // no previewable extractor -> unchanged behavior
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        assert!(shots.is_empty());
+        assert_eq!(raw_only, vec![dir.join("IMG_0001.CR3")]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jpeg_and_raf_sharing_a_stem_are_one_shot() {
+        let dir = unique_temp_dir("rafpair");
+        touch(&dir.join("DSCF0002.JPG"));
+        std::fs::write(
+            dir.join("DSCF0002.RAF"),
+            wrap_raf(&jpeg_with_exif("2026:07:08 09:00:00", "10")),
+        )
+        .unwrap();
+        let (shots, raw_only) = scan_report(&dir).unwrap();
+        assert_eq!(stems(&shots), vec!["DSCF0002".to_string()]);
+        assert!(raw_only.is_empty());
+        assert_eq!(shots[0].raw, Some(dir.join("DSCF0002.RAF")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raf_only_shot_sorts_by_embedded_capture_time() {
+        let dir = unique_temp_dir("rafsort");
+        std::fs::write(
+            dir.join("B_late.RAF"),
+            wrap_raf(&jpeg_with_exif("2026:07:08 10:00:00", "00")),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("A_early.RAF"),
+            wrap_raf(&jpeg_with_exif("2026:07:08 09:00:00", "00")),
+        )
+        .unwrap();
+        let shots = scan(&dir).unwrap();
+        assert_eq!(
+            stems(&shots),
+            vec!["A_early".to_string(), "B_late".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
