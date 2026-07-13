@@ -29,10 +29,14 @@ pub fn embedded_jpeg(data: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let off = u32::from_be_bytes(
-        data[RAF_JPEG_OFFSET_POS..RAF_JPEG_OFFSET_POS + 4].try_into().ok()?,
+        data[RAF_JPEG_OFFSET_POS..RAF_JPEG_OFFSET_POS + 4]
+            .try_into()
+            .ok()?,
     ) as usize;
     let len = u32::from_be_bytes(
-        data[RAF_JPEG_LENGTH_POS..RAF_JPEG_LENGTH_POS + 4].try_into().ok()?,
+        data[RAF_JPEG_LENGTH_POS..RAF_JPEG_LENGTH_POS + 4]
+            .try_into()
+            .ok()?,
     ) as usize;
     if len == 0 {
         return None;
@@ -54,7 +58,10 @@ mod tests {
     /// Minimal synthetic RAF: 16-byte magic, header zero-padded to `jpeg_off`,
     /// then `jpeg`; the offset(@84)/length(@88) fields point at it (big-endian).
     fn synth_raf(jpeg: &[u8], jpeg_off: usize) -> Vec<u8> {
-        assert!(jpeg_off >= 92, "the offset/length header fields occupy bytes 84..92");
+        assert!(
+            jpeg_off >= 92,
+            "the offset/length header fields occupy bytes 84..92"
+        );
         let mut raf = Vec::new();
         raf.extend_from_slice(RAF_MAGIC);
         raf.resize(jpeg_off, 0);
