@@ -256,7 +256,12 @@ fn build_culling_ui(
                 }
             }
             // Request the exact target for current.
-            pipeline.enqueue(cur, s.shots[cur].jpeg.clone(), z.target(fw, fh), false);
+            pipeline.enqueue(
+                cur,
+                s.shots[cur].display_path().to_path_buf(),
+                z.target(fw, fh),
+                false,
+            );
             // Prefetch neighbors (fit-size only). thumb_first: true — an
             // embedded EXIF thumbnail paints the filmstrip tile instantly
             // (spec §12), refined by the real decode moments later. The
@@ -266,7 +271,7 @@ fn build_culling_ui(
                 if idx != cur && !cache.lock().unwrap().contains(idx) {
                     pipeline.enqueue(
                         idx,
-                        s.shots[idx].jpeg.clone(),
+                        s.shots[idx].display_path().to_path_buf(),
                         TargetSize::Fit(fw, fh),
                         true,
                     );

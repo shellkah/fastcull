@@ -178,7 +178,12 @@ fn trim_trailing_zero(v: f32) -> String {
 #[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Shot {
     pub stem: String, // the shot key, e.g. "IMG_1234" (case preserved as on disk)
-    pub jpeg: std::path::PathBuf, // display file, required in v1
+    /// Display JPEG, if the stem has one. `None` for a RAW-only stem (shown
+    /// via its RAW's embedded preview). `#[serde(default)]` so session files
+    /// saved before this field was optional still deserialize (missing key
+    /// → `None`), matching `exif` below.
+    #[serde(default)]
+    pub jpeg: Option<std::path::PathBuf>,
     pub raw: Option<std::path::PathBuf>,
     pub sidecar: Option<std::path::PathBuf>, // pre-existing xmp (either convention)
     pub capture: CaptureTime,
@@ -191,10 +196,12 @@ pub struct Shot {
 }
 
 impl Shot {
-    /// All on-disk files belonging to this shot, in move order: jpeg, raw?, sidecar?.
+    /// All on-disk files belonging to this shot, in move order: jpeg?, raw?, sidecar?.
     pub fn files(&self) -> Vec<std::path::PathBuf> {
         let mut out = Vec::with_capacity(3);
-        out.push(self.jpeg.clone());
+        if let Some(jpeg) = &self.jpeg {
+            out.push(jpeg.clone());
+        }
         if let Some(raw) = &self.raw {
             out.push(raw.clone());
         }
@@ -202,6 +209,20 @@ impl Shot {
             out.push(sidecar.clone());
         }
         out
+    }
+
+    /// The file the loupe decodes by default: the JPEG if present, else the RAW.
+    /// Never panics — `scan` guarantees at least one of jpeg/raw is present.
+    pub fn display_path(&self) -> &std::path::Path {
+        self.jpeg
+            .as_deref()
+            .or(self.raw.as_deref())
+            .expect("Shot invariant: at least one of jpeg/raw is present")
+    }
+
+    /// True when this shot has no JPEG (shown via its RAW's embedded preview).
+    pub fn is_raw_only(&self) -> bool {
+        self.jpeg.is_none()
     }
 }
 
@@ -505,7 +526,7 @@ mod tests {
     fn shot_files_lists_jpeg_only_when_no_siblings() {
         let shot = Shot {
             stem: "IMG_1234".to_string(),
-            jpeg: std::path::PathBuf::from("/src/IMG_1234.JPG"),
+            jpeg: Some(std::path::PathBuf::from("/src/IMG_1234.JPG")),
             raw: None,
             sidecar: None,
             capture: CaptureTime::default(),
@@ -521,7 +542,7 @@ mod tests {
     fn shot_files_orders_jpeg_then_raw_then_sidecar() {
         let shot = Shot {
             stem: "IMG_1234".to_string(),
-            jpeg: std::path::PathBuf::from("/src/IMG_1234.JPG"),
+            jpeg: Some(std::path::PathBuf::from("/src/IMG_1234.JPG")),
             raw: Some(std::path::PathBuf::from("/src/IMG_1234.CR3")),
             sidecar: Some(std::path::PathBuf::from("/src/IMG_1234.xmp")),
             capture: CaptureTime {
@@ -553,7 +574,7 @@ mod tests {
             source_dir: std::path::PathBuf::from("/src"),
             shots: vec![Shot {
                 stem: "IMG_0001".to_string(),
-                jpeg: std::path::PathBuf::from("/src/IMG_0001.JPG"),
+                jpeg: Some(std::path::PathBuf::from("/src/IMG_0001.JPG")),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
@@ -594,7 +615,7 @@ mod tests {
             source_dir: std::path::PathBuf::from("/src"),
             shots: vec![Shot {
                 stem: "IMG_0001".to_string(),
-                jpeg: std::path::PathBuf::from("/src/IMG_0001.JPG"),
+                jpeg: Some(std::path::PathBuf::from("/src/IMG_0001.JPG")),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
@@ -617,7 +638,7 @@ mod tests {
         let mut session = Session::default();
         session.shots.push(Shot {
             stem: "IMG_0001".to_string(),
-            jpeg: std::path::PathBuf::from("/src/IMG_0001.JPG"),
+            jpeg: Some(std::path::PathBuf::from("/src/IMG_0001.JPG")),
             raw: None,
             sidecar: None,
             capture: CaptureTime::default(),
@@ -655,7 +676,7 @@ mod tests {
         for stem in stems {
             session.shots.push(Shot {
                 stem: (*stem).to_string(),
-                jpeg: std::path::PathBuf::from(format!("/src/{stem}.JPG")),
+                jpeg: Some(std::path::PathBuf::from(format!("/src/{stem}.JPG"))),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
@@ -1013,5 +1034,68 @@ mod tests {
             focal_length_mm: Some(35.0),
         };
         assert_eq!(e.hud_line(), "\u{192}1.8 \u{b7} 35mm");
+    }
+
+    #[test]
+    fn display_path_prefers_jpeg_then_raw() {
+        let pair = Shot {
+            stem: "IMG".into(),
+            jpeg: Some("/s/IMG.JPG".into()),
+            raw: Some("/s/IMG.RAF".into()),
+            sidecar: None,
+            capture: CaptureTime::default(),
+            exif: None,
+        };
+        assert_eq!(pair.display_path(), std::path::Path::new("/s/IMG.JPG"));
+        assert!(!pair.is_raw_only());
+
+        let raw_only = Shot {
+            stem: "IMG".into(),
+            jpeg: None,
+            raw: Some("/s/IMG.RAF".into()),
+            sidecar: None,
+            capture: CaptureTime::default(),
+            exif: None,
+        };
+        assert_eq!(raw_only.display_path(), std::path::Path::new("/s/IMG.RAF"));
+        assert!(raw_only.is_raw_only());
+    }
+
+    #[test]
+    fn files_lists_raw_first_when_no_jpeg() {
+        let raw_only = Shot {
+            stem: "IMG".into(),
+            jpeg: None,
+            raw: Some("/s/IMG.RAF".into()),
+            sidecar: Some("/s/IMG.RAF.xmp".into()),
+            capture: CaptureTime::default(),
+            exif: None,
+        };
+        assert_eq!(
+            raw_only.files(),
+            vec![
+                std::path::PathBuf::from("/s/IMG.RAF"),
+                std::path::PathBuf::from("/s/IMG.RAF.xmp"),
+            ]
+        );
+    }
+
+    #[test]
+    fn shot_jpeg_none_serde_round_trips() {
+        let shot = Shot {
+            stem: "IMG".into(),
+            jpeg: None,
+            raw: Some("/s/IMG.RAF".into()),
+            sidecar: None,
+            capture: CaptureTime::default(),
+            exif: None,
+        };
+        let json = serde_json::to_string(&shot).unwrap();
+        let back: Shot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, shot);
+        // An old session with a present jpeg string still loads as Some.
+        let old = r#"{"stem":"IMG","jpeg":"/s/IMG.JPG","raw":null,"sidecar":null,"capture":{"datetime":null,"subsec":null}}"#;
+        let s: Shot = serde_json::from_str(old).unwrap();
+        assert_eq!(s.jpeg, Some(std::path::PathBuf::from("/s/IMG.JPG")));
     }
 }

@@ -505,7 +505,7 @@ mod startup_tests {
     fn shot(stem: &str, dir: &std::path::Path) -> Shot {
         Shot {
             stem: stem.into(),
-            jpeg: dir.join(format!("{stem}.JPG")),
+            jpeg: Some(dir.join(format!("{stem}.JPG"))),
             raw: None,
             sidecar: None,
             capture: CaptureTime::default(),

@@ -110,7 +110,7 @@ pub fn scan_report(dir: &Path) -> Result<(Vec<Shot>, Vec<PathBuf>), ScanError> {
                 let (capture, exif) = read_exif_data(&jpeg);
                 shots.push(Shot {
                     stem,
-                    jpeg,
+                    jpeg: Some(jpeg),
                     raw: group.raw,
                     sidecar: group.sidecar,
                     capture,
@@ -300,7 +300,7 @@ fn sort_key(shot: &Shot) -> (bool, Option<String>, Option<u32>, String) {
         shot.capture.datetime.is_none(),
         shot.capture.datetime.clone(),
         shot.capture.subsec,
-        file_name_string(&shot.jpeg),
+        file_name_string(shot.display_path()),
     )
 }
 
@@ -431,7 +431,7 @@ mod tests {
         // Deterministic first-wins (plan's documented Known edge): the
         // sorted-path-order winner claims the display slot regardless of
         // readdir order.
-        assert_eq!(shots[0].jpeg, dir.join("IMG_0001.jpeg"));
+        assert_eq!(shots[0].jpeg, Some(dir.join("IMG_0001.jpeg")));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -452,7 +452,7 @@ mod tests {
             ]
         );
         // The display-file path is carried verbatim (on-disk case preserved).
-        assert_eq!(shots[0].jpeg, dir.join("IMG_0001.JPG"));
+        assert_eq!(shots[0].jpeg, Some(dir.join("IMG_0001.JPG")));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -371,7 +371,7 @@ mod filter_tests {
             let stem = format!("IMG_{i:04}");
             shots.push(Shot {
                 stem: stem.clone(),
-                jpeg: std::path::PathBuf::from(format!("/src/{stem}.JPG")),
+                jpeg: Some(std::path::PathBuf::from(format!("/src/{stem}.JPG"))),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
@@ -584,7 +584,7 @@ mod action_tests {
             let stem = format!("IMG_{i:04}");
             shots.push(Shot {
                 stem: stem.clone(),
-                jpeg: std::path::PathBuf::from(format!("/src/{stem}.JPG")),
+                jpeg: Some(std::path::PathBuf::from(format!("/src/{stem}.JPG"))),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),

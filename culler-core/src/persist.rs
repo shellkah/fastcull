@@ -124,7 +124,7 @@ mod tests {
             source_dir: dir.clone(),
             shots: vec![Shot {
                 stem: "IMG_0001".to_string(),
-                jpeg: dir.join("IMG_0001.JPG"),
+                jpeg: Some(dir.join("IMG_0001.JPG")),
                 raw: Some(dir.join("IMG_0001.CR3")),
                 sidecar: None,
                 capture: CaptureTime {

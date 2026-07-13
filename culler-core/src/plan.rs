@@ -215,7 +215,7 @@ mod tests {
     fn shot(stem: &str, ext: &str, raw: Option<&str>, sidecar: Option<&str>) -> Shot {
         Shot {
             stem: stem.to_string(),
-            jpeg: PathBuf::from(format!("/src/{stem}.{ext}")),
+            jpeg: Some(PathBuf::from(format!("/src/{stem}.{ext}"))),
             raw: raw.map(|e| PathBuf::from(format!("/src/{stem}.{e}"))),
             sidecar: sidecar.map(PathBuf::from),
             capture: CaptureTime::default(),

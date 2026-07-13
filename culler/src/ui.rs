@@ -190,7 +190,8 @@ pub fn hud_text(session: &Session, filter: Filter) -> HudText {
     .to_string();
     let current_shot = session.shots.get(session.current);
     let filename = current_shot
-        .and_then(|s| s.jpeg.file_name())
+        .map(|s| s.display_path())
+        .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let has_raw = current_shot.is_some_and(|s| s.raw.is_some());
@@ -266,7 +267,7 @@ mod hud_tests {
             let stem = format!("IMG_{i:04}");
             shots.push(Shot {
                 stem: stem.clone(),
-                jpeg: format!("/s/{stem}.JPG").into(),
+                jpeg: Some(format!("/s/{stem}.JPG").into()),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
@@ -450,7 +451,7 @@ mod color_tests {
             let stem = format!("IMG_{i:04}");
             shots.push(Shot {
                 stem: stem.clone(),
-                jpeg: format!("/s/{stem}.JPG").into(),
+                jpeg: Some(format!("/s/{stem}.JPG").into()),
                 raw: None,
                 sidecar: None,
                 capture: CaptureTime::default(),
