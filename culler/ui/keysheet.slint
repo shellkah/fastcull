@@ -85,7 +85,8 @@ export component KeySheet inherits Rectangle {
         // for width. Content is static (6 groups, fixed row counts), so a fixed
         // height sized to fit it is exact, not an approximation. 500px fits the
         // VIEW & TAGS group after its two added rows (enter/focus + F11).
-        height: 500px;
+        // +32px for r (RAW/JPEG toggle) row added in Task 8.
+        height: 532px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.panel-dialog;
@@ -165,6 +166,7 @@ export component KeySheet inherits Rectangle {
                         title: "VIEW & TAGS";
                         KeyRow { keycap: "T"; desc: "tag entry (autocomplete; comma-separates)"; }
                         KeyRow { keycap: "Z"; desc: "toggle 1:1 zoom (zoom + pan persist)"; }
+                        KeyRow { keycap: "r"; desc: "RAW / JPEG preview toggle"; }
                         KeyRow { keycap: "enter"; cap-width: 62px; desc: "focus mode (hide all HUD)"; }
                         KeyRow { keycap: "F11"; desc: "toggle fullscreen"; }
                         KeyRow { keycap: "?"; desc: "this help"; }
