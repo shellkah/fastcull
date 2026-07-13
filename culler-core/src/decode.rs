@@ -1082,7 +1082,10 @@ mod tests {
         let mut raf = wrap_raf(&jpeg);
         raf[88..92].copy_from_slice(&0u32.to_be_bytes());
         let (_dir, path) = write_temp_named("empty.raf", &raf);
-        assert!(matches!(decode(&path, TargetSize::Full), Err(DecodeError::Unsupported)));
+        assert!(matches!(
+            decode(&path, TargetSize::Full),
+            Err(DecodeError::Unsupported)
+        ));
     }
 
     #[test]
