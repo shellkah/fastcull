@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libturbojpeg0-dev libfontconfig1-dev \
+            clang libclang-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p culler
+
+      - name: Package
+        run: |
+          STAGE="culler-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux"
+          mkdir "$STAGE"
+          cp target/release/culler "$STAGE/"
+          strip "$STAGE/culler"
+          cp README.md LICENSE "$STAGE/"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: culler-*-linux.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## FastCull ${{ github.ref_name }}
+
+            Native Linux builds for **x86_64** and **aarch64**.
+
+            ### Install
+            ```sh
+            tar xzf culler-${{ github.ref_name }}-x86_64-linux.tar.gz   # or -aarch64-linux
+            ./culler-${{ github.ref_name }}-x86_64-linux/culler --help
+            ```
+
+            The binary statically links Skia and needs only **libjpeg-turbo** and
+            **fontconfig** at runtime:
+            ```sh
+            sudo apt install libturbojpeg0 libfontconfig1
+            ```
+
+            Verify a download with its `.sha256` sidecar:
+            ```sh
+            sha256sum -c culler-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+            ```
