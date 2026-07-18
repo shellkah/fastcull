@@ -9,7 +9,7 @@ use culler_core::model::{
 use std::path::{Path, PathBuf};
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "culler", about = "FastCull — keyboard-driven photo culling")]
+#[command(name = "fastcull", about = "FastCull — keyboard-driven photo culling")]
 pub struct Cli {
     /// Source folder of shots (scanned flat, non-recursive). Omit to open the
     /// startup screen and pick a folder interactively.

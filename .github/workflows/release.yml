@@ -42,10 +42,10 @@ jobs:
 
       - name: Package
         run: |
-          STAGE="culler-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux"
+          STAGE="fastcull-${GITHUB_REF_NAME}-${{ matrix.arch }}-linux"
           mkdir "$STAGE"
-          cp target/release/culler "$STAGE/"
-          strip "$STAGE/culler"
+          cp target/release/fastcull "$STAGE/"
+          strip "$STAGE/fastcull"
           cp README.md LICENSE "$STAGE/"
           tar czf "${STAGE}.tar.gz" "$STAGE"
           sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
@@ -53,7 +53,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.arch }}
-          path: culler-*-linux.tar.gz*
+          path: fastcull-*-linux.tar.gz*
           if-no-files-found: error
 
   release:
@@ -79,8 +79,8 @@ jobs:
 
             ### Install
             ```sh
-            tar xzf culler-${{ github.ref_name }}-x86_64-linux.tar.gz   # or -aarch64-linux
-            ./culler-${{ github.ref_name }}-x86_64-linux/culler --help
+            tar xzf fastcull-${{ github.ref_name }}-x86_64-linux.tar.gz   # or -aarch64-linux
+            ./fastcull-${{ github.ref_name }}-x86_64-linux/fastcull --help
             ```
 
             The binary statically links Skia and needs only **libjpeg-turbo** and
@@ -91,5 +91,5 @@ jobs:
 
             Verify a download with its `.sha256` sidecar:
             ```sh
-            sha256sum -c culler-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+            sha256sum -c fastcull-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
             ```

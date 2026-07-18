@@ -54,8 +54,8 @@ Grab the tarball for your architecture from the
 [latest release](https://github.com/shellkah/fastcull/releases/latest):
 
 ```sh
-tar xzf culler-vX.Y.Z-x86_64-linux.tar.gz      # or -aarch64-linux
-./culler-vX.Y.Z-x86_64-linux/culler --help
+tar xzf fastcull-vX.Y.Z-x86_64-linux.tar.gz    # or -aarch64-linux
+./fastcull-vX.Y.Z-x86_64-linux/fastcull --help
 ```
 
 The binary statically links Skia; at runtime it needs only **libjpeg-turbo** and
@@ -73,7 +73,7 @@ Requires **Rust 1.85+** (2024 edition) and these system packages:
 ```sh
 sudo apt install -y pkg-config libturbojpeg0-dev libfontconfig1-dev \
   clang libclang-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev
-cargo build --release          # binary at target/release/culler
+cargo build --release          # binary at target/release/fastcull
 ```
 
 > `culler-core` links the system **libjpeg-turbo** through `pkg-config` (the
@@ -83,8 +83,8 @@ cargo build --release          # binary at target/release/culler
 ## Usage
 
 ```sh
-culler /path/to/shoot     # open a folder directly
-culler                    # no arg → startup screen, pick a folder interactively
+fastcull /path/to/shoot   # open a folder directly
+fastcull                  # no arg → startup screen, pick a folder interactively
 ```
 
 The source folder is scanned **flat** (non-recursive). Work through the shots,
@@ -134,7 +134,8 @@ cargo fmt --all -- --check
 ```
 
 Two crates: **`culler-core`** (scan, EXIF/XMP, JPEG/RAW decode, plan + apply
-engine, persistence) and **`culler`** (the Slint GUI + CLI). Design docs live in
+engine, persistence) and **`culler`** (the Slint GUI + CLI, which builds the
+`fastcull` binary). Design docs live in
 [`docs/`](docs/) — start with
 [`docs/specs/2026-07-08-fastcull-design.md`](docs/specs/2026-07-08-fastcull-design.md).
 
