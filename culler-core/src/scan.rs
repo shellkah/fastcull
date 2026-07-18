@@ -938,12 +938,16 @@ mod tests {
     fn exif_summary_parses_all_four_fields() {
         let dir = unique_temp_dir("exifsummary");
         let entries = vec![
-            rational_entry(0x829a, 1, 250),   // ExposureTime = 1/250s
-            rational_entry(0x829d, 28, 10),   // FNumber = 2.8
-            short_entry(0x8827, 400),         // PhotographicSensitivity = ISO 400
-            rational_entry(0x920a, 850, 10),  // FocalLength = 85.0mm
+            rational_entry(0x829a, 1, 250),  // ExposureTime = 1/250s
+            rational_entry(0x829d, 28, 10),  // FNumber = 2.8
+            short_entry(0x8827, 400),        // PhotographicSensitivity = ISO 400
+            rational_entry(0x920a, 850, 10), // FocalLength = 85.0mm
         ];
-        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            wrap_jpeg_exif(&build_tiff(&entries)),
+        )
+        .unwrap();
 
         let shots = scan(&dir).unwrap();
         assert_eq!(shots.len(), 1);
@@ -964,7 +968,11 @@ mod tests {
         let dir = unique_temp_dir("exifpartial");
         // Only FNumber and ISO present; ExposureTime and FocalLength absent.
         let entries = vec![rational_entry(0x829d, 18, 10), short_entry(0x8827, 100)];
-        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            wrap_jpeg_exif(&build_tiff(&entries)),
+        )
+        .unwrap();
 
         let shots = scan(&dir).unwrap();
         assert_eq!(
@@ -983,11 +991,15 @@ mod tests {
     fn exif_summary_coexists_with_capture_time_from_one_parse() {
         let dir = unique_temp_dir("exifboth");
         let entries = vec![
-            rational_entry(0x829a, 1, 125), // ExposureTime = 1/125s
-            short_entry(0x8827, 200),       // ISO 200
+            rational_entry(0x829a, 1, 125),             // ExposureTime = 1/125s
+            short_entry(0x8827, 200),                   // ISO 200
             ascii_entry(0x9003, "2026:07:08 10:11:12"), // DateTimeOriginal
         ];
-        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            wrap_jpeg_exif(&build_tiff(&entries)),
+        )
+        .unwrap();
 
         let shots = scan(&dir).unwrap();
         assert_eq!(
@@ -1013,7 +1025,11 @@ mod tests {
         // DateTimeOriginal (already covered by `reads_datetime_and_subsec_from_exif`;
         // the point here is that `exif` on the Shot stays `None`).
         let entries = vec![ascii_entry(0x9003, "2026:07:08 10:11:12")];
-        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            wrap_jpeg_exif(&build_tiff(&entries)),
+        )
+        .unwrap();
 
         let shots = scan(&dir).unwrap();
         assert_eq!(
@@ -1030,8 +1046,15 @@ mod tests {
         // ExposureTime encoded as ASCII instead of RATIONAL (malformed/odd
         // EXIF) alongside a well-formed ISO — the odd tag must degrade to
         // `None` for that one field, not panic and not poison the rest.
-        let entries = vec![ascii_entry(0x829a, "not-a-rational"), short_entry(0x8827, 800)];
-        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+        let entries = vec![
+            ascii_entry(0x829a, "not-a-rational"),
+            short_entry(0x8827, 800),
+        ];
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            wrap_jpeg_exif(&build_tiff(&entries)),
+        )
+        .unwrap();
 
         let shots = scan(&dir).unwrap();
         assert_eq!(
@@ -1052,7 +1075,11 @@ mod tests {
         // A malformed FNumber with denominator 0 must not panic or produce
         // an infinite/NaN f32 — it degrades to `None` for that field.
         let entries = vec![rational_entry(0x829d, 5, 0), short_entry(0x8827, 100)];
-        std::fs::write(dir.join("IMG_0001.JPG"), wrap_jpeg_exif(&build_tiff(&entries))).unwrap();
+        std::fs::write(
+            dir.join("IMG_0001.JPG"),
+            wrap_jpeg_exif(&build_tiff(&entries)),
+        )
+        .unwrap();
 
         let shots = scan(&dir).unwrap();
         assert_eq!(

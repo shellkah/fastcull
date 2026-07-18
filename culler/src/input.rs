@@ -178,7 +178,11 @@ pub fn nearest_passing(session: &Session, filter: Filter, from: usize) -> Option
     let from = from.min(n - 1);
     (from..n)
         .find(|&i| passes(filter, session.decision(i)))
-        .or_else(|| (0..from).rev().find(|&i| passes(filter, session.decision(i))))
+        .or_else(|| {
+            (0..from)
+                .rev()
+                .find(|&i| passes(filter, session.decision(i)))
+        })
 }
 
 /// Turn comma-separated tag-entry text into clean, order-preserving, deduped tags.

@@ -107,7 +107,10 @@ mod tests {
             let hist = luma_histogram(&img, bins);
             assert_eq!(hist.len(), bins, "bins={bins}");
             let max = hist.iter().cloned().fold(0.0f32, f32::max);
-            assert_eq!(max, 1.0, "tallest bucket must normalize to 1.0, bins={bins}");
+            assert_eq!(
+                max, 1.0,
+                "tallest bucket must normalize to 1.0, bins={bins}"
+            );
         }
     }
 

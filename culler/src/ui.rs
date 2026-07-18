@@ -446,7 +446,10 @@ mod hud_tests {
         // mid-typing a later tag
         assert_eq!(
             tag_segments("street, maria, mar"),
-            ("mar".to_string(), vec!["street".to_string(), "maria".to_string()])
+            (
+                "mar".to_string(),
+                vec!["street".to_string(), "maria".to_string()]
+            )
         );
         assert_eq!(tag_segments(""), ("".to_string(), vec![]));
     }

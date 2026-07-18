@@ -1022,7 +1022,10 @@ mod tests {
             iso: Some(400),
             focal_length_mm: Some(85.0),
         };
-        assert_eq!(e.hud_line(), "1/250s \u{b7} \u{192}2.8 \u{b7} ISO 400 \u{b7} 85mm");
+        assert_eq!(
+            e.hud_line(),
+            "1/250s \u{b7} \u{192}2.8 \u{b7} ISO 400 \u{b7} 85mm"
+        );
     }
 
     #[test]
