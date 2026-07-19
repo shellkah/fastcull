@@ -824,8 +824,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => {
             // 2a startup landing (DESIGN.md §4 2a, Task B): no CLI source
             // given — show the wordmark + dropzone and let the native folder
-            // picker (rfd, xdg-desktop-portal at runtime) choose one, then
-            // build the SAME culling UI the fast path builds and hide the
+            // picker (rfd — xdg-desktop-portal on Linux, AppKit on macOS)
+            // choose one, then build the SAME culling UI the fast path
+            // builds and hide the
             // startup window. `ui_holder` survives the closure so the
             // exit-flush below can still reach the session if a folder was
             // ever opened.
