@@ -915,7 +915,13 @@ mod applyflow_tests {
         let src = tmp.path();
         std::fs::write(src.join("IMG_1.JPG"), b"aaaa").unwrap();
         let bad_name = std::ffi::OsStr::from_bytes(b"IMG_\xFF.JPG");
-        std::fs::write(src.join(bad_name), b"bad").unwrap();
+        // Environment probe: Linux filenames are arbitrary byte sequences, but
+        // macOS's (UTF-8-enforcing) filesystem rejects a non-UTF-8 name with
+        // EILSEQ — the scenario under test (a non-UTF-8-named source file) cannot
+        // exist there, so skip rather than fail on an impossible fixture setup.
+        if std::fs::write(src.join(bad_name), b"bad").is_err() {
+            return;
+        }
 
         let mut decisions = std::collections::HashMap::new();
         decisions.insert(
