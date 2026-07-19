@@ -3,6 +3,7 @@ name: Release
 on:
   push:
     tags: ['v*.*.*']
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -12,7 +13,7 @@ env:
 
 jobs:
   build:
-    name: build (${{ matrix.arch }})
+    name: build linux (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:
@@ -56,13 +57,105 @@ jobs:
           path: fastcull-*-linux.tar.gz*
           if-no-files-found: error
 
+  build-macos:
+    name: build macos (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64,  runner: macos-13 }
+          - { arch: aarch64, runner: macos-14 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install jpeg-turbo
+          echo "PKG_CONFIG_PATH=$(brew --prefix jpeg-turbo)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos-${{ matrix.arch }}
+
+      - name: Build release binary
+        run: cargo build --release --locked -p culler
+
+      - name: Stage binary + its libturbojpeg slice
+        run: |
+          mkdir -p stage
+          cp target/release/fastcull "stage/fastcull-${{ matrix.arch }}"
+          ref="$(otool -L target/release/fastcull | awk '/turbojpeg/ {print $1; exit}')"
+          if [ -z "$ref" ]; then echo "fastcull does not link libturbojpeg" >&2; exit 1; fi
+          cp "$ref" "stage/libturbojpeg-${{ matrix.arch }}.dylib"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: stage/*
+          if-no-files-found: error
+
+  bundle-macos:
+    name: bundle macos universal dmg
+    needs: build-macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: slices
+          merge-multiple: true
+
+      - name: Compute version + tag
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME}"; version="${tag#v}"
+          else
+            tag="dev"; version="0.0.0"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble universal .app and .dmg
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Basename of the linked dylib (same for both arches, discovered off arm64).
+          base="$(otool -arch arm64 -L slices/fastcull-aarch64 | awk '/turbojpeg/ {print $1; exit}' | xargs basename)"
+          test -n "$base"
+          lipo -create slices/fastcull-x86_64 slices/fastcull-aarch64 -output dist/fastcull
+          lipo -create slices/libturbojpeg-x86_64.dylib slices/libturbojpeg-aarch64.dylib -output "dist/$base"
+          file dist/fastcull   # expect: Mach-O universal binary with 2 architectures
+          bash culler/macos/make-icns.sh culler/ui/logo-3a.svg dist/AppIcon.icns
+          bash culler/macos/bundle-app.sh dist/fastcull "dist/$base" dist/AppIcon.icns \
+            "${{ steps.ver.outputs.version }}" dist
+          bash culler/macos/make-dmg.sh dist/FastCull.app \
+            "FastCull ${{ steps.ver.outputs.version }}" \
+            "dist/fastcull-${{ steps.ver.outputs.tag }}-macos.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            dist/fastcull-*-macos.dmg
+            dist/fastcull-*-macos.dmg.sha256
+          if-no-files-found: error
+
   release:
     name: publish release
-    needs: build
+    needs: [build, bundle-macos]
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: dist-*
           path: dist
           merge-multiple: true
 
@@ -75,21 +168,31 @@ jobs:
           body: |
             ## FastCull ${{ github.ref_name }}
 
-            Native Linux builds for **x86_64** and **aarch64**.
+            Native builds for **Linux** (`x86_64`, `aarch64`) and **macOS**
+            (universal — Intel + Apple Silicon).
 
-            ### Install
+            ### Linux
             ```sh
             tar xzf fastcull-${{ github.ref_name }}-x86_64-linux.tar.gz   # or -aarch64-linux
             ./fastcull-${{ github.ref_name }}-x86_64-linux/fastcull --help
             ```
-
             The binary statically links Skia and needs only **libjpeg-turbo** and
             **fontconfig** at runtime:
             ```sh
             sudo apt install libturbojpeg0 libfontconfig1
             ```
 
-            Verify a download with its `.sha256` sidecar:
+            ### macOS
+            Download `fastcull-${{ github.ref_name }}-macos.dmg`, open it, and drag
+            **FastCull** to Applications. It is a self-contained universal binary —
+            no Homebrew needed. On first launch Gatekeeper blocks unsigned apps:
+            right-click the app and choose **Open**, or run:
             ```sh
-            sha256sum -c fastcull-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256
+            xattr -dr com.apple.quarantine /Applications/FastCull.app
+            ```
+
+            ### Verify a download
+            ```sh
+            sha256sum -c fastcull-${{ github.ref_name }}-x86_64-linux.tar.gz.sha256   # Linux
+            shasum -a 256 -c fastcull-${{ github.ref_name }}-macos.dmg.sha256          # macOS
             ```
