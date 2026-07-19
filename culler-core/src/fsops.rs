@@ -28,7 +28,9 @@ pub trait FsOps {
     fn free_space(&self, path: &Path) -> io::Result<u64>;
 }
 
-/// Production `FsOps` over the real Linux filesystem via rustix.
+/// Production `FsOps` over the real filesystem via rustix (Linux + macOS;
+/// `renameat_with(NOREPLACE)` maps to `renameat2(RENAME_NOREPLACE)` on Linux and
+/// `renameatx_np(RENAME_EXCL)` on macOS).
 pub struct RealFs;
 
 impl FsOps for RealFs {
@@ -59,7 +61,9 @@ impl FsOps for RealFs {
     }
 
     fn fsync_dir(&self, path: &Path) -> io::Result<()> {
-        // Opening a directory read-only then fsync flushes its entries on Linux.
+        // Opening a directory read-only then fsync flushes its entries (Linux;
+        // on macOS fsync is not F_FULLFSYNC, a weaker but acceptable guarantee —
+        // the journal/reconcile model tolerates an unsynced tail).
         std::fs::File::open(path)?.sync_all()
     }
 
