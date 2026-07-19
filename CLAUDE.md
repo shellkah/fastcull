@@ -46,8 +46,8 @@ export MACOSX_DEPLOYMENT_TARGET=11.0
 
 The `rfd` dependency is target-split in `culler/Cargo.toml` (Linux xdg-portal vs
 macOS AppKit); there is no `#[cfg(target_os)]` in the Rust source. macOS can't be
-built locally on a Linux box — CI (`macos-13` Intel, `macos-14` Apple Silicon) is
-the macOS build/test harness.
+built locally on a Linux box — CI (`macos-14` Apple Silicon) is the macOS
+build/test harness.
 
 ## The loop — CI enforces every one of these
 
@@ -85,12 +85,13 @@ app and driving the surface you touched.
 The released binary dynamically needs only `libturbojpeg` + `libfontconfig` at runtime (Skia is
 static). Re-pointing an existing public tag requires a force/delete — avoid once a release is out.
 
-macOS releases build natively on `macos-13` (x86_64) + `macos-14` (arm64), then
-`lipo`-merge into a **universal** `FastCull.app` (bundling `libturbojpeg` so the
-app is self-contained), packaged as `fastcull-vX.Y.Z-macos.dmg` and ad-hoc
-signed (not notarized — first launch needs the Gatekeeper right-click/`xattr`
-workaround, documented in the README). Use `workflow_dispatch` on
-`release.yml` to dry-run the whole `.dmg` pipeline on a branch before tagging.
+macOS releases build natively on `macos-14` (Apple Silicon) into an **`arm64`**
+`FastCull.app` (bundling `libturbojpeg` so the app is self-contained), packaged
+as `fastcull-vX.Y.Z-macos.dmg` and ad-hoc signed (not notarized — first launch
+needs the Gatekeeper right-click/`xattr` workaround, documented in the README).
+Intel Macs are not supported (macOS 26 is the last to run them, and GitHub's
+`macos-13` Intel runners are scarce). Use `workflow_dispatch` on `release.yml`
+to dry-run the whole `.dmg` pipeline before tagging.
 The packaging scripts live in `culler/macos/`.
 
 ## Conventions

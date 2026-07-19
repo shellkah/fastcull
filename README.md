@@ -70,9 +70,9 @@ sudo apt install libturbojpeg0 libfontconfig1
 
 Download `fastcull-vX.Y.Z-macos.dmg` from the
 [latest release](https://github.com/shellkah/fastcull/releases/latest), open it,
-and drag **FastCull** to Applications. It is a **universal** build (Intel +
-Apple Silicon) and fully self-contained — libjpeg-turbo is bundled, so no
-Homebrew is required to run it.
+and drag **FastCull** to Applications. It is an **Apple Silicon** (`arm64`)
+build, fully self-contained — libjpeg-turbo is bundled, so no Homebrew is
+required to run it.
 
 FastCull is ad-hoc signed, not notarized, so on first launch Gatekeeper will
 refuse to open it. Clear that once:
@@ -154,8 +154,8 @@ Rename any bucket with `--bucket-rejected`, `--bucket-rest`, `--bucket-keep`,
 **Linux and macOS.** FastCull renders with Slint/Skia and links the system
 libjpeg-turbo. On Linux it uses the XDG desktop portal for folder picking and is
 released natively for `x86_64` and `aarch64`; on macOS it uses the native AppKit
-picker and ships as a self-contained **universal** `.dmg` (Intel + Apple
-Silicon). Windows is not supported.
+picker and ships as a self-contained **Apple Silicon** (`arm64`) `.dmg`. Intel
+Macs and Windows are not supported.
 
 ## Development
 

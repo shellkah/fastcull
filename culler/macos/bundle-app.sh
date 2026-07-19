@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Assemble a self-contained FastCull.app from a (universal) fastcull binary and a
-# (universal) libturbojpeg dylib, relocate the dylib into the bundle, and ad-hoc
-# sign. macOS-only: uses otool / install_name_tool / codesign (built-in).
+# Assemble a self-contained FastCull.app from a fastcull binary and its
+# libturbojpeg dylib, relocate the dylib into the bundle, and ad-hoc sign.
+# macOS-only: uses otool / install_name_tool / codesign (built-in).
 set -euo pipefail
 
 BIN="${1:?usage: bundle-app.sh <fastcull> <libturbojpeg.dylib> <AppIcon.icns> <VERSION> <out-dir>}"
@@ -24,9 +24,9 @@ chmod u+w "$APP/Contents/Frameworks/$base"
 sed "s|@VERSION@|$VERSION|g" "$HERE/Info.plist.in" > "$APP/Contents/Info.plist"
 
 # Give the bundled dylib an executable-relative id, then repoint the binary at
-# it in EVERY arch slice. The x86_64 slice (built on the Intel runner) links a
-# /usr/local/... path; the arm64 slice links /opt/homebrew/... — different
-# strings, so run -change once per arch (a no-op where the ref is absent).
+# it in every arch slice present. Homebrew links an absolute path that differs
+# per arch (/opt/homebrew on arm64, /usr/local on Intel), so run -change once
+# per arch — a safe no-op for any slice the (now arm64-only) binary lacks.
 install_name_tool -id "@executable_path/../Frameworks/$base" "$APP/Contents/Frameworks/$base"
 for arch in x86_64 arm64; do
   ref="$(otool -arch "$arch" -L "$APP/Contents/MacOS/fastcull" 2>/dev/null | awk '/turbojpeg/ {print $1; exit}')" || ref=""
@@ -37,7 +37,7 @@ done
 
 # Fail loudly if any slice still points at an absolute (Homebrew) turbojpeg path.
 for arch in x86_64 arm64; do
-  if otool -arch "$arch" -L "$APP/Contents/MacOS/fastcull" | awk '/turbojpeg/ {print $1}' | grep -q '^/'; then
+  if otool -arch "$arch" -L "$APP/Contents/MacOS/fastcull" 2>/dev/null | awk '/turbojpeg/ {print $1}' | grep -q '^/'; then
     echo "error: $arch slice still has an absolute libturbojpeg reference" >&2
     otool -arch "$arch" -L "$APP/Contents/MacOS/fastcull" >&2
     exit 1

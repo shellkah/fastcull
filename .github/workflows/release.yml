@@ -57,15 +57,13 @@ jobs:
           path: fastcull-*-linux.tar.gz*
           if-no-files-found: error
 
+  # macOS ships an Apple Silicon (arm64) .dmg only. Intel (x86_64) is dropped:
+  # Apple stopped selling Intel Macs c.2023 and macOS 26 is the last to support
+  # them, and GitHub's macos-13 Intel runners are scarce/deprecated. Building
+  # natively on macos-14 needs no lipo and no scarce Intel runner.
   build-macos:
-    name: build macos (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { arch: x86_64,  runner: macos-13 }
-          - { arch: aarch64, runner: macos-14 }
-    runs-on: ${{ matrix.runner }}
+    name: build macos (arm64 dmg)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -79,37 +77,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-macos-${{ matrix.arch }}
+          key: release-macos-arm64
 
       - name: Build release binary
         run: cargo build --release --locked -p culler
-
-      - name: Stage binary + its libturbojpeg slice
-        run: |
-          mkdir -p stage
-          cp target/release/fastcull "stage/fastcull-${{ matrix.arch }}"
-          ref="$(otool -L target/release/fastcull | awk '/turbojpeg/ {print $1; exit}')"
-          if [ -z "$ref" ]; then echo "fastcull does not link libturbojpeg" >&2; exit 1; fi
-          cp "$ref" "stage/libturbojpeg-${{ matrix.arch }}.dylib"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.arch }}
-          path: stage/*
-          if-no-files-found: error
-
-  bundle-macos:
-    name: bundle macos universal dmg
-    needs: build-macos
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: macos-*
-          path: slices
-          merge-multiple: true
 
       - name: Compute version + tag
         id: ver
@@ -122,16 +93,17 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Assemble universal .app and .dmg
+      - name: Assemble .app and .dmg
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Basename of the linked dylib (same for both arches, discovered off arm64).
-          base="$(otool -arch arm64 -L slices/fastcull-aarch64 | awk '/turbojpeg/ {print $1; exit}' | xargs basename)"
-          test -n "$base"
-          lipo -create slices/fastcull-x86_64 slices/fastcull-aarch64 -output dist/fastcull
-          lipo -create slices/libturbojpeg-x86_64.dylib slices/libturbojpeg-aarch64.dylib -output "dist/$base"
-          file dist/fastcull   # expect: Mach-O universal binary with 2 architectures
+          # Discover the linked libturbojpeg (basename not hardcoded) and copy it out.
+          ref="$(otool -L target/release/fastcull | awk '/turbojpeg/ {print $1; exit}')"
+          if [ -z "$ref" ]; then echo "fastcull does not link libturbojpeg" >&2; exit 1; fi
+          base="$(basename "$ref")"
+          cp target/release/fastcull dist/fastcull
+          cp "$ref" "dist/$base"
+          file dist/fastcull   # expect: Mach-O 64-bit executable arm64
           bash culler/macos/make-icns.sh culler/ui/logo-3a.svg dist/AppIcon.icns
           bash culler/macos/bundle-app.sh dist/fastcull "dist/$base" dist/AppIcon.icns \
             "${{ steps.ver.outputs.version }}" dist
@@ -149,7 +121,7 @@ jobs:
 
   release:
     name: publish release
-    needs: [build, bundle-macos]
+    needs: [build, build-macos]
     if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
@@ -169,7 +141,7 @@ jobs:
             ## FastCull ${{ github.ref_name }}
 
             Native builds for **Linux** (`x86_64`, `aarch64`) and **macOS**
-            (universal — Intel + Apple Silicon).
+            (Apple Silicon / `arm64`).
 
             ### Linux
             ```sh
@@ -182,11 +154,11 @@ jobs:
             sudo apt install libturbojpeg0 libfontconfig1
             ```
 
-            ### macOS
+            ### macOS (Apple Silicon)
             Download `fastcull-${{ github.ref_name }}-macos.dmg`, open it, and drag
-            **FastCull** to Applications. It is a self-contained universal binary —
-            no Homebrew needed. On first launch Gatekeeper blocks unsigned apps:
-            right-click the app and choose **Open**, or run:
+            **FastCull** to Applications. It is a self-contained Apple Silicon
+            (`arm64`) build — no Homebrew needed. On first launch Gatekeeper blocks
+            unsigned apps: right-click the app and choose **Open**, or run:
             ```sh
             xattr -dr com.apple.quarantine /Applications/FastCull.app
             ```
