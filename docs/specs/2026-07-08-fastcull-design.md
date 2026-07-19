@@ -34,7 +34,8 @@ large shoots.
 **Non-goals (v1)**
 - RAW demosaicing / true RAW rendering (we always display the JPEG).
 - Photo editing, adjustments, export/resize.
-- Cross-platform packaging (Linux-only, personal tool).
+- Cross-platform packaging (Linux-only, personal tool). **Superseded** by the
+  2026-07-18 macOS port (`docs/specs/2026-07-18-macos-port-design.md`).
 - Cloud, catalog database, or multi-user features.
 - Color management (AdobeRGB JPEGs render unmanaged and look slightly flat —
   acceptable for culling decisions).
