@@ -8,8 +8,9 @@ use std::path::Path;
 /// dimensions (up to 65535x65535) — allocating `w * h * 4` bytes for that BEFORE
 /// any scan data is validated is a decompression-bomb vector: under
 /// `vm.overcommit_memory=2` the allocator's `handle_alloc_error` aborts the
-/// whole process (SIGABRT), which is uncatchable and would crash the Phase 6
-/// GUI worker thread on a single corrupt file. 300 MP is comfortably above any
+/// whole process (SIGABRT) — uncatchable, and macOS aborts a huge allocation
+/// too; the guard is platform-agnostic, and without it a single corrupt file
+/// would crash the Phase 6 GUI worker thread. 300 MP is comfortably above any
 /// real camera sensor (current high-end sensors top out well under 200 MP)
 /// and far below allocation-abort territory (300M * 4 bytes = 1.2 GB).
 const MAX_DECODE_PIXELS: usize = 300_000_000;

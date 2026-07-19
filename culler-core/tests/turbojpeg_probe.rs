@@ -1,6 +1,7 @@
-//! Linking probe: proves the `turbojpeg` crate links the SYSTEM libjpeg-turbo
-//! (pkg-config; this machine has no cmake/nasm so a from-source build cannot
-//! have produced this binary). Kept as a permanent guard for the dep spelling.
+//! Linking probe: proves the `turbojpeg` crate links the SYSTEM libjpeg-turbo via
+//! pkg-config (Linux 2.1.x, or Homebrew 3.x on macOS — both export the legacy
+//! `tj*` API this crate binds). Kept as a permanent guard for the dep spelling
+//! and the pkg-config wiring on every platform.
 
 #[test]
 fn turbojpeg_system_library_round_trip() {
