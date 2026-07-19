@@ -1,6 +1,6 @@
 # FastCull — agent & contributor guide
 
-FastCull is a keyboard-driven **photo culling** GUI for Linux (Rust + Slint): cull a folder of
+FastCull is a keyboard-driven **photo culling** GUI for Linux and macOS (Rust + Slint): cull a folder of
 shots into quality tiers, then **Apply** non-destructively reorganizes them. Spec:
 `docs/specs/2026-07-08-fastcull-design.md`. UI contract: `docs/design/DESIGN.md`.
 
@@ -30,6 +30,25 @@ sudo apt install -y pkg-config libturbojpeg0-dev libfontconfig1-dev \
 comment in `culler-core/Cargo.toml`, read it before touching that dependency. `clang/libclang` is
 for skia-safe's bindgen (Slint's Skia renderer).
 
+### macOS build environment
+
+macOS builds link Homebrew's **libjpeg-turbo 3.x** (which keeps the legacy
+TurboJPEG `tj*` API that the pinned `turbojpeg` 0.5.x binds — so the crate is
+unchanged across platforms). No fontconfig (Skia uses CoreText), no X11/Wayland
+packages.
+
+```sh
+xcode-select --install                                    # clang/libclang for bindgen
+brew install jpeg-turbo
+export PKG_CONFIG_PATH="$(brew --prefix jpeg-turbo)/lib/pkgconfig"
+export MACOSX_DEPLOYMENT_TARGET=11.0
+```
+
+The `rfd` dependency is target-split in `culler/Cargo.toml` (Linux xdg-portal vs
+macOS AppKit); there is no `#[cfg(target_os)]` in the Rust source. macOS can't be
+built locally on a Linux box — CI (`macos-13` Intel, `macos-14` Apple Silicon) is
+the macOS build/test harness.
+
 ## The loop — CI enforces every one of these
 
 ```sh
@@ -40,8 +59,8 @@ cargo clippy --workspace --all-targets -- -D warnings    # gate — a warning fa
 cargo run -p culler -- <folder-of-shots>                 # launch the GUI
 ```
 
-CI (`.github/workflows/ci.yml`) runs build + test on **x86_64 and aarch64**, plus fmt + clippy on
-x86_64. "Green locally, red in CI" is almost always an unformatted file or a clippy warning — run
+CI (`.github/workflows/ci.yml`) runs build + test on **Linux and macOS** (x86_64 + aarch64 each),
+plus fmt + clippy on Linux x86_64. "Green locally, red in CI" is almost always an unformatted file or a clippy warning — run
 both gates before pushing.
 
 **Testing `culler`:** it is a **binary crate with no lib target** — use `cargo test -p culler
@@ -65,6 +84,14 @@ app and driving the surface you touched.
 
 The released binary dynamically needs only `libturbojpeg` + `libfontconfig` at runtime (Skia is
 static). Re-pointing an existing public tag requires a force/delete — avoid once a release is out.
+
+macOS releases build natively on `macos-13` (x86_64) + `macos-14` (arm64), then
+`lipo`-merge into a **universal** `FastCull.app` (bundling `libturbojpeg` so the
+app is self-contained), packaged as `fastcull-vX.Y.Z-macos.dmg` and ad-hoc
+signed (not notarized — first launch needs the Gatekeeper right-click/`xattr`
+workaround, documented in the README). Use `workflow_dispatch` on
+`release.yml` to dry-run the whole `.dmg` pipeline on a branch before tagging.
+The packaging scripts live in `culler/macos/`.
 
 ## Conventions
 

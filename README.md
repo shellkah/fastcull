@@ -1,6 +1,6 @@
 # FastCull
 
-**Fast, keyboard-driven photo culling for Linux.** Point it at a folder of
+**Fast, keyboard-driven photo culling for Linux and macOS.** Point it at a folder of
 shots, race through them with single keypresses to sort each into a quality tier
 (and optionally tag them), then on **Apply** it safely reorganizes everything
 into a clean destination-folder structure.
@@ -8,7 +8,7 @@ into a clean destination-folder structure.
 [![CI](https://github.com/shellkah/fastcull/actions/workflows/ci.yml/badge.svg)](https://github.com/shellkah/fastcull/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/shellkah/fastcull?sort=semver)](https://github.com/shellkah/fastcull/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform: Linux](https://img.shields.io/badge/platform-Linux-informational)](#platform)
+[![Platform: Linux | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-informational)](#platform)
 
 ![FastCull main culling view](docs/design/screens/1b-main.png)
 
@@ -66,9 +66,29 @@ missing):
 sudo apt install libturbojpeg0 libfontconfig1
 ```
 
+### macOS
+
+Download `fastcull-vX.Y.Z-macos.dmg` from the
+[latest release](https://github.com/shellkah/fastcull/releases/latest), open it,
+and drag **FastCull** to Applications. It is a **universal** build (Intel +
+Apple Silicon) and fully self-contained — libjpeg-turbo is bundled, so no
+Homebrew is required to run it.
+
+FastCull is ad-hoc signed, not notarized, so on first launch Gatekeeper will
+refuse to open it. Clear that once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/FastCull.app
+```
+
+or right-click the app in Finder and choose **Open** the first time. Verify a
+download with its sidecar: `shasum -a 256 -c fastcull-vX.Y.Z-macos.dmg.sha256`.
+
 ### Build from source
 
-Requires **Rust 1.85+** (2024 edition) and these system packages:
+Requires **Rust 1.85+** (2024 edition).
+
+**Linux** — system packages:
 
 ```sh
 sudo apt install -y pkg-config libturbojpeg0-dev libfontconfig1-dev \
@@ -76,8 +96,19 @@ sudo apt install -y pkg-config libturbojpeg0-dev libfontconfig1-dev \
 cargo build --release          # binary at target/release/fastcull
 ```
 
+**macOS** — Xcode Command Line Tools + Homebrew's libjpeg-turbo (no fontconfig;
+Skia uses CoreText):
+
+```sh
+xcode-select --install         # if not already present
+brew install jpeg-turbo
+export PKG_CONFIG_PATH="$(brew --prefix jpeg-turbo)/lib/pkgconfig"
+cargo build --release          # binary at target/release/fastcull
+```
+
 > `culler-core` links the system **libjpeg-turbo** through `pkg-config` (the
-> legacy TurboJPEG API); it targets libjpeg-turbo 2.1.x. See the note in
+> legacy TurboJPEG API); it targets libjpeg-turbo 2.1.x on Linux and Homebrew's
+> 3.x on macOS (both keep the legacy `tj*` API). See the note in
 > `culler-core/Cargo.toml` for why the `turbojpeg` crate is pinned.
 
 ## Usage
@@ -120,10 +151,11 @@ Rename any bucket with `--bucket-rejected`, `--bucket-rest`, `--bucket-keep`,
 
 ## Platform
 
-**Linux-only, by design.** FastCull is a focused personal tool: it renders with
-Slint/Skia, uses the XDG desktop portal for folder picking, and links the system
-libjpeg-turbo. Cross-platform packaging is an explicit non-goal. Releases are
-built natively for `x86_64` and `aarch64`.
+**Linux and macOS.** FastCull renders with Slint/Skia and links the system
+libjpeg-turbo. On Linux it uses the XDG desktop portal for folder picking and is
+released natively for `x86_64` and `aarch64`; on macOS it uses the native AppKit
+picker and ships as a self-contained **universal** `.dmg` (Intel + Apple
+Silicon). Windows is not supported.
 
 ## Development
 
