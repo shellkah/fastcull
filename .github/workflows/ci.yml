@@ -64,4 +64,7 @@ jobs:
         run: cargo build --workspace --all-targets --locked
 
       - name: Test
-        run: cargo test --workspace --locked
+        # --no-fail-fast: run every test binary and report all failures in one
+        # run (esp. platform-specific ones on macOS), instead of stopping at the
+        # first failing binary.
+        run: cargo test --workspace --locked --no-fail-fast

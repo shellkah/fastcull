@@ -429,13 +429,19 @@ mod tests {
 
         let dir = unique_temp_dir("nonutf8");
         touch(&dir.join("IMG_0001.JPG")); // a normal shot
-        // Files whose stems are NOT valid UTF-8 (0xFF byte).
+        // Files whose stems are NOT valid UTF-8 (0xFF byte). Linux filenames are
+        // arbitrary byte sequences, but macOS's (UTF-8-enforcing) filesystem
+        // rejects these with EILSEQ — the scenario cannot exist there, so skip
+        // rather than fail on fixture setup (matches applyflow's non-UTF-8 test).
         for name in [
             b"IMG_\xffA.jpg".to_vec(),
             b"IMG_\xffB.jpg".to_vec(),
             b"IMG_\xffC.cr3".to_vec(),
         ] {
-            touch(&dir.join(OsString::from_vec(name)));
+            if std::fs::write(dir.join(OsString::from_vec(name)), b"").is_err() {
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
         }
 
         let (shots, raw_only) = scan_report(&dir).unwrap();
